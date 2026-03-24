@@ -1,4 +1,7 @@
 # DW_THI_Project
 This repository contains the research and implementation of Deep Learning architectures designed to enhance Diffusion-Weighted MRI (DW-MRI).
-# Used Datasets
+## Used Datasets
 *DTI data from 'Fiber architecture in the ventromedial striatum and its relation with the bed nucleus of the stria terminalis'* : https://openneuro.org/datasets/ds003047/versions/1.0.0
+## Potential Datasets
+- DWI Traveling Human Phantom Study: https://openneuro.org/datasets/ds000206/versions/00002
+- SUDMEX_CONN: The Mexican dataset of cocaine use disorder patients: https://openneuro.org/datasets/ds003346/versions/1.1.2
