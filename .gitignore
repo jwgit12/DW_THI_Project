@@ -205,3 +205,9 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+/dataset
+/dti_ml_dataset_v1.zarr
+/dti_ml_dataset_v2.zarr
+/qc
+/.idea
+/.claude
