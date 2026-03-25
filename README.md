@@ -28,3 +28,21 @@ The goal is to develop and benchmark deep learning architectures that tackle one
 ## Potential Datasets
 - DWI Traveling Human Phantom Study: https://openneuro.org/datasets/ds000206/versions/00002
 - SUDMEX_CONN: The Mexican dataset of cocaine use disorder patients: https://openneuro.org/datasets/ds003346/versions/1.1.2
+
+## How to Check out the UI
+
+To visualize the DW-MRI dataset with the modern Qt6 desktop dashboard:
+
+1. **Activate the Environment:**
+   Ensure your Python virtual environment is active and dependencies are installed.
+   ```bash
+   source .venv/bin/activate
+   pip install -r requirements.txt
+   ```
+
+2. **Launch the Application:**
+   Run the Qt6 desktop application:
+   ```bash
+   python main_qt.py
+   ```
+   *The application will compute DW-MRI metrics (FA/MD/cFA) and K-space representations directly within the desktop window.*

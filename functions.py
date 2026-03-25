@@ -3,6 +3,7 @@ import glob
 import nibabel as nib
 import numpy as np
 import cv2
+from joblib import Parallel, delayed
 from dipy.io import read_bvals_bvecs
 from dipy.core.gradients import gradient_table
 from dipy.reconst.dti import TensorModel
@@ -90,32 +91,35 @@ def add_noise(slice_2d, noise_level):
     return slice_2d + noise
 
 def lowres_noise(data, keep_fraction=0.5, noise_min=0.01, noise_max=0.05):
-    _, _, z, t = data.shape
-    degraded = np.zeros_like(data)
+    h, w = data.shape[:2]
 
-    for di in range(t):
-        for zi in range(z):
+    # Vectorized k-space filtering over all slices/volumes at once
+    kspace = np.fft.fftshift(np.fft.fft2(data, axes=(0, 1)), axes=(0, 1))
 
-            slice_2d = data[:, :, zi, di]
+    # Build 2D mask once, broadcast over z and t
+    cy, cx = h // 2, w // 2
+    ry, rx = int(h * keep_fraction / 2), int(w * keep_fraction / 2)
+    mask = np.zeros((h, w), dtype=bool)
+    mask[cy - ry:cy + ry, cx - rx:cx + rx] = True
+    kspace[~mask] = 0
 
-            # Step 1: k-space resolution reduction
-            lowres = apply_kspace_mask(slice_2d, keep_fraction)
+    lowres = np.abs(np.fft.ifft2(np.fft.ifftshift(kspace, axes=(0, 1)), axes=(0, 1)))
 
-            # Step 2: random noise per slice & timepoint
-            noise_level = np.random.uniform(noise_min, noise_max)
-            noisy = add_noise(lowres, noise_level)
+    # Vectorized noise: one random level per (slice, volume)
+    noise_levels = np.random.uniform(noise_min, noise_max, size=data.shape[2:])
+    slice_max = lowres.max(axis=(0, 1), keepdims=True)
+    sigma = noise_levels * slice_max
+    noise = np.random.randn(*data.shape) * sigma
 
-            degraded[:, :, zi, di] = noisy
-
-    return degraded
+    return lowres + noise
 
 #%% DTI computations
-def compute_dti(data, gtab):
+def compute_dti(data, gtab, mask=None):
     tenmodel = TensorModel(gtab)
-    tenfit = tenmodel.fit(data)
+    tenfit = tenmodel.fit(data, mask=mask)
     # Tensor element order: Dxx, Dxy, Dyy, Dxz, Dyz, Dzz
     tensor = tenfit.quadratic_form
-    
+
     return tensor  # shape: (X, Y, Z, 3, 3)
 
 def tensor_to_6d(tensor):
@@ -304,11 +308,18 @@ def brain_mask(image,
         mask = process_slice(image)
         masked = image * mask
     elif image.ndim == 3:
-        mask = np.stack([process_slice(image[..., i]) for i in range(image.shape[-1])], axis=-1)
+        slices = Parallel(n_jobs=-1)(delayed(process_slice)(image[..., i]) for i in range(image.shape[-1]))
+        mask = np.stack(slices, axis=-1)
         masked = image * mask
     elif image.ndim == 4:
-        mask = np.stack([np.stack([process_slice(image[..., i, t]) for i in range(image.shape[-2])], axis=-1)
-                         for t in range(image.shape[-1])], axis=-1)
+        all_slices = Parallel(n_jobs=-1)(
+            delayed(process_slice)(image[..., i, t])
+            for t in range(image.shape[-1])
+            for i in range(image.shape[-2])
+        )
+        # Reshape: we iterated t-outer, i-inner
+        n_z, n_t = image.shape[-2], image.shape[-1]
+        mask = np.stack(all_slices, axis=-1).reshape(image.shape[:2] + (n_z, n_t))
         masked = image * mask
     else:
         raise ValueError("Input image must be 2D, 3D, or 4D.")
