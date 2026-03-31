@@ -6,3 +6,7 @@ matplotlib
 PyQt6
 joblib
 zarr
+torch
+torchvision
+tensorboard
+tqdm
