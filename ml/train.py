@@ -15,6 +15,7 @@ Usage:
 import argparse
 import math
 import os
+import random
 import sys
 import time
 
@@ -39,11 +40,28 @@ def charbonnier_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-3
     return torch.mean(torch.sqrt((pred - target) ** 2 + eps ** 2))
 
 
-def _gaussian_kernel_2d(size: int = 7, sigma: float = 1.5, device: torch.device = torch.device("cpu")) -> torch.Tensor:
+# Cache SSIM kernels to avoid repeated CPU/GPU allocations each iteration.
+_SSIM_KERNEL_CACHE: dict[tuple[int, float, str, torch.dtype], torch.Tensor] = {}
+
+
+def _gaussian_kernel_2d(
+    size: int = 7,
+    sigma: float = 1.5,
+    device: torch.device = torch.device("cpu"),
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    cache_key = (size, float(sigma), str(device), dtype)
+    cached = _SSIM_KERNEL_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
     coords = torch.arange(size, dtype=torch.float32, device=device) - size // 2
     g = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
     kernel = g.outer(g)
-    return (kernel / kernel.sum()).unsqueeze(0).unsqueeze(0)  # (1, 1, size, size)
+    kernel = (kernel / kernel.sum()).unsqueeze(0).unsqueeze(0)  # (1, 1, size, size)
+    kernel = kernel.to(dtype=dtype)
+    _SSIM_KERNEL_CACHE[cache_key] = kernel
+    return kernel
 
 
 def ssim_2d(
@@ -56,7 +74,7 @@ def ssim_2d(
 
     Returns a scalar in [0, 1] (higher = more similar).
     """
-    kernel = _gaussian_kernel_2d(window_size, sigma, pred.device)
+    kernel = _gaussian_kernel_2d(window_size, sigma, pred.device, pred.dtype)
     pad = window_size // 2
     C1, C2 = 0.01 ** 2, 0.03 ** 2
 
@@ -89,6 +107,18 @@ def pretext_loss(
     """
     # --- DWI loss (only valid directions) ---
     valid = pad_mask > 0.5  # (B, N)
+    if not bool(valid.any().item()):
+        zero = dwi_pred.new_zeros(())
+        loss_dti = charbonnier_loss(dti_pred, dti_target)
+        loss_total = lambda_dti * loss_dti
+        return {
+            "loss": loss_total,
+            "loss_dwi": zero,
+            "loss_dti": loss_dti,
+            "charb_dwi": zero,
+            "ssim_dwi": zero,
+        }
+
     pred_valid = dwi_pred[valid].unsqueeze(1)   # (K, 1, H, W)
     tgt_valid = dwi_target[valid].unsqueeze(1)  # (K, 1, H, W)
 
@@ -126,15 +156,6 @@ def compute_ssim(pred: torch.Tensor, target: torch.Tensor) -> float:
     return ssim_2d(pred, target).item()
 
 
-def _tensor6_to_matrix(t6: torch.Tensor) -> torch.Tensor:
-    """(*, 6) → (*, 3, 3) symmetric matrix.  Order: Dxx Dxy Dyy Dxz Dyz Dzz."""
-    Dxx, Dxy, Dyy, Dxz, Dyz, Dzz = t6.unbind(dim=-1)
-    row0 = torch.stack([Dxx, Dxy, Dxz], dim=-1)
-    row1 = torch.stack([Dxy, Dyy, Dyz], dim=-1)
-    row2 = torch.stack([Dxz, Dyz, Dzz], dim=-1)
-    return torch.stack([row0, row1, row2], dim=-2)
-
-
 @torch.no_grad()
 def _tensor6_to_fa_md(t6: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute FA and MD maps from (B, 6, H, W) DTI tensor.
@@ -144,21 +165,19 @@ def _tensor6_to_fa_md(t6: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     fa : (B, H, W)  Fractional Anisotropy  [0, 1]
     md : (B, H, W)  Mean Diffusivity
     """
-    B, _, H, W = t6.shape
-    # Rearrange to (B, H, W, 6) for eigen decomposition
-    t6_bhw = t6.permute(0, 2, 3, 1).contiguous()
-    D = _tensor6_to_matrix(t6_bhw)  # (B, H, W, 3, 3)
+    # Order: Dxx Dxy Dyy Dxz Dyz Dzz
+    Dxx, Dxy, Dyy, Dxz, Dyz, Dzz = t6.float().unbind(dim=1)
+    md = (Dxx + Dyy + Dzz) / 3.0
 
-    # Eigenvalues on CPU (more robust, not in training loop anyway)
-    D_cpu = D.reshape(-1, 3, 3).cpu().float()
-    evals = torch.linalg.eigvalsh(D_cpu)  # (B*H*W, 3)
-    evals = evals.reshape(B, H, W, 3)
+    # FA via tensor invariants (equivalent to eigenvalue definition):
+    # FA = sqrt(3/2) * ||D - MD*I||_F / ||D||_F
+    dxx = Dxx - md
+    dyy = Dyy - md
+    dzz = Dzz - md
 
-    md = evals.mean(dim=-1)
-    dev = evals - md.unsqueeze(-1)
-    fa = torch.sqrt(1.5 * (dev ** 2).sum(-1) / ((evals ** 2).sum(-1) + 1e-12))
-    fa = fa.clamp(0.0, 1.0)
-
+    dev_fro_sq = dxx ** 2 + dyy ** 2 + dzz ** 2 + 2.0 * (Dxy ** 2 + Dxz ** 2 + Dyz ** 2)
+    full_fro_sq = Dxx ** 2 + Dyy ** 2 + Dzz ** 2 + 2.0 * (Dxy ** 2 + Dxz ** 2 + Dyz ** 2)
+    fa = torch.sqrt((1.5 * dev_fro_sq / (full_fro_sq + 1e-12)).clamp(0.0, 1.0))
     return fa, md
 
 
@@ -252,12 +271,22 @@ def _log_images(model, loader, writer, epoch, device, args):
 # Training loop
 # ---------------------------------------------------------------------------
 def train(args):
+    if args.accum_steps < 1:
+        raise ValueError("accum_steps must be >= 1")
+    if args.dir_chunk_size < 1:
+        raise ValueError("dir_chunk_size must be >= 1")
+    if not (0.0 <= args.mask_fraction <= 1.0):
+        raise ValueError("mask_fraction must be in [0, 1]")
+
+    _set_seed(args.seed)
     device = _get_device()
     print(f"Using device: {device}")
 
     # Speed: device-specific tuning
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
     elif device.type == "mps":
         # Metal Performance Shaders benefit from channels-last memory layout
         print("MPS detected (Apple Silicon) — enabling channels_last + bfloat16")
@@ -270,7 +299,8 @@ def train(args):
     n_val = max(1, int(n_subjects * 0.2))
     n_train = n_subjects - n_val
     all_idx = list(range(n_subjects))
-    np.random.seed(42)
+    # Preserve legacy split behavior (and RNG consumption order) for strict reproducibility.
+    np.random.seed(args.seed)
     np.random.shuffle(all_idx)
     train_idx = sorted(all_idx[:n_train])
     val_idx = sorted(all_idx[n_train:])
@@ -290,7 +320,7 @@ def train(args):
     loader_kwargs = dict(
         num_workers=args.num_workers,
         collate_fn=pretext_collate_fn,
-        pin_memory=True,
+        pin_memory=device.type == "cuda",
         persistent_workers=args.num_workers > 0,
     )
     train_loader = DataLoader(
@@ -376,7 +406,7 @@ def train(args):
 
             if (step + 1) % accum_steps == 0 or (step + 1) == len(train_loader):
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
@@ -455,6 +485,14 @@ def train(args):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+def _set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
 def _get_device() -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda")
@@ -467,11 +505,13 @@ def _get_device() -> torch.device:
 def _validate(model, loader, device, args):
     model.eval()
     total_loss = 0.0
-    total_psnr = 0.0
+    total_mse_sum = 0.0
+    total_mse_count = 0
     total_ssim = 0.0
     total_fa_mae = 0.0
     total_md_mae = 0.0
-    n = 0
+    n_subjects = 0
+    n_dwi_dirs = 0
 
     use_amp = device.type in ["cuda", "mps"]
     amp_dtype = torch.bfloat16 if device.type == "mps" else torch.float16
@@ -497,29 +537,41 @@ def _validate(model, loader, device, args):
                 lambda_dti=args.lambda_dti,
             )
 
-        total_loss += losses["loss"].item()
+        batch_size = directions.shape[0]
+        total_loss += losses["loss"].item() * batch_size
 
         # DWI metrics on valid directions
         valid = pad_mask > 0.5
-        pred_valid = dwi_pred.float()[valid].unsqueeze(1)
-        tgt_valid = tgt_dwi.float()[valid].unsqueeze(1)
-        total_psnr += compute_psnr(pred_valid, tgt_valid)
-        total_ssim += compute_ssim(pred_valid, tgt_valid)
+        n_valid = int(valid.sum().item())
+        if n_valid > 0:
+            pred_valid = dwi_pred.float()[valid].unsqueeze(1)
+            tgt_valid = tgt_dwi.float()[valid].unsqueeze(1)
+            sq_err = (pred_valid - tgt_valid) ** 2
+            total_mse_sum += sq_err.sum().item()
+            total_mse_count += sq_err.numel()
+            total_ssim += compute_ssim(pred_valid, tgt_valid) * n_valid
+            n_dwi_dirs += n_valid
 
         # DTI-derived metrics
         fa_mae, md_mae = compute_fa_md_errors(dti_pred.float(), tgt_dti.float())
-        total_fa_mae += fa_mae
-        total_md_mae += md_mae
+        total_fa_mae += fa_mae * batch_size
+        total_md_mae += md_mae * batch_size
 
-        n += 1
+        n_subjects += batch_size
 
-    n = max(n, 1)
+    n_subjects = max(n_subjects, 1)
+    n_dwi_dirs = max(n_dwi_dirs, 1)
+    if total_mse_count > 0:
+        mse = total_mse_sum / total_mse_count
+        psnr = 100.0 if mse < 1e-10 else 10.0 * math.log10(1.0 / mse)
+    else:
+        psnr = 0.0
     return {
-        "loss": total_loss / n,
-        "psnr": total_psnr / n,
-        "ssim": total_ssim / n,
-        "fa_mae": total_fa_mae / n,
-        "md_mae": total_md_mae / n,
+        "loss": total_loss / n_subjects,
+        "psnr": psnr,
+        "ssim": total_ssim / n_dwi_dirs,
+        "fa_mae": total_fa_mae / n_subjects,
+        "md_mae": total_md_mae / n_subjects,
     }
 
 
@@ -542,6 +594,8 @@ def main():
     parser.add_argument("--lambda_dwi", type=float, default=1.0)
     parser.add_argument("--lambda_dti", type=float, default=1.0)
     parser.add_argument("--base_features", type=int, default=32)
+    parser.add_argument("--grad_clip_norm", type=float, default=1.0)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--log_dir", type=str, default="ml/runs/pretext")
     parser.add_argument("--ckpt_dir", type=str, default="ml/checkpoints")

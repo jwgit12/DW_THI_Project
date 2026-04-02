@@ -54,9 +54,30 @@ class UpBlock(nn.Module):
         x = self.up(x)
         dy = skip.shape[2] - x.shape[2]
         dx = skip.shape[3] - x.shape[3]
-        if dy != 0 or dx != 0:
-            x = F.pad(x, [0, dx, 0, dy])
+        # Handle both odd-size padding (+) and rare over-shoot cropping (-).
+        if dy > 0 or dx > 0:
+            pad_top = max(dy // 2, 0)
+            pad_bottom = max(dy - pad_top, 0)
+            pad_left = max(dx // 2, 0)
+            pad_right = max(dx - pad_left, 0)
+            x = F.pad(x, [pad_left, pad_right, pad_top, pad_bottom])
+        if dy < 0:
+            crop_top = (-dy) // 2
+            x = x[:, :, crop_top : crop_top + skip.shape[2], :]
+        if dx < 0:
+            crop_left = (-dx) // 2
+            x = x[:, :, :, crop_left : crop_left + skip.shape[3]]
         return self.conv(torch.cat([x, skip], dim=1))
+
+
+def _masked_mean(feats: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
+    """Masked mean over directions.
+
+    feats:      (B, N, C, H, W)
+    valid_mask: (B, N, 1, 1, 1)
+    """
+    valid_count = valid_mask.sum(dim=1).clamp_min(1.0)
+    return (feats * valid_mask).sum(dim=1) / valid_count
 
 
 # ---------------------------------------------------------------------------
@@ -159,6 +180,11 @@ class PretextUNet(nn.Module):
         dwi_pred : (B, N, H, W)  reconstructed DWI per direction
         dti_pred : (B, 6, H, W)  predicted DTI 6-component tensor
         """
+        if dir_chunk_size < 1:
+            raise ValueError("dir_chunk_size must be >= 1")
+        if bvecs.ndim != 3 or bvecs.shape[1] != 3:
+            raise ValueError("bvecs must have shape (B, 3, N)")
+
         B, N, H, W = directions.shape
         BN = B * N
 
@@ -191,12 +217,10 @@ class PretextUNet(nn.Module):
         e1_r = e1.reshape(B, N, f_ch // 4, h1, w1)
 
         # Masked mean aggregation (ignore padded + masked directions)
-        valid = (pad_mask * dir_mask).reshape(B, N, 1, 1, 1)
-        valid_count = valid.sum(dim=1).clamp(min=1)
-
-        g3 = (e3_r * valid).sum(dim=1) / valid_count
-        g2 = (e2_r * valid[..., :h2, :w2]).sum(dim=1) / valid_count[..., :h2, :w2]
-        g1 = (e1_r * valid[..., :h1, :w1]).sum(dim=1) / valid_count[..., :h1, :w1]
+        valid = (pad_mask * dir_mask).to(e3_r.dtype).reshape(B, N, 1, 1, 1)
+        g3 = _masked_mean(e3_r, valid)
+        g2 = _masked_mean(e2_r, valid)
+        g1 = _masked_mean(e1_r, valid)
 
         # --- DTI head: decode aggregated features ---
         dti = self.dti_up2(g3, g2)
@@ -204,17 +228,18 @@ class PretextUNet(nn.Module):
         dti_pred = self.dti_head(dti)  # (B, 6, H, W)
 
         # --- DWI head: chunked per-direction reconstruction ---
-        g3_exp = g3.unsqueeze(1).expand_as(e3_r).reshape(BN, f_ch, h3, w3)
-        g2_exp = g2.unsqueeze(1).expand_as(e2_r).reshape(BN, f_ch // 2, h2, w2)
-        g1_exp = g1.unsqueeze(1).expand_as(e1_r).reshape(BN, f_ch // 4, h1, w1)
+        # Gather global features per flattened (B, N) index lazily per chunk,
+        # avoiding large expanded intermediate tensors.
+        flat_to_batch = torch.arange(BN, device=directions.device) // N
 
         dwi_parts = []
         for i in range(0, BN, dir_chunk_size):
             s = slice(i, i + dir_chunk_size)
+            b_idx = flat_to_batch[s]
             dwi_parts.append(
                 self.dir_decoder(
                     (e1[s], e2[s], e3[s]),
-                    (g1_exp[s], g2_exp[s], g3_exp[s]),
+                    (g1[b_idx], g2[b_idx], g3[b_idx]),
                 )
             )
         dwi_single = torch.cat(dwi_parts, dim=0)  # (BN, 1, H, W)
