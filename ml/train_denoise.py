@@ -6,8 +6,7 @@ Training: EMA weights, linear warmup + cosine LR, gradient accumulation.
 
 Usage:
     # Fast prototyping with tiny model
-    python ml/train_denoise.py --zarr_path dataset/pretext_dataset.zarr \\
-        --model_size tiny --epochs 20 --augment
+    python ml/train_denoise.py --zarr_path dataset/pretext_dataset.zarr --model_size tiny --patch_size 64 --epochs 20 --augment
 
     # Full training
     python ml/train_denoise.py --zarr_path dataset/pretext_dataset.zarr \\
@@ -285,12 +284,13 @@ def _log_images(model, loader, writer, epoch, device, args):
     pad_mask = batch["pad_mask"].to(device)
     bvals = batch["bvals"].to(device)
     bvecs = batch["bvecs"].to(device)
+    pos_enc = batch["pos_enc"].to(device)
 
     use_amp = device.type in ["cuda", "mps"]
     amp_dtype = torch.bfloat16 if device.type == "mps" else torch.float16
 
     with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-        denoised = model(noisy, pad_mask, bvals, bvecs,
+        denoised = model(noisy, pad_mask, bvals, bvecs, pos_enc,
                          dir_chunk_size=args.dir_chunk_size)
 
     idx = 0
@@ -336,8 +336,10 @@ def train(args):
     print(f"Subjects — train: {len(train_idx)}, val: {len(val_idx)}")
 
     train_ds = DWIDenoiseDataset(args.zarr_path, subject_indices=train_idx,
-                                 augment=args.augment)
-    val_ds = DWIDenoiseDataset(args.zarr_path, subject_indices=val_idx)
+                                 augment=args.augment,
+                                 patch_size=args.patch_size)
+    val_ds = DWIDenoiseDataset(args.zarr_path, subject_indices=val_idx,
+                               patch_size=args.patch_size)
 
     loader_kwargs = dict(
         num_workers=args.num_workers,
@@ -418,10 +420,11 @@ def train(args):
             pad_mask = batch["pad_mask"].to(device, non_blocking=True)
             bvals = batch["bvals"].to(device, non_blocking=True)
             bvecs = batch["bvecs"].to(device, non_blocking=True)
+            pos_enc = batch["pos_enc"].to(device, non_blocking=True)
 
             with torch.autocast(device_type=device.type, dtype=amp_dtype,
                                 enabled=use_amp):
-                denoised = model(noisy, pad_mask, bvals, bvecs,
+                denoised = model(noisy, pad_mask, bvals, bvecs, pos_enc,
                                  dir_chunk_size=args.dir_chunk_size)
                 losses = denoise_loss(denoised, clean, pad_mask,
                                       alpha_ssim=args.alpha_ssim,
@@ -549,10 +552,11 @@ def _validate(model, loader, device, args):
         pad_mask = batch["pad_mask"].to(device, non_blocking=True)
         bvals = batch["bvals"].to(device, non_blocking=True)
         bvecs = batch["bvecs"].to(device, non_blocking=True)
+        pos_enc = batch["pos_enc"].to(device, non_blocking=True)
 
         with torch.autocast(device_type=device.type, dtype=amp_dtype,
                             enabled=use_amp):
-            denoised = model(noisy, pad_mask, bvals, bvecs,
+            denoised = model(noisy, pad_mask, bvals, bvecs, pos_enc,
                              dir_chunk_size=args.dir_chunk_size)
             losses = denoise_loss(denoised, clean, pad_mask,
                                   alpha_ssim=args.alpha_ssim,
@@ -583,6 +587,9 @@ def main():
                         default="dataset/pretext_dataset.zarr")
     parser.add_argument("--augment", action="store_true",
                         help="Enable data augmentation (flips + rotations).")
+    parser.add_argument("--patch_size", type=int, default=None,
+                        help="Train on random NxN patches instead of full slices "
+                             "(e.g. 64). Reduces memory significantly.")
 
     # Model
     parser.add_argument("--model_size", type=str, default="base",

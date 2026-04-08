@@ -177,13 +177,13 @@ def _masked_mean(feats: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 class DirEncoder(nn.Module):
     """Shared encoder applied independently to each DWI direction.
-    Input:  (*, 5, H, W) — signal + bval + 3x bvec
+    Input:  (*, 7, H, W) — signal + bval + 3x bvec + 2x position (y, x)
     Output: multi-scale feature list for skip connections
     """
 
     def __init__(self, f: int = 48, drop_path: float = 0.0):
         super().__init__()
-        self.enc1 = ResConvBlock(5, f, drop_path)
+        self.enc1 = ResConvBlock(7, f, drop_path)
         self.enc2 = DownBlock(f, f * 2, drop_path)
         self.enc3 = DownBlock(f * 2, f * 4, drop_path)
         self.enc4 = DownBlock(f * 4, f * 8, drop_path)
@@ -248,6 +248,7 @@ class DenoiseUNet(nn.Module):
         pad_mask: torch.Tensor,
         bvals: torch.Tensor,
         bvecs: torch.Tensor,
+        pos_enc: torch.Tensor,
         dir_chunk_size: int = 16,
     ) -> torch.Tensor:
         """
@@ -257,16 +258,19 @@ class DenoiseUNet(nn.Module):
         pad_mask  : (B, N)  — 1.0 = real direction, 0.0 = padding
         bvals     : (B, N)
         bvecs     : (B, 3, N)
+        pos_enc   : (B, 2, H, W) — normalized (y, x) position coordinates
         dir_chunk_size : int — max directions per encoder/decoder pass
         """
         B, N, H, W = noisy_dwi.shape
         BN = B * N
 
-        # Per-direction input: signal + bval + 3x bvec
+        # Per-direction input: signal + bval + 3x bvec + 2x position
         sigs = noisy_dwi.reshape(BN, 1, H, W)
         bvals_norm = (bvals / 1000.0).reshape(BN, 1, 1, 1).expand(-1, -1, H, W)
         bvecs_r = bvecs.transpose(1, 2).reshape(BN, 3, 1, 1).expand(-1, -1, H, W)
-        x = torch.cat([sigs, bvals_norm, bvecs_r], dim=1)  # (BN, 5, H, W)
+        # Repeat position encoding for each direction: (B, 2, H, W) -> (BN, 2, H, W)
+        pos_r = pos_enc.unsqueeze(1).expand(-1, N, -1, -1, -1).reshape(BN, 2, H, W)
+        x = torch.cat([sigs, bvals_norm, bvecs_r, pos_r], dim=1)  # (BN, 7, H, W)
 
         # Chunked encoding
         e1_parts, e2_parts, e3_parts, e4_parts = [], [], [], []
