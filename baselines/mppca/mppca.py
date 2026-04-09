@@ -55,6 +55,7 @@ from baselines.utils import (
     evals_to_adc,
     evals_to_fa,
     fit_dti_to_6d,
+    save_denoising_slice_plot,
     scalar_map_metrics,
 )
 
@@ -87,6 +88,52 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
+def run_mppca_denoising(noisy: np.ndarray, cfg: dict) -> np.ndarray:
+    from dipy.denoise.localpca import mppca
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        denoised = mppca(
+            noisy,
+            patch_radius=cfg["patch_radius"],
+            pca_method=cfg["pca_method"],
+        ).astype(np.float32)
+    return denoised
+
+
+def save_example_plot(
+    zarr_path: str,
+    subject_key: str,
+    cfg: dict,
+    out_path: Path,
+    b0_threshold: float,
+    brain_mask_frac: float,
+    slice_idx: int | None = None,
+    volume_idx: int | None = None,
+) -> dict:
+    store = zarr.open(zarr_path, mode="r")
+    grp = store[subject_key]
+    noisy = grp["input_dwi"][:]
+    target_dwi = grp["target_dwi"][:]
+    bvals = grp["bvals"][:].astype(float)
+    denoised = run_mppca_denoising(noisy, cfg)
+    return save_denoising_slice_plot(
+        noisy_dwi=noisy,
+        denoised_dwi=denoised,
+        bvals=bvals,
+        out_path=out_path,
+        subject_key=subject_key,
+        b0_threshold=b0_threshold,
+        target_dwi=target_dwi,
+        brain_mask_frac=brain_mask_frac,
+        slice_idx=slice_idx,
+        volume_idx=volume_idx,
+        before_label="Before denoising",
+        after_label="After MP-PCA",
+        target_label="Target",
+    )
+
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Per-subject worker  (runs in subprocess)
@@ -94,7 +141,6 @@ log = logging.getLogger(__name__)
 
 def evaluate_subject(zarr_path: str, subject_key: str, cfg: dict) -> dict | str:
     """Full evaluation pipeline for one subject."""
-    from dipy.denoise.localpca import mppca
 
     t0 = time.time()
     try:
@@ -108,13 +154,7 @@ def evaluate_subject(zarr_path: str, subject_key: str, cfg: dict) -> dict | str:
         bvecs        = grp["bvecs"][:].astype(float)    # (3,N) in zarr → transpose
 
         # ── 2. Denoise with MP-PCA ────────────────────────────────────────────
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            denoised = mppca(
-                noisy,
-                patch_radius=cfg["patch_radius"],
-                pca_method=cfg["pca_method"],
-            ).astype(np.float32)
+        denoised = run_mppca_denoising(noisy, cfg)
 
         # ── 3. DWI-space metrics ──────────────────────────────────────────────
         dwi_m = dwi_metrics(target_dwi, denoised)
@@ -270,6 +310,29 @@ def main(args):
              len(subjects) - n_fail, len(subjects), total)
     log.info("Saved → %s", out_path)
 
+    if subjects and not args.skip_plot:
+        plot_subject = args.plot_subject if args.plot_subject in subjects else subjects[0]
+        if args.plot_subject and args.plot_subject not in subjects:
+            log.warning("Plot subject %s not found. Falling back to %s.",
+                        args.plot_subject, plot_subject)
+
+        plot_path = out_dir / f"denoising_example_{plot_subject}.png"
+        try:
+            plot_meta = save_example_plot(
+                zarr_path=zarr_path,
+                subject_key=plot_subject,
+                cfg=cfg,
+                out_path=plot_path,
+                b0_threshold=args.b0_threshold,
+                brain_mask_frac=args.brain_mask_frac,
+                slice_idx=args.plot_slice_idx,
+                volume_idx=args.plot_volume_idx,
+            )
+            log.info("Saved denoising plot → %s  (z=%d, volume=%d)",
+                     plot_meta["out_path"], plot_meta["slice_idx"], plot_meta["volume_idx"])
+        except Exception as exc:
+            log.warning("Could not save denoising plot for %s: %s", plot_subject, exc)
+
     # ── Console summary ───────────────────────────────────────────────────────
     if not df.empty:
         print("\n── DWI metrics (denoised_dwi vs target_dwi) " + "─" * 25)
@@ -313,5 +376,13 @@ if __name__ == "__main__":
     parser.add_argument("--brain_mask_frac", type=float, default=BRAIN_MASK_FRAC,
                         help="Brain mask: fraction of max b0 signal. Voxels below "
                              "this are excluded from DTI metrics (default: 0.1)")
+    parser.add_argument("--skip_plot",      action="store_true",
+                        help="Disable saving the notebook-style denoising slice plot")
+    parser.add_argument("--plot_subject",   default=None,
+                        help="Subject key to visualize (default: first valid subject)")
+    parser.add_argument("--plot_slice_idx", type=int, default=None,
+                        help="Axial slice index for visualization (default: auto)")
+    parser.add_argument("--plot_volume_idx", type=int, default=None,
+                        help="DWI volume index for visualization (default: auto)")
 
     main(parser.parse_args())

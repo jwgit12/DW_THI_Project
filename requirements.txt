@@ -1,4 +1,7 @@
 numpy
+scipy
+scikit-image
+pandas
 nibabel
 dipy
 opencv-python

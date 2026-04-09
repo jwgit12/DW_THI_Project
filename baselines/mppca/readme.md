@@ -2,14 +2,15 @@
 
 Evaluates [Marcenko-Pastur PCA (MP-PCA)](https://docs.dipy.org/stable/examples_built/preprocessing/denoise_mppca.html)
 denoising quality against clean ground-truth targets stored in a Zarr dataset.
-Nothing is written back to the store — only a metrics CSV is produced.
+Nothing is written back to the store — the script writes a metrics CSV and an
+example denoising PNG to the output directory.
 
 ---
 
 ## Installation
 
 ```bash
-pip install dipy zarr numpy pandas scikit-image
+pip install dipy zarr numpy pandas scikit-image matplotlib
 ```
 
 ---
@@ -25,7 +26,8 @@ python mppca.py \
     --patch_radius   2 \
     --pca_method     eig \
     --dti_fit_method WLS \
-    --fa_mask_thresh 0.1
+    --fa_mask_thresh 0.1 \
+    --plot_subject   subject_000
 ```
 
 ---
@@ -73,8 +75,20 @@ DWI metrics                            denoised FA / ADC
 
 ```
 ./results/
-└── metrics_per_subject.csv
+├── metrics_per_subject.csv
+└── denoising_example_subject_000.png
 ```
+
+The PNG reproduces the notebook-style 2D slice view with:
+- noisy input slice
+- denoised slice
+- target slice
+- normalized difference map between target and denoised output
+- k-space views for all four panels in a second row
+
+By default, the script saves one example plot for the first valid subject. Use
+`--plot_subject`, `--plot_slice_idx`, and `--plot_volume_idx` to override the
+selection, or `--skip_plot` to disable it.
 
 One row per subject, plus `MEAN` and `STD` summary rows at the bottom:
 
@@ -142,6 +156,10 @@ FA and ADC are derived identically from both the fitted and target tensors:
 | `--zarr_path` | *(required)* | Path to the `.zarr` store |
 | `--out_dir` | `./mppca_eval` | Directory for the output CSV |
 | `--n_jobs` | `4` | Parallel workers |
+| `--skip_plot` | off | Disable saving the denoising example PNG |
+| `--plot_subject` | first valid subject | Subject key to visualize |
+| `--plot_slice_idx` | auto | Axial slice index for the example plot |
+| `--plot_volume_idx` | auto | DWI volume index for the example plot |
 
 ### MP-PCA
 

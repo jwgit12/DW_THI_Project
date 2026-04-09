@@ -1,164 +1,145 @@
 # DW_THI_Project
 
-Deep-learning and baseline-denoising experiments for diffusion-weighted MRI (DW-MRI), with a focus on:
+Supervised DWI restoration research code for a variable-`N` diffusion dataset. The current implementation centers on a new `research/` stack that trains and evaluates a set-conditioned 3D model against clean DWI targets and DTI tensor targets, while keeping Patch2Self and MPPCA as comparison baselines.
 
-- denoising degraded DWI signal,
-- reconstructing diffusion directions that were masked during training,
-- predicting 6-component DTI tensors from noisy, partial diffusion inputs.
+## Current focus
 
-The repository contains:
+- fully supervised restoration from `input_dwi -> target_dwi`
+- variable-length diffusion sets per subject (`N` differs across subjects)
+- tensor-aware training via direct tensor supervision and differentiable tensor fitting
+- held-out subject evaluation with fold manifests, image metrics, tensor metrics, edge metrics, and paired statistical tests
 
-- a full data-preparation pipeline from DWI NIfTI to Zarr,
-- a direction-invariant residual U-Net denoising model with EMA training,
-- classical baselines (MPPCA, Patch2Self) with per-subject evaluation,
-- a PyQt6 dataset inspector,
-- shared evaluation utilities (PSNR, SSIM, DTI metrics).
+## Dataset contract
 
-## Why this project exists
+The supervised Zarr dataset lives at `dataset/pretext_dataset.zarr/` and contains per-subject groups:
 
-DW-MRI is noisy and relatively low-resolution. That makes downstream analysis (tractography, FA/MD quantification, microstructure studies) sensitive to image quality.
+| Array | Shape | Description |
+|---|---|---|
+| `input_dwi` | `(X, Y, Z, N)` | noisy / degraded DWI |
+| `target_dwi` | `(X, Y, Z, N)` | clean DWI target |
+| `target_dti_6d` | `(X, Y, Z, 6)` | tensor target `[Dxx, Dxy, Dyy, Dxz, Dyz, Dzz]` |
+| `bvals` | `(N,)` | diffusion b-values |
+| `bvecs` | `(3, N)` | diffusion gradient directions |
 
-This project frames the problem as a pretext learning task:
+The local dataset currently contains `18` subjects. In this dataset `N` varies, with both `130` and `258` direction stacks present.
 
-- Input: noisy DWI plus missing gradient directions.
-- Targets: clean DWI and clean DTI (6 independent tensor coefficients).
+## Research stack
 
-The hypothesis is that forcing the model to infer hidden gradient directions helps it learn diffusion structure priors that transfer to denoising/reconstruction.
-
-## Current project status
-
-- Pretext Zarr dataset at `dataset/pretext_dataset.zarr` with **18 subjects**
-- Dataset generation params: `keep_fraction=0.5`, `noise_min=0.01`, `noise_max=0.05`
-- Subject tensor shapes: `input_dwi (130, 132, 25, 258)`, `target_dti_6d (130, 132, 25, 6)`
-- Training is early-stage; metrics not yet near clinical-quality targets
-
-## Repository map
+The new implementation lives under `research/`:
 
 ```text
-DW_THI_Project/
-├── functions.py                 # Core DWI utilities (loading, degradation, DTI)
-├── build_pretext_dataset.py     # NIfTI -> Zarr preprocessing pipeline
-├── visualizer.py                # PyQt6 dataset inspector GUI
-├── requirements.txt             # Python dependencies
-├── dti_prep.ipynb               # Exploratory notebook
+research/
+├── data/
+│   ├── zarr_dataset.py         # Lazy subject access, metadata, train-only clipping stats
+│   ├── patch_sampler.py        # Foreground / boundary / WM patch sampling
+│   ├── collate.py              # Variable-N padding and batch assembly
+│   └── gradients.py            # Gradient validation, shell ids, N_ctx selection
+├── models/
+│   ├── aqd_net.py              # AQD-Net and fixed-channel ablation model
+│   ├── volume_encoder.py       # Shared 3D encoder/decoder blocks
+│   ├── set_attention.py        # Masked cross-volume attention
+│   └── tensor_head.py          # Auxiliary tensor decoder head
+├── losses/
+│   ├── charbonnier.py          # Weighted DWI reconstruction + SSIM
+│   ├── edge_loss.py            # Edge-aware boundary preservation loss
+│   ├── tensor_fit.py           # Differentiable WLS tensor fit from predicted DWI
+│   └── dti_metrics.py          # Torch tensor scalars and tensor losses
+├── eval/
+│   ├── metrics_image.py        # PSNR / SSIM / NRMSE / edge metrics
+│   ├── metrics_tensor.py       # Tensor RMSE, FA/MD/AD/RD errors, FDR helpers
+│   └── evaluate_fold.py        # Fold evaluation against noisy, Patch2Self, MPPCA
 ├── baselines/
-│   ├── utils.py                 # Shared metrics (PSNR, SSIM, DTI helpers)
-│   ├── mppca/
-│   │   ├── mppca.py             # MP-PCA denoising evaluation
-│   │   └── results/             # Per-subject CSV metrics
-│   └── patch2self/
-│       ├── patch2self.py        # Patch2Self denoising evaluation
-│       └── results/             # Per-subject CSV metrics
-├── ml/
-│   ├── denoise_dataset.py       # PyTorch Dataset (2D axial slices from Zarr)
-│   ├── denoise_model.py         # DenoiseUNet architecture
-│   ├── train_denoise.py         # Training loop (EMA, mixed precision, multi-loss)
-│   ├── checkpoints/             # Saved model weights (best_denoise.pt)
-│   └── runs/                    # TensorBoard logs
-└── dataset/
-    ├── dataset_v1/              # Raw NIfTI DWI files
-    ├── dataset_v2/              # Additional raw data
-    ├── dataset_v3/              # Additional raw data
-    └── pretext_dataset.zarr/    # Processed training data (18 subjects)
+│   ├── run_patch2self.py       # Wrapper on common preprocessing
+│   └── run_mppca.py            # Wrapper on common preprocessing
+├── splits/
+│   └── folds.json              # 6 subject-level folds: 12 train / 3 val / 3 test
+├── infer.py                    # Sliding-window + multi-context inference
+├── train.py                    # Training loop with EMA, warmup+cosine, early stop
+└── tests/
+    └── test_research_stack.py  # Smoke tests for data/model/inference contracts
 ```
 
-## End-to-end pipeline
+## AQD-Net summary
 
-### 1) Source data discovery and loading
+`research/models/aqd_net.py` implements the proposed model:
 
-`functions.py` handles DWI dataset discovery and loading:
+- shared 3D per-volume encoder
+- gradient conditioning from `[is_b0, log_bval, bvec_x, bvec_y, bvec_z]`
+- masked set attention across diffusion volumes
+- per-volume residual decoding (`pred_dwi = x_in - residual`)
+- auxiliary tensor head for `target_dti_6d`
 
-- finds `*_dwi.nii.gz` files,
-- expects sidecar gradients at matching paths (`*.bval`, `*.bvec`),
-- builds dipy `gradient_table` objects.
+To handle subjects with `N=258`, training and inference use the plan’s memory fallback by default:
 
-### 2) Synthetic degradation and targets
+- `context_cap = 48`
+- all b0 volumes are retained
+- remaining DWI volumes are selected shell-stratified with angular coverage
+- inference reconstructs the full subject by running multiple contexts and stitching them back together
 
-`build_pretext_dataset.py` performs per-subject preprocessing:
+The default training preset is now a smaller AQD-Net for faster iteration:
 
-- noisy input creation:
-  - k-space center-crop style masking via `keep_fraction`,
-  - additive Gaussian noise with random level in `[noise_min, noise_max]`.
-- clean target creation:
-  - dipy tensor fit,
-  - conversion from full 3x3 to 6-component representation (`Dxx, Dxy, Dyy, Dxz, Dyz, Dzz`).
+- `model_preset = "small"`
+- `base_channels = 16`
+- `attention_depth = 1`
+- `num_heads = 4`
 
-Output is written to a Zarr store with compressed arrays.
+Inference and evaluation also skip the auxiliary tensor decoder head, because only `pred_dwi` is needed on that path.
 
-### 3) Training sample construction
+## Training objective
 
-`ml/denoise_dataset.py` (`DWIDenoiseDataset`):
+`research/train.py` uses the composite supervised loss from the implementation plan:
 
-- samples 2D axial slices from each subject,
-- optional augmentation (flips, 180-degree rotations),
-- optional patch-wise training (random crops via `--patch_size`),
-- per-slice percentile-based normalization,
-- position encoding: normalized (y, x) coordinates appended per direction,
-- custom collate function to pad variable direction counts per batch.
+```text
+L_total =
+  1.00 * L_dwi
+  + 0.25 * L_ssim
+  + 0.20 * L_edge
+  + 0.35 * L_tensor_fit
+  + 0.15 * L_tensor_aux
+  + 0.10 * L_fa_md
+```
 
-### 4) Model architecture
+Implemented details include:
 
-`ml/denoise_model.py` defines `DenoiseUNet`:
+- per-subject normalization from the median input mean-b0 signal
+- train-fold-only clipping threshold estimation
+- subject-level split reuse via `research/splits/folds.json`
+- foreground / boundary / white-matter patch sampling
+- diffusion-geometry-safe augmentation with matching `bvec` updates
+- AdamW, warmup + cosine decay, gradient clipping, and EMA
+- TensorBoard scalars for epoch-level train/validation metrics plus a fixed validation denoising slice
+- early stopping on the validation composite score:
 
-- shared direction-wise encoder operating on 7-channel per-direction input:
-  - signal (1ch),
-  - normalized b-value (1ch),
-  - 3 b-vector components (3ch),
-  - normalized position encoding (2ch).
-- masked mean aggregation across valid (non-padded) directions,
-- 4-level decoder with CBAM (Channel + Spatial) attention,
-- residual learning: output = input + predicted residual,
-- chunked direction processing (`dir_chunk_size`) to control memory.
+```text
+score =
+  + PSNR_target_dwi
+  + SSIM_target_dwi
+  - NRMSE_target_dwi
+  - tensor_RMSE
+  - FA_abs_error
+  - MD_abs_error
+```
 
-Model size presets: `tiny` (16 features), `small` (24), `base` (48).
+## Baselines
 
-### 5) Training and validation
+The original baseline scripts remain in `baselines/`, and the new fold evaluator uses wrappers in `research/baselines/` so baselines and model evaluation share:
 
-`ml/train_denoise.py` includes:
+- the same subject normalization
+- the same masking policy
+- the same tensor fitting code path
+- the same image/tensor/edge metrics
 
-- loss: 70% Charbonnier + 20% MS-SSIM + 10% Edge (spatial gradients),
-- EMA weight smoothing (decay=0.999),
-- mixed precision (bfloat16 on MPS, float16 on CUDA),
-- linear warmup + cosine annealing LR schedule,
-- gradient accumulation and clipping,
-- metrics: PSNR, SSIM in DWI domain,
-- TensorBoard scalar/image logging,
-- best-checkpoint saving to `ml/checkpoints/best_denoise.pt`.
+Patch2Self defaults in the wrapper follow the plan:
 
-## Baseline: MPPCA
+- OLS first
+- `patch_radius=0`
 
-`baselines/mppca/mppca.py` evaluates Marcenko-Pastur PCA denoising:
+MPPCA defaults are fixed and documented:
 
-- uses dipy's `mppca` implementation,
-- computes DWI-space metrics (PSNR, SSIM, RMSE, MAE, NRMSE),
-- computes DTI-space metrics (FA-MAE, MD-MAE),
-- outputs per-subject CSV to `baselines/mppca/results/`.
+- `patch_radius=2`
+- `pca_method="eig"`
 
-## Baseline: Patch2Self
-
-`baselines/patch2self/patch2self.py` evaluates Patch2Self self-supervised denoising:
-
-- uses dipy's Patch2Self implementation,
-- same metric suite as MPPCA baseline,
-- outputs per-subject CSV to `baselines/patch2self/results/`.
-
-Shared evaluation utilities live in `baselines/utils.py`.
-
-## Data format contract (Zarr)
-
-Per subject group (`subject_XXX`):
-
-| Array           | Shape          | Type    | Description                          |
-|-----------------|----------------|---------|--------------------------------------|
-| `input_dwi`     | (X, Y, Z, N)  | float32 | Noisy + low-res DWI                 |
-| `target_dwi`    | (X, Y, Z, N)  | float32 | Clean ground truth DWI              |
-| `target_dti_6d` | (X, Y, Z, 6)  | float32 | DTI tensor (6 independent coeffs)   |
-| `bvals`         | (N,)           | float32 | b-values                            |
-| `bvecs`         | (3, N)         | float32 | Gradient vectors                    |
-
-Root attrs include generation provenance (`num_subjects`, `keep_fraction`, `noise_min`, `noise_max`).
-
-## Environment and install
+## Installation
 
 ```bash
 python3 -m venv .venv
@@ -168,7 +149,7 @@ pip install -r requirements.txt
 
 ## Common commands
 
-### Build pretext dataset
+Build the supervised Zarr dataset:
 
 ```bash
 python3 build_pretext_dataset.py \
@@ -179,86 +160,91 @@ python3 build_pretext_dataset.py \
   --noise_max 0.05
 ```
 
-### Inspect dataset interactively
+Inspect the dataset:
 
 ```bash
 python3 visualizer.py --zarr_path dataset/pretext_dataset.zarr
 ```
 
-### Train denoising model
+Train AQD-Net on one fold:
 
 ```bash
-python3 ml/train_denoise.py \
+python3 -m research.train \
   --zarr_path dataset/pretext_dataset.zarr \
-  --model_size base \
-  --epochs 100 \
+  --fold_id 0 \
+  --epochs 40 \
   --batch_size 2 \
-  --accum_steps 4 \
+  --model_preset small \
+  --patch_size 32 32 32 \
+  --context_cap 48 \
   --augment
 ```
 
-### Open TensorBoard
+Run inference on one subject:
 
 ```bash
-tensorboard --logdir ml/runs/
+python3 -m research.infer \
+  --checkpoint research/runs/fold_0/best.pt \
+  --zarr_path dataset/pretext_dataset.zarr \
+  --subject_id subject_000 \
+  --patch_size 32 32 32
 ```
 
-## Training CLI reference (`ml/train_denoise.py`)
+Evaluate one fold against noisy input, Patch2Self, and MPPCA:
 
-| Argument | Default | Description |
-|----------|---------|-------------|
-| `--zarr_path` | `dataset/pretext_dataset.zarr` | Path to Zarr dataset |
-| `--model_size` | `base` | Model preset: `tiny`, `small`, `base` |
-| `--base_features` | (from preset) | Override base feature width |
-| `--drop_path` | `0.1` | Stochastic depth rate |
-| `--patch_size` | `None` | Random crop size (full slice if unset) |
-| `--augment` | `False` | Enable data augmentation |
-| `--epochs` | `100` | Number of training epochs |
-| `--batch_size` | `2` | Batch size |
-| `--accum_steps` | `4` | Gradient accumulation steps |
-| `--lr` | `1e-3` | Learning rate |
-| `--grad_clip_norm` | `1.0` | Gradient clipping norm |
-| `--ema_decay` | `0.999` | EMA weight decay |
-| `--dir_chunk_size` | `16` | Directions processed per chunk |
-| `--alpha_ssim` | `0.2` | MS-SSIM loss weight |
-| `--alpha_edge` | `0.1` | Edge loss weight |
-| `--seed` | `42` | Random seed |
-| `--num_workers` | `0` | DataLoader workers |
-| `--log_dir` | `ml/runs/denoise` | TensorBoard log directory |
-| `--ckpt_dir` | `ml/checkpoints` | Checkpoint directory |
+```bash
+python3 -m research.eval.evaluate_fold \
+  --checkpoint research/runs/fold_0/best.pt \
+  --zarr_path dataset/pretext_dataset.zarr \
+  --fold_id 0 \
+  --output_dir research/eval/results
+```
 
-## Apple Silicon notes
+Run smoke tests:
 
-The training code includes MPS-aware paths:
+```bash
+python3 -m unittest research.tests.test_research_stack
+```
 
-- mixed precision with bfloat16 autocast,
-- channels-last memory layout,
-- direction chunking to reduce peak memory,
-- periodic cache cleanup.
+Launch TensorBoard for a fold run:
 
-If you hit OOM: lower `--dir_chunk_size`, `--batch_size`, or `--model_size`.
+```bash
+tensorboard --logdir research/runs
+```
 
-## Known limitations / next priorities
+## Training CLI highlights
 
-- Validation metrics are still far from clinical-quality targets.
-- No fixed train/val split artifact is persisted (split generated in code with seed 42).
-- No standalone test harness for the deep learning pipeline.
-- No experiment config/version registry.
+`research/train.py` supports the planned ablations directly:
 
-Recommended next improvements:
+- `--disable_gradient_conditioning`
+- `--disable_attention`
+- `--disable_aux_tensor_head`
+- `--disable_tensor_fit_loss`
+- `--disable_edge_loss`
+- `--architecture fixed_channel`
 
-1. Add experiment config files and reproducible run manifests.
-2. Add model unit/integration tests for data contracts and loss/mask behavior.
-3. Track train/val subject IDs in saved checkpoint metadata.
-4. Introduce baseline-vs-model evaluation scripts on held-out subjects.
+Useful core options:
 
-## Dataset references
+- `--model_preset small`: smaller default AQD-Net (`16 / 1 / 4`)
+- `--model_preset base`: previous larger AQD-Net (`32 / 3 / 8`)
+- `--context_cap 48`: enable large-`N` fallback
+- `--patch_size X Y Z`: patch-based 3D training and inference
+- `--use_b0_guide`: concatenate the mean-b0 patch as an extra guide channel
+- `--augment`: enable geometry-safe augmentation
+- `--val_overlap`: overlap used during sliding-window validation
 
-- Fiber architecture in the ventromedial striatum and its relation with the bed nucleus of the stria terminalis:
-  [OpenNeuro ds003047 v1.0.0](https://openneuro.org/datasets/ds003047/versions/1.0.0)
+Each fold run writes TensorBoard event files under `research/runs/fold_<id>/tensorboard/`.
+The validation example image uses the first validation subject, a fixed DWI volume, and a fixed axial slice, with panels ordered as `input | prediction | target | abs_error`.
 
-Potential additional datasets:
+Note: the current dataset has `Z=25`, so the code clamps requested patch sizes to the subject dimensions at runtime when necessary.
 
-- [DWI Traveling Human Phantom Study (ds000206)](https://openneuro.org/datasets/ds000206/versions/00002)
-- [SUDMEX_CONN (ds003346)](https://openneuro.org/datasets/ds003346/versions/1.1.2)
-- [SCA2 Diffusion Tensor Imaging (ds001378)](https://openneuro.org/datasets/ds001378/versions/00003)
+## Legacy files still in repo
+
+The repository still includes:
+
+- `functions.py` for raw DWI / tensor helper utilities
+- `build_pretext_dataset.py` for dataset creation
+- `visualizer.py` for manual inspection
+- `baselines/` for the original standalone baseline scripts
+
+The active research training and evaluation path is now the `research/` package, not the older `ml/` prototype.
