@@ -10,7 +10,7 @@ import numpy as np
 import zarr
 from tqdm import tqdm
 
-from functions import compute_dti, find_dwi_datasets, load_dwi_dataset, lowres_noise, tensor_to_6d
+from functions import compute_dti, find_dwi_datasets, load_dwi_dataset, lowres_noise, show_kspace, tensor_to_6d
 
 
 def parse_args() -> argparse.Namespace:
@@ -33,6 +33,14 @@ def _normalize_01(x: np.ndarray) -> np.ndarray:
     return (x - vmin) / (vmax - vmin + 1e-8)
 
 
+def _normalize_pair_01(a: np.ndarray, b: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    stacked = np.stack([a, b], axis=0).astype(np.float32)
+    vmin = float(np.min(stacked))
+    vmax = float(np.max(stacked))
+    scale = vmax - vmin + 1e-8
+    return (a - vmin) / scale, (b - vmin) / scale
+
+
 def save_qc_plot(
     subject_id: str,
     clean_dwi: np.ndarray,
@@ -49,13 +57,18 @@ def save_qc_plot(
     non_b0 = np.where(bvals >= 50)[0]
     b = int(non_b0[0]) if non_b0.size > 0 else 0
 
-    clean_slice = _normalize_01(clean_dwi[:, :, z, b])
-    degraded_slice = _normalize_01(degraded_dwi[:, :, z, b])
+    clean_slice, degraded_slice = _normalize_pair_01(
+        clean_dwi[:, :, z, b],
+        degraded_dwi[:, :, z, b],
+    )
+    clean_kspace = np.rot90(show_kspace(clean_slice), 1)
+    degraded_kspace = np.rot90(show_kspace(degraded_slice), 1)
+    diff_kspace = clean_kspace - degraded_kspace
 
     b0_idx = np.where(bvals < 50)[0]
     b0_vol = int(b0_idx[0]) if b0_idx.size > 0 else b
 
-    fig, axes = plt.subplots(2, 3, figsize=(15, 9))
+    fig, axes = plt.subplots(3, 3, figsize=(15, 13))
 
     axes[0, 0].imshow(np.rot90(_normalize_01(clean_dwi[:, :, z, b0_vol]), 1), cmap="gray")
     axes[0, 0].set_title("b0 image example slice")
@@ -75,13 +88,26 @@ def save_qc_plot(
     axes[1, 0].axis("off")
     fig.colorbar(im, ax=axes[1, 0], fraction=0.046, pad=0.04)
 
-    axes[1, 1].plot(bvals, ".")
-    axes[1, 1].set_title("b-values per volume")
-    axes[1, 1].set_xlabel("Volume index")
-    axes[1, 1].set_ylabel("b-value")
+    axes[1, 1].imshow(clean_kspace, cmap="gray")
+    axes[1, 1].set_title("Ground Truth k-space")
+    axes[1, 1].axis("off")
 
+    axes[1, 2].imshow(degraded_kspace, cmap="gray")
+    axes[1, 2].set_title("Low-res + Noisy k-space")
     axes[1, 2].axis("off")
-    axes[1, 2].text(
+
+    k_im = axes[2, 0].imshow(diff_kspace, cmap="gray")
+    axes[2, 0].set_title("Difference k-space")
+    axes[2, 0].axis("off")
+    fig.colorbar(k_im, ax=axes[2, 0], fraction=0.046, pad=0.04)
+
+    axes[2, 1].plot(bvals, ".")
+    axes[2, 1].set_title("b-values per volume")
+    axes[2, 1].set_xlabel("Volume index")
+    axes[2, 1].set_ylabel("b-value")
+
+    axes[2, 2].axis("off")
+    axes[2, 2].text(
         0.0,
         0.95,
         (
@@ -198,4 +224,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

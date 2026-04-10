@@ -1,17 +1,17 @@
 # DW_THI_Project
 
-Supervised DWI restoration research code for a variable-`N` diffusion dataset. The current implementation centers on a new `research/` stack that trains and evaluates a set-conditioned 3D model against clean DWI targets and DTI tensor targets, while keeping Patch2Self and MPPCA as comparison baselines.
+Supervised DWI denoising and DTI prediction for a variable-`N` diffusion dataset. A deep learning model (QSpaceUNet) is trained to predict clean 6D DTI tensors directly from degraded DWI volumes, compared against Patch2Self and MP-PCA baselines.
 
 ## Current focus
 
-- fully supervised restoration from `input_dwi -> target_dwi`
-- variable-length diffusion sets per subject (`N` differs across subjects)
-- tensor-aware training via direct tensor supervision and differentiable tensor fitting
-- held-out subject evaluation with fold manifests, image metrics, tensor metrics, edge metrics, and paired statistical tests
+- Supervised prediction: `input_dwi (X,Y,Z,N)` → `target_dti_6d (X,Y,Z,6)`
+- 2D slice-based training with q-space encoding for variable `N`
+- Tensor-aware training via combined MSE + differentiable FA/MD loss
+- Subject-level train/val/test split with held-out evaluation
 
 ## Dataset contract
 
-The supervised Zarr dataset lives at `dataset/pretext_dataset.zarr/` and contains per-subject groups:
+The supervised Zarr dataset lives at `dataset/pretext_dataset_new.zarr/` and contains per-subject groups:
 
 | Array | Shape | Description |
 |---|---|---|
@@ -21,123 +21,73 @@ The supervised Zarr dataset lives at `dataset/pretext_dataset.zarr/` and contain
 | `bvals` | `(N,)` | diffusion b-values |
 | `bvecs` | `(3, N)` | diffusion gradient directions |
 
-The local dataset currently contains `18` subjects. In this dataset `N` varies, with both `130` and `258` direction stacks present.
+The dataset contains 18 subjects with spatial dims `(130, 132, 25)`. `N` varies across subjects (130 or 258 volumes).
 
-## Research stack
-
-The new implementation lives under `research/`:
+## Repository structure
 
 ```text
-research/
-├── data/
-│   ├── zarr_dataset.py         # Lazy subject access, metadata, train-only clipping stats
-│   ├── patch_sampler.py        # Foreground / boundary / WM patch sampling
-│   ├── collate.py              # Variable-N padding and batch assembly
-│   └── gradients.py            # Gradient validation, shell ids, N_ctx selection
-├── models/
-│   ├── aqd_net.py              # AQD-Net and fixed-channel ablation model
-│   ├── volume_encoder.py       # Shared 3D encoder/decoder blocks
-│   ├── set_attention.py        # Masked cross-volume attention
-│   └── tensor_head.py          # Auxiliary tensor decoder head
-├── losses/
-│   ├── charbonnier.py          # Weighted DWI reconstruction + SSIM
-│   ├── edge_loss.py            # Edge-aware boundary preservation loss
-│   ├── tensor_fit.py           # Differentiable WLS tensor fit from predicted DWI
-│   └── dti_metrics.py          # Torch tensor scalars and tensor losses
-├── eval/
-│   ├── metrics_image.py        # PSNR / SSIM / NRMSE / edge metrics
-│   ├── metrics_tensor.py       # Tensor RMSE, FA/MD/AD/RD errors, FDR helpers
-│   └── evaluate_fold.py        # Fold evaluation against noisy, Patch2Self, MPPCA
+DW_THI_Project/
+├── functions.py                     # Core DWI loading, degradation, and DTI helpers
+├── build_pretext_dataset.py         # NIfTI -> Zarr dataset builder
+├── visualizer.py                    # PyQt6 viewer for the Zarr dataset
 ├── baselines/
-│   ├── run_patch2self.py       # Wrapper on common preprocessing
-│   └── run_mppca.py            # Wrapper on common preprocessing
-├── splits/
-│   └── folds.json              # 6 subject-level folds: 12 train / 3 val / 3 test
-├── infer.py                    # Sliding-window + multi-context inference
-├── train.py                    # Training loop with EMA, warmup+cosine, early stop
-└── tests/
-    └── test_research_stack.py  # Smoke tests for data/model/inference contracts
+│   ├── utils.py                     # Shared DWI/DTI metrics and plotting helpers
+│   ├── patch2self/patch2self.py     # Patch2Self baseline evaluation
+│   └── mppca/mppca.py               # MP-PCA baseline evaluation
+├── research/
+│   ├── dataset.py                   # Zarr slice-based PyTorch dataset
+│   ├── model.py                     # QSpaceUNet (q-space encoder + 2D U-Net)
+│   ├── train.py                     # Training script
+│   └── evaluate.py                  # Evaluation (produces CSV like baselines)
+├── requirements.txt                 # Python dependencies
+└── dti_prep.ipynb
 ```
 
-## AQD-Net summary
+## QSpaceUNet
 
-`research/models/aqd_net.py` implements the proposed model:
+`research/model.py` implements the model:
 
-- shared 3D per-volume encoder
-- gradient conditioning from `[is_b0, log_bval, bvec_x, bvec_y, bvec_z]`
-- masked set attention across diffusion volumes
-- per-volume residual decoding (`pred_dwi = x_in - residual`)
-- auxiliary tensor head for `target_dti_6d`
+- **Q-space encoder**: 1×1 conv compresses `N` DWI volumes into `C` feature channels, with FiLM conditioning from a gradient table MLP (bvals/bvecs → scale + shift)
+- **2D U-Net backbone**: 4-level encoder-decoder with skip connections, GroupNorm, auto-padding for arbitrary spatial dims
+- **Output**: 6-channel DTI tensor `[Dxx, Dxy, Dyy, Dxz, Dyz, Dzz]`
 
-To handle subjects with `N=258`, training and inference use the plan’s memory fallback by default:
+Variable `N` is handled by zero-padding to `max_n` with a volume mask. The gradient FiLM conditioning adapts features to the acquisition protocol.
 
-- `context_cap = 48`
-- all b0 volumes are retained
-- remaining DWI volumes are selected shell-stratified with angular coverage
-- inference reconstructs the full subject by running multiple contexts and stitching them back together
+## Training
 
-The default training preset is now a smaller AQD-Net for faster iteration:
+`research/train.py` trains on 2D axial slices with:
 
-- `model_preset = "small"`
-- `base_channels = 16`
-- `attention_depth = 1`
-- `num_heads = 4`
+- **Loss**: MSE on 6D tensor + λ × (FA MAE + MD MAE), computed within a brain mask
+- **FA/MD computation**: Frobenius norm formulation (no eigendecomposition — MPS-safe)
+- **Optimizer**: AdamW with cosine annealing, gradient clipping
+- **Split**: 13 train / 2 val / 3 test (subject-level)
+- **Augmentation**: random horizontal/vertical flips
+- **Early stopping**: patience=25 on validation loss
 
-Inference and evaluation also skip the auxiliary tensor decoder head, because only `pred_dwi` is needed on that path.
+## TensorBoard monitoring
 
-## Training objective
+`research/train.py` writes TensorBoard event files to `{out_dir}/tb/`.
 
-`research/train.py` uses the composite supervised loss from the implementation plan:
+**Scalars logged every epoch:**
 
-```text
-L_total =
-  1.00 * L_dwi
-  + 0.25 * L_ssim
-  + 0.20 * L_edge
-  + 0.35 * L_tensor_fit
-  + 0.15 * L_tensor_aux
-  + 0.10 * L_fa_md
-```
+| Tag | Description |
+|---|---|
+| `loss/train`, `loss/val` | Total combined loss |
+| `tensor_mse/train`, `tensor_mse/val` | 6D tensor MSE component |
+| `fa_mae/train`, `fa_mae/val` | FA MAE auxiliary loss component |
+| `md_mae/train`, `md_mae/val` | MD MAE auxiliary loss component |
+| `lr` | Current learning rate |
+| `baselines/fa_rmse/patch2self` | Patch2Self mean FA RMSE (flat reference line) |
+| `baselines/fa_rmse/mppca` | MP-PCA mean FA RMSE (flat reference line) |
+| *(all other `fa_*`, `adc_*` baseline metrics)* | Flat reference lines from baseline CSVs |
 
-Implemented details include:
+**Images logged every `--vis_every` epochs (default: 1):**
 
-- per-subject normalization from the median input mean-b0 signal
-- train-fold-only clipping threshold estimation
-- subject-level split reuse via `research/splits/folds.json`
-- foreground / boundary / white-matter patch sampling
-- diffusion-geometry-safe augmentation with matching `bvec` updates
-- AdamW, warmup + cosine decay, gradient clipping, and EMA
-- TensorBoard scalars for epoch-level train/validation metrics plus a fixed validation denoising slice
-- early stopping on the validation composite score:
-
-```text
-score =
-  + PSNR_target_dwi
-  + SSIM_target_dwi
-  - NRMSE_target_dwi
-  - tensor_RMSE
-  - FA_abs_error
-  - MD_abs_error
-```
+`val_prediction` — a 2×4 panel showing for a fixed validation slice: target FA, predicted FA, FA error map, FA scatter plot (with RMSE and R²), and the same four panels for ADC.
 
 ## Baselines
 
-The original baseline scripts remain in `baselines/`, and the new fold evaluator uses wrappers in `research/baselines/` so baselines and model evaluation share:
-
-- the same subject normalization
-- the same masking policy
-- the same tensor fitting code path
-- the same image/tensor/edge metrics
-
-Patch2Self defaults in the wrapper follow the plan:
-
-- OLS first
-- `patch_radius=0`
-
-MPPCA defaults are fixed and documented:
-
-- `patch_radius=2`
-- `pca_method="eig"`
+Patch2Self and MP-PCA baselines in `baselines/` evaluate in both DWI-space and DTI-space. The DL evaluation in `research/evaluate.py` uses the same metric functions from `baselines/utils.py` for direct comparison.
 
 ## Installation
 
@@ -154,97 +104,66 @@ Build the supervised Zarr dataset:
 ```bash
 python3 build_pretext_dataset.py \
   --data_dir dataset/dataset_v1 \
-  --output dataset/pretext_dataset.zarr \
-  --keep_fraction 0.5 \
-  --noise_min 0.01 \
-  --noise_max 0.05
+  --output dataset/pretext_dataset_new.zarr
 ```
 
 Inspect the dataset:
 
 ```bash
-python3 visualizer.py --zarr_path dataset/pretext_dataset.zarr
+python3 visualizer.py --zarr_path dataset/pretext_dataset_new.zarr
 ```
 
-Train AQD-Net on one fold:
+Run Patch2Self baseline:
+
+```bash
+python3 baselines/patch2self/patch2self.py --zarr_path dataset/pretext_dataset_new.zarr
+```
+
+Run MP-PCA baseline:
+
+```bash
+python3 baselines/mppca/mppca.py --zarr_path dataset/pretext_dataset_new.zarr
+```
+
+Train the DL model:
 
 ```bash
 python3 -m research.train \
-  --zarr_path dataset/pretext_dataset.zarr \
-  --fold_id 0 \
-  --epochs 40 \
-  --batch_size 2 \
-  --model_preset small \
-  --patch_size 32 32 32 \
-  --context_cap 48 \
-  --augment
+  --zarr_path dataset/pretext_dataset_new.zarr \
+  --out_dir research/runs/run_01 \
+  --epochs 150 \
+  --batch_size 8
 ```
 
-Run inference on one subject:
+Monitor training with TensorBoard (logs written to `{out_dir}/tb/`):
 
 ```bash
-python3 -m research.infer \
-  --checkpoint research/runs/fold_0/best.pt \
-  --zarr_path dataset/pretext_dataset.zarr \
-  --subject_id subject_000 \
-  --patch_size 32 32 32
+tensorboard --logdir research/runs/run_01/tb
 ```
 
-Evaluate one fold against noisy input, Patch2Self, and MPPCA:
+Reduce visualisation overhead by generating figures less frequently:
 
 ```bash
-python3 -m research.eval.evaluate_fold \
-  --checkpoint research/runs/fold_0/best.pt \
-  --zarr_path dataset/pretext_dataset.zarr \
-  --fold_id 0 \
-  --output_dir research/eval/results
+python3 -m research.train \
+  --zarr_path dataset/pretext_dataset_new.zarr \
+  --out_dir research/runs/run_01 \
+  --vis_every 5
 ```
 
-Run smoke tests:
+Evaluate the trained model on test subjects:
 
 ```bash
-python3 -m unittest research.tests.test_research_stack
+python3 -m research.evaluate \
+  --checkpoint research/runs/run_01/best_model.pt \
+  --zarr_path dataset/pretext_dataset_new.zarr \
+  --out_dir research/results
 ```
 
-Launch TensorBoard for a fold run:
+Evaluate on all subjects (for full comparison with baselines):
 
 ```bash
-tensorboard --logdir research/runs
+python3 -m research.evaluate \
+  --checkpoint research/runs/run_01/best_model.pt \
+  --zarr_path dataset/pretext_dataset_new.zarr \
+  --eval_all
 ```
-
-## Training CLI highlights
-
-`research/train.py` supports the planned ablations directly:
-
-- `--disable_gradient_conditioning`
-- `--disable_attention`
-- `--disable_aux_tensor_head`
-- `--disable_tensor_fit_loss`
-- `--disable_edge_loss`
-- `--architecture fixed_channel`
-
-Useful core options:
-
-- `--model_preset small`: smaller default AQD-Net (`16 / 1 / 4`)
-- `--model_preset base`: previous larger AQD-Net (`32 / 3 / 8`)
-- `--context_cap 48`: enable large-`N` fallback
-- `--patch_size X Y Z`: patch-based 3D training and inference
-- `--use_b0_guide`: concatenate the mean-b0 patch as an extra guide channel
-- `--augment`: enable geometry-safe augmentation
-- `--val_overlap`: overlap used during sliding-window validation
-
-Each fold run writes TensorBoard event files under `research/runs/fold_<id>/tensorboard/`.
-The validation example image uses the first validation subject, a fixed DWI volume, and a fixed axial slice, with panels ordered as `input | prediction | target | abs_error`.
-
-Note: the current dataset has `Z=25`, so the code clamps requested patch sizes to the subject dimensions at runtime when necessary.
-
-## Legacy files still in repo
-
-The repository still includes:
-
-- `functions.py` for raw DWI / tensor helper utilities
-- `build_pretext_dataset.py` for dataset creation
-- `visualizer.py` for manual inspection
-- `baselines/` for the original standalone baseline scripts
-
-The active research training and evaluation path is now the `research/` package, not the older `ml/` prototype.

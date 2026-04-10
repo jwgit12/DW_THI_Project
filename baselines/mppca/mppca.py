@@ -51,9 +51,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from baselines.utils import (
     dwi_metrics,
-    dti6d_to_evals,
-    evals_to_adc,
-    evals_to_fa,
+    dti6d_to_scalar_maps,
     fit_dti_to_6d,
     save_denoising_slice_plot,
     scalar_map_metrics,
@@ -115,7 +113,9 @@ def save_example_plot(
     grp = store[subject_key]
     noisy = grp["input_dwi"][:]
     target_dwi = grp["target_dwi"][:]
+    target_dti6d = grp["target_dti_6d"][:]
     bvals = grp["bvals"][:].astype(float)
+    bvecs = grp["bvecs"][:].astype(float)
     denoised = run_mppca_denoising(noisy, cfg)
     return save_denoising_slice_plot(
         noisy_dwi=noisy,
@@ -125,6 +125,9 @@ def save_example_plot(
         subject_key=subject_key,
         b0_threshold=b0_threshold,
         target_dwi=target_dwi,
+        bvecs=bvecs,
+        target_dti6d=target_dti6d,
+        dti_fit_method=cfg["dti_fit_method"],
         brain_mask_frac=brain_mask_frac,
         slice_idx=slice_idx,
         volume_idx=volume_idx,
@@ -168,13 +171,8 @@ def evaluate_subject(zarr_path: str, subject_key: str, cfg: dict) -> dict | str:
         )
 
         # ── 5. FA and ADC from denoised tensor and target tensor ──────────────
-        evals_den = dti6d_to_evals(denoised_dti6d)
-        evals_tgt = dti6d_to_evals(target_dti6d)
-
-        fa_den  = evals_to_fa(evals_den)
-        fa_tgt  = evals_to_fa(evals_tgt)
-        adc_den = evals_to_adc(evals_den)
-        adc_tgt = evals_to_adc(evals_tgt)
+        fa_den, adc_den = dti6d_to_scalar_maps(denoised_dti6d)
+        fa_tgt, adc_tgt = dti6d_to_scalar_maps(target_dti6d)
 
         # Brain mask from mean b=0 signal — excludes background voxels where
         # DTI fitting is undefined and produces extreme outlier eigenvalues
