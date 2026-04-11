@@ -36,6 +36,7 @@ DW_THI_Project/
 │   ├── patch2self/patch2self.py     # Patch2Self baseline evaluation
 │   └── mppca/mppca.py               # MP-PCA baseline evaluation
 ├── research/
+│   ├── ARCHITECTURE.md             # Concise model/data-flow overview
 │   ├── dataset.py                   # Zarr slice-based PyTorch dataset
 │   ├── model.py                     # QSpaceUNet (q-space encoder + 2D U-Net)
 │   ├── train.py                     # Training script
@@ -59,6 +60,8 @@ For quick checks without opening the GUI, `--summary-only` prints the dataset sh
 ## QSpaceUNet
 
 `research/model.py` implements the model:
+
+See [research/ARCHITECTURE.md](research/ARCHITECTURE.md) for a diagram and short walkthrough of the current data flow.
 
 - **Q-space encoder**: 1×1 conv compresses `N` DWI volumes into `C` feature channels, with FiLM conditioning from a gradient table MLP (bvals/bvecs → scale + shift)
 - **2D U-Net backbone**: 4-level encoder-decoder with skip connections, GroupNorm, auto-padding for arbitrary spatial dims
