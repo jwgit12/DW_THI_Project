@@ -8,6 +8,7 @@ Supervised DWI denoising and DTI prediction for a variable-`N` diffusion dataset
 - 2D slice-based training with q-space encoding for variable `N`
 - Tensor-aware training via combined MSE + differentiable FA/MD loss
 - Subject-level train/val/test split with held-out evaluation
+- Lightweight PyQt dataset inspection for raw DWI and derived DTI maps
 
 ## Dataset contract
 
@@ -29,7 +30,7 @@ The dataset contains 18 subjects with spatial dims `(130, 132, 25)`. `N` varies 
 DW_THI_Project/
 ├── functions.py                     # Core DWI loading, degradation, and DTI helpers
 ├── build_pretext_dataset.py         # NIfTI -> Zarr dataset builder
-├── visualizer.py                    # PyQt6 viewer for the Zarr dataset
+├── visualizer.py                    # Single-file PyQt6 viewer for the Zarr dataset
 ├── baselines/
 │   ├── utils.py                     # Shared DWI/DTI metrics and plotting helpers
 │   ├── patch2self/patch2self.py     # Patch2Self baseline evaluation
@@ -42,6 +43,18 @@ DW_THI_Project/
 ├── requirements.txt                 # Python dependencies
 └── dti_prep.ipynb
 ```
+
+## Visualization tool
+
+`visualizer.py` is a lightweight desktop viewer for `dataset/pretext_dataset_new.zarr`.
+
+- Subject selector for browsing the 18 stored subject groups
+- Plane switcher for axial, coronal, and sagittal views
+- Slice and diffusion-volume sliders that work with variable-`N` acquisitions
+- Side-by-side panels for `input_dwi`, `target_dwi`, absolute difference, FA, MD, and color-FA
+- Metadata sidebar with source file, shell counts, current `bval` / `bvec`, and a b-value scatter plot
+
+For quick checks without opening the GUI, `--summary-only` prints the dataset shape and subject count in the terminal.
 
 ## QSpaceUNet
 
@@ -111,6 +124,18 @@ Inspect the dataset:
 
 ```bash
 python3 visualizer.py --zarr_path dataset/pretext_dataset_new.zarr
+```
+
+Open a specific subject first:
+
+```bash
+python3 visualizer.py --zarr_path dataset/pretext_dataset_new.zarr --subject subject_010
+```
+
+Print a dataset summary without launching Qt:
+
+```bash
+python3 visualizer.py --zarr_path dataset/pretext_dataset_new.zarr --summary-only
 ```
 
 Run Patch2Self baseline:
