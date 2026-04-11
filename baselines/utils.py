@@ -547,10 +547,7 @@ def save_prediction_slice_plot(
         "diff": (adc_diff, "ADC difference (target − pred)"),
         "base_cmap": "magma",
         "diff_cmap": "bwr",
-        "base_limits": _robust_limits(
-            pred_adc[:, :, slice_idx], target_adc[:, :, slice_idx],
-            *([input_adc[:, :, slice_idx]] if input_adc is not None else []),
-        ),
+        "base_limits": _robust_limits(pred_adc[:, :, slice_idx], target_adc[:, :, slice_idx]),
         "diff_limits": _symmetric_limits(adc_diff),
     })
 
