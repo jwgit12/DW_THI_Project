@@ -13,8 +13,8 @@ class DWISliceDataset(Dataset):
 
     Each sample returns:
         input:      (max_n, H, W)   padded DWI signal, normalised by mean b0
-        target:     (6, H, W)       6D DTI tensor
-        bvals:      (max_n,)        normalised b-values (/ 3000), padded
+        target:     (6, H, W)       6D DTI tensor, scaled by dti_scale
+        bvals:      (max_n,)        normalised b-values (/ max_bval), padded
         bvecs:      (3, max_n)      b-vectors, padded
         vol_mask:   (max_n,)        1 for real volumes, 0 for padding
         brain_mask: (H, W)          brain region mask (for masked loss)
@@ -39,6 +39,9 @@ class DWISliceDataset(Dataset):
         self.max_n = 0
         self.samples: list[tuple[str, int]] = []
 
+        global_max_bval = 0.0
+        dti_abs_values = []
+
         for key in self.subject_keys:
             grp = store[key]
             n_volumes = grp["bvals"].shape[0]
@@ -46,6 +49,18 @@ class DWISliceDataset(Dataset):
             self.max_n = max(self.max_n, n_volumes)
             for z in range(n_slices):
                 self.samples.append((key, z))
+
+            bvals = np.asarray(grp["bvals"][:], dtype=np.float32)
+            global_max_bval = max(global_max_bval, float(bvals.max()))
+
+            dti = np.asarray(grp["target_dti_6d"][:], dtype=np.float32)
+            nonzero = np.abs(dti[dti != 0])
+            if nonzero.size > 0:
+                dti_abs_values.append(float(np.percentile(nonzero, 99)))
+
+        # Adaptive normalisation constants derived from the data
+        self.max_bval = global_max_bval if global_max_bval > 0 else 1.0
+        self.dti_scale = 1.0 / np.mean(dti_abs_values) if dti_abs_values else 1.0
 
         self._store = None
 
@@ -74,6 +89,9 @@ class DWISliceDataset(Dataset):
         input_slice = input_slice.transpose(2, 0, 1)
         target_slice = target_slice.transpose(2, 0, 1)
 
+        # Scale DTI tensor to ~O(1) range for balanced training
+        target_slice = target_slice * self.dti_scale
+
         # Brain mask from mean b0
         b0_idx = bvals < self.b0_threshold
         if b0_idx.any() and self.brain_mask_frac > 0:
@@ -90,8 +108,8 @@ class DWISliceDataset(Dataset):
             if b0_norm > 0:
                 input_slice = input_slice / b0_norm
 
-        # Normalise bvals to [0, 1]
-        bvals_norm = bvals / 3000.0
+        # Normalise bvals to [0, 1] using the max b-value in the dataset
+        bvals_norm = bvals / self.max_bval
 
         # Pad to max_n
         if N < self.max_n:

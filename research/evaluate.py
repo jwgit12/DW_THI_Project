@@ -48,6 +48,8 @@ def predict_subject(
     subject_key: str,
     device: torch.device,
     b0_threshold: float = 50.0,
+    dti_scale: float = 1.0,
+    max_bval: float = 1000.0,
 ) -> np.ndarray:
     """Run inference on a full 3D subject, slice by slice.
 
@@ -63,8 +65,8 @@ def predict_subject(
     X, Y, Z, N = input_dwi.shape
     max_n = model.max_n
 
-    # Normalise bvals
-    bvals_norm = bvals / 3000.0
+    # Normalise bvals using the same max_bval as training
+    bvals_norm = bvals / max_bval
 
     # Pad to max_n
     if N < max_n:
@@ -106,6 +108,9 @@ def predict_subject(
             pred = model(signal_t, bvals_t, bvecs_t, vol_mask_t)  # (1, 6, H, W)
             pred_dti[:, :, z, :] = pred[0].permute(1, 2, 0).cpu().numpy()
 
+    # Unscale from training range back to physical units
+    pred_dti = pred_dti / dti_scale
+
     return pred_dti
 
 
@@ -116,6 +121,8 @@ def evaluate_subject(
     device: torch.device,
     brain_mask_frac: float = 0.1,
     b0_threshold: float = 50.0,
+    dti_scale: float = 1.0,
+    max_bval: float = 1000.0,
 ) -> tuple[dict, dict]:
     """Full evaluation pipeline for one subject.
 
@@ -138,7 +145,7 @@ def evaluate_subject(
     bvecs = np.asarray(grp["bvecs"][:], dtype=np.float32)
 
     # Predict
-    pred_dti6d = predict_subject(model, zarr_path, subject_key, device, b0_threshold)
+    pred_dti6d = predict_subject(model, zarr_path, subject_key, device, b0_threshold, dti_scale, max_bval)
 
     # Brain mask
     b0_idx = bvals < b0_threshold
@@ -194,6 +201,9 @@ def main(args):
     max_n = ckpt["max_n"]
     feat_dim = ckpt.get("feat_dim", 64)
     channels = tuple(ckpt.get("channels", [64, 128, 256, 512]))
+    dti_scale = ckpt.get("dti_scale", 1.0)
+    max_bval = ckpt.get("max_bval", 1000.0)
+    log.info("DTI scale factor: %.4f, max_bval: %.1f", dti_scale, max_bval)
 
     model = QSpaceUNet(max_n=max_n, feat_dim=feat_dim, channels=channels).to(device)
     model.load_state_dict(ckpt["model_state_dict"])
@@ -224,6 +234,8 @@ def main(args):
                 model, args.zarr_path, subj, device,
                 brain_mask_frac=args.brain_mask_frac,
                 b0_threshold=args.b0_threshold,
+                dti_scale=dti_scale,
+                max_bval=max_bval,
             )
             log.info(
                 "%-14s  tensor_rmse=%.5f  FA[rmse=%.4f r2=%.3f]  ADC[rmse=%.2e r2=%.3f]  (%.1fs)",

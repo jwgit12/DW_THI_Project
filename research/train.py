@@ -79,6 +79,7 @@ def make_val_figure(
     model: QSpaceUNet,
     val_ds: DWISliceDataset,
     device: torch.device,
+    dti_scale: float,
     slice_idx: int | None = None,
 ) -> plt.Figure:
     """Generate a prediction vs target figure for one validation slice."""
@@ -97,6 +98,10 @@ def make_val_figure(
     with torch.no_grad():
         pred = model(signal, bvals, bvecs, vol_mask)  # (1, 6, H, W)
     pred_np = pred[0].cpu().numpy()  # (6, H, W)
+
+    # Unscale to physical units before computing FA / ADC
+    pred_np = pred_np / dti_scale
+    target = target / dti_scale
 
     # Compute FA / ADC from 6-channel tensors → need (X, Y, Z, 6) shape
     pred_vol = pred_np.transpose(1, 2, 0)[..., np.newaxis, :]  # (H, W, 1, 6)
@@ -256,10 +261,17 @@ def main(args):
     train_ds = DWISliceDataset(args.zarr_path, train_subjects, augment=True)
     val_ds = DWISliceDataset(args.zarr_path, val_subjects, augment=False)
 
-    # Ensure both datasets use the same max_n (for model compatibility)
+    # Ensure both datasets use the same max_n and normalisation constants
     global_max_n = max(train_ds.max_n, val_ds.max_n)
     train_ds.max_n = global_max_n
     val_ds.max_n = global_max_n
+
+    global_max_bval = max(train_ds.max_bval, val_ds.max_bval)
+    global_dti_scale = train_ds.dti_scale  # use train stats for normalisation
+    train_ds.max_bval = global_max_bval
+    train_ds.dti_scale = global_dti_scale
+    val_ds.max_bval = global_max_bval
+    val_ds.dti_scale = global_dti_scale
 
     train_loader = DataLoader(
         train_ds,
@@ -276,7 +288,8 @@ def main(args):
         pin_memory=(device.type != "cpu"),
     )
 
-    log.info("Train slices: %d  Val slices: %d  max_n: %d", len(train_ds), len(val_ds), global_max_n)
+    log.info("Train slices: %d  Val slices: %d  max_n: %d  max_bval: %.0f  dti_scale: %.4f",
+             len(train_ds), len(val_ds), global_max_n, global_max_bval, global_dti_scale)
 
     # ── Model ─────────────────────────────────────────────────────────────────
     model = QSpaceUNet(
@@ -355,7 +368,7 @@ def main(args):
 
         # ── TensorBoard: validation visualisation ────────────────────────────
         if epoch % args.vis_every == 0 or epoch == 1:
-            fig = make_val_figure(model, val_ds, device, slice_idx=vis_slice_idx)
+            fig = make_val_figure(model, val_ds, device, dti_scale=train_ds.dti_scale, slice_idx=vis_slice_idx)
             writer.add_figure("val_prediction", fig, epoch)
             plt.close(fig)
 
@@ -373,6 +386,8 @@ def main(args):
                     "max_n": global_max_n,
                     "feat_dim": args.feat_dim,
                     "channels": list(args.channels),
+                    "dti_scale": train_ds.dti_scale,
+                    "max_bval": train_ds.max_bval,
                     "train_subjects": train_subjects,
                     "val_subjects": val_subjects,
                     "test_subjects": test_subjects,
@@ -417,6 +432,8 @@ def main(args):
             "max_n": global_max_n,
             "feat_dim": args.feat_dim,
             "channels": list(args.channels),
+            "dti_scale": train_ds.dti_scale,
+            "max_bval": train_ds.max_bval,
             "train_subjects": train_subjects,
             "val_subjects": val_subjects,
             "test_subjects": test_subjects,
