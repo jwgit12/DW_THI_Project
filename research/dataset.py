@@ -60,7 +60,7 @@ class DWISliceDataset(Dataset):
 
         # Adaptive normalisation constants derived from the data
         self.max_bval = global_max_bval if global_max_bval > 0 else 1.0
-        self.dti_scale = 1.0 / np.mean(dti_abs_values) if dti_abs_values else 1.0
+        self.dti_scale = float(1.0 / np.mean(dti_abs_values)) if dti_abs_values else 1.0
 
         self._store = None
 
