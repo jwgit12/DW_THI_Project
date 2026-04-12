@@ -11,6 +11,31 @@ import torch.nn.functional as F
 # Differentiable DTI scalar maps (no eigendecomposition — MPS-safe)
 # ---------------------------------------------------------------------------
 
+def cholesky_to_tensor6(chol6: torch.Tensor) -> torch.Tensor:
+    """Convert 6 Cholesky factor channels to 6 symmetric PSD tensor channels.
+
+    Input order:  l11, l21, l22, l31, l32, l33  (lower-triangular L)
+    Output order:  Dxx, Dxy, Dyy, Dxz, Dyz, Dzz  (D = L @ L^T)
+
+    Diagonal elements are passed through softplus to guarantee positivity.
+    """
+    l11 = F.softplus(chol6[:, 0])
+    l21 = chol6[:, 1]
+    l22 = F.softplus(chol6[:, 2])
+    l31 = chol6[:, 3]
+    l32 = chol6[:, 4]
+    l33 = F.softplus(chol6[:, 5])
+
+    dxx = l11 * l11
+    dxy = l11 * l21
+    dyy = l21 * l21 + l22 * l22
+    dxz = l11 * l31
+    dyz = l21 * l31 + l22 * l32
+    dzz = l31 * l31 + l32 * l32 + l33 * l33
+
+    return torch.stack([dxx, dxy, dyy, dxz, dyz, dzz], dim=1)
+
+
 def tensor6_to_fa_md(tensor6: torch.Tensor):
     """Compute FA and MD from a (B, 6, H, W) tensor using Frobenius norms.
 
@@ -237,9 +262,11 @@ class QSpaceUNet(nn.Module):
         max_n: int,
         feat_dim: int = 64,
         channels: tuple[int, ...] = (64, 128, 256, 512),
+        cholesky: bool = False,
     ):
         super().__init__()
         self.max_n = max_n
+        self.cholesky = cholesky
         self.q_encoder = QSpaceEncoder(max_n, feat_dim)
         self.unet = UNet2D(feat_dim, out_ch=6, channels=channels)
 
@@ -251,4 +278,7 @@ class QSpaceUNet(nn.Module):
         vol_mask: torch.Tensor,
     ) -> torch.Tensor:
         features = self.q_encoder(signal, bvals, bvecs, vol_mask)
-        return self.unet(features)
+        out = self.unet(features)
+        if self.cholesky:
+            out = cholesky_to_tensor6(out)
+        return out

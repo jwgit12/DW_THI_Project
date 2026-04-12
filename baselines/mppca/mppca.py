@@ -187,7 +187,11 @@ def evaluate_subject(zarr_path: str, subject_key: str, cfg: dict) -> dict | str:
         if cfg["fa_mask_thresh"] > 0:
             brain_mask = brain_mask & (fa_tgt > cfg["fa_mask_thresh"])
 
-        # ── 6. DTI-space metrics ──────────────────────────────────────────────
+        # ── 6. Tensor RMSE within brain mask ─────────────────────────────────
+        diff = denoised_dti6d - target_dti6d
+        tensor_rmse = float(np.sqrt(np.mean(diff[brain_mask] ** 2)))
+
+        # ── 7. DTI-space metrics ──────────────────────────────────────────────
         fa_m  = scalar_map_metrics(fa_tgt,  fa_den,  mask=brain_mask)
         adc_m = scalar_map_metrics(adc_tgt, adc_den, mask=brain_mask)
 
@@ -202,6 +206,8 @@ def evaluate_subject(zarr_path: str, subject_key: str, cfg: dict) -> dict | str:
             "dwi_mae":    round(dwi_m["mae"],    6),
             "dwi_nrmse":  round(dwi_m["nrmse"],  6),
             "dwi_n_vols": dwi_m["n_volumes"],
+            # ── Tensor metric ────────────────────────────────────
+            "tensor_rmse": round(tensor_rmse, 6),
             # ── FA metrics ───────────────────────────────────────
             "fa_rmse":    round(fa_m["rmse"],   6),
             "fa_mae":     round(fa_m["mae"],    6),
@@ -239,6 +245,23 @@ def main(args):
     )
     if not subjects:
         log.error("No valid subjects (each needs: %s).", ", ".join(required))
+        return
+
+    # Filter to requested subjects (for fair comparison with research model)
+    if args.subjects:
+        requested = set(args.subjects)
+        subjects = [s for s in subjects if s in requested]
+    elif args.checkpoint:
+        import torch
+        ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+        test_subs = ckpt.get("test_subjects", [])
+        if test_subs:
+            requested = set(test_subs)
+            subjects = [s for s in subjects if s in requested]
+            log.info("Filtered to %d test subjects from checkpoint", len(subjects))
+
+    if not subjects:
+        log.error("No subjects remain after filtering.")
         return
 
     log.info("Found %d subjects  |  workers=%d  patch_radius=%d  pca_method=%s  "
@@ -290,6 +313,7 @@ def main(args):
 
     metric_cols = [
         "dwi_psnr", "dwi_ssim", "dwi_rmse", "dwi_mae",  "dwi_nrmse",
+        "tensor_rmse",
         "fa_rmse",  "fa_mae",   "fa_nrmse",  "fa_r2",
         "adc_rmse", "adc_mae",  "adc_nrmse", "adc_r2",
     ]
@@ -382,5 +406,10 @@ if __name__ == "__main__":
                         help="Axial slice index for visualization (default: auto)")
     parser.add_argument("--plot_volume_idx", type=int, default=None,
                         help="DWI volume index for visualization (default: auto)")
+    # Subject filtering
+    parser.add_argument("--subjects", nargs="*", default=None,
+                        help="Evaluate only these subject keys (default: all subjects in zarr)")
+    parser.add_argument("--checkpoint", default=None,
+                        help="Path to research checkpoint; extracts test_subjects for filtering")
 
     main(parser.parse_args())

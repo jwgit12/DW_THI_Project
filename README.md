@@ -9,6 +9,7 @@ Supervised DWI denoising and DTI prediction for a variable-`N` diffusion dataset
 - Tensor-aware training via combined MSE + differentiable FA/MD loss
 - Subject-level train/val/test split with held-out evaluation
 - Lightweight PyQt dataset inspection for raw DWI and derived DTI maps
+- Lightweight PyQt comparison of Patch2Self, MP-PCA, and research metrics
 
 ## Dataset contract
 
@@ -22,7 +23,10 @@ The supervised Zarr dataset lives at `dataset/pretext_dataset_new.zarr/` and con
 | `bvals` | `(N,)` | diffusion b-values |
 | `bvecs` | `(3, N)` | diffusion gradient directions |
 
-The dataset contains 18 subjects with spatial dims `(130, 132, 25)`. `N` varies across subjects (130 or 258 volumes).
+The dataset contains 11 biological subjects (18 sessions total, 7 subjects have 2 sessions).
+Zarr groups are named by subject and session (e.g., `sub-01_ses-1`).
+Spatial dims are `(130, 132, 25)`. `N` varies across subjects (130 or 258 volumes).
+The train/test/val split operates on biological subject IDs to prevent data leakage.
 
 ## Repository structure
 
@@ -31,6 +35,7 @@ DW_THI_Project/
 ├── functions.py                     # Core DWI loading, degradation, and DTI helpers
 ├── build_pretext_dataset.py         # NIfTI -> Zarr dataset builder
 ├── visualizer.py                    # Single-file PyQt6 viewer for the Zarr dataset
+├── comparison_viewer.py             # PyQt6 viewer for comparing evaluation CSVs
 ├── baselines/
 │   ├── utils.py                     # Shared DWI/DTI metrics and plotting helpers
 │   ├── patch2self/patch2self.py     # Patch2Self baseline evaluation
@@ -57,6 +62,23 @@ DW_THI_Project/
 
 For quick checks without opening the GUI, `--summary-only` prints the dataset shape and subject count in the terminal.
 
+## Comparison viewer
+
+`comparison_viewer.py` is a small PyQt desktop tool for comparing the three evaluation CSVs:
+
+- `baselines/patch2self/results/metrics_per_subject.csv`
+- `baselines/mppca/mppca_eval/metrics_per_subject.csv`
+- `research/results/metrics_per_subject.csv`
+
+It automatically:
+
+- finds the subject intersection across all three files
+- finds the quality metrics they all share
+- recomputes mean values on that shared subject set instead of trusting the `MEAN` footer rows
+- shows an all-metrics table, a selected-metric bar chart, and per-subject detail
+
+This is especially useful when the research CSV only covers held-out test subjects while the baselines cover all subjects.
+
 ## QSpaceUNet
 
 `research/model.py` implements the model:
@@ -76,7 +98,7 @@ Variable `N` is handled by zero-padding to `max_n` with a volume mask. The gradi
 - **Loss**: MSE on 6D tensor + λ × (FA MAE + MD MAE), computed within a brain mask
 - **FA/MD computation**: Frobenius norm formulation (no eigendecomposition — MPS-safe)
 - **Optimizer**: AdamW with cosine annealing, gradient clipping
-- **Split**: 13 train / 2 val / 3 test (subject-level)
+- **Split**: 7 train / 2 val / 2 test (biological subject-level, all sessions grouped)
 - **Augmentation**: random horizontal/vertical flips
 - **Early stopping**: patience=25 on validation loss
 
@@ -132,13 +154,25 @@ python3 visualizer.py --zarr_path dataset/pretext_dataset_new.zarr
 Open a specific subject first:
 
 ```bash
-python3 visualizer.py --zarr_path dataset/pretext_dataset_new.zarr --subject subject_010
+python3 visualizer.py --zarr_path dataset/pretext_dataset_new.zarr --subject sub-06_ses-1
 ```
 
 Print a dataset summary without launching Qt:
 
 ```bash
 python3 visualizer.py --zarr_path dataset/pretext_dataset_new.zarr --summary-only
+```
+
+Open the comparison viewer:
+
+```bash
+python3 comparison_viewer.py
+```
+
+Print the shared subjects/metrics and recomputed overlap-only means:
+
+```bash
+python3 comparison_viewer.py --summary-only
 ```
 
 Run Patch2Self baseline:

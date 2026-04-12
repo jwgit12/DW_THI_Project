@@ -17,15 +17,23 @@ def find_dwi_datasets(root_dir):
     
     for dwi_path in dwi_files:
         base = dwi_path.replace(".nii.gz", "")
-        
+
         bval_path = base + ".bval"
         bvec_path = base + ".bvec"
-        
+
         if os.path.exists(bval_path) and os.path.exists(bvec_path):
+            # Parse subject and session from filename convention:
+            # sub-XX__ses-Y__dwi__sub-XX_ses-Y_dwi.nii.gz
+            basename = os.path.basename(dwi_path)
+            parts = basename.split("__")
+            sub_id = parts[0]   # e.g., "sub-01"
+            ses_id = parts[1]   # e.g., "ses-1"
             datasets.append({
                 "dwi": dwi_path,
                 "bval": bval_path,
-                "bvec": bvec_path
+                "bvec": bvec_path,
+                "subject": sub_id,
+                "session": ses_id,
             })
         else:
             print(f"Missing gradients for {dwi_path}")

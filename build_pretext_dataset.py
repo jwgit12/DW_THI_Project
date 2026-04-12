@@ -189,9 +189,11 @@ def main() -> None:
 
         tensor_clean_6d = tensor_to_6d(compute_dti(clean_dwi, sample["gtab"])).astype(np.float32)
 
-        subject_id = f"subject_{idx:03d}"
+        subject_id = f"{entry['subject']}_{entry['session']}"
         group = store.create_group(subject_id)
         group.attrs["source_dwi"] = entry["dwi"]
+        group.attrs["original_subject"] = entry["subject"]
+        group.attrs["original_session"] = entry["session"]
 
         group.create_array("input_dwi", data=degraded_dwi)
         group.create_array("target_dwi", data=clean_dwi)

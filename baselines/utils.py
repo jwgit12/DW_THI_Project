@@ -68,12 +68,14 @@ def dti6d_to_evals(dti_6d: np.ndarray) -> np.ndarray:
     return evals.reshape(X, Y, Z, 3).astype(np.float32)
 
 def evals_to_fa(evals: np.ndarray) -> np.ndarray:
+    evals = np.maximum(evals, 0.0)  # clamp negative eigenvalues (non-PSD tensors)
     md  = evals.mean(axis=-1, keepdims=True)
     num = np.sqrt(((evals - md) ** 2).sum(axis=-1))
     den = np.sqrt((evals ** 2).sum(axis=-1) + 1e-12)
     return np.clip(np.sqrt(1.5) * num / den, 0.0, 1.0).astype(np.float32)
 
 def evals_to_adc(evals: np.ndarray) -> np.ndarray:
+    evals = np.maximum(evals, 0.0)
     return ((evals[..., 0] + evals[..., 1] + evals[..., 2]) / 3.0).astype(np.float32)
 
 def fit_dti_to_6d(dwi_4d: np.ndarray, bvals: np.ndarray,

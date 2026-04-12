@@ -31,10 +31,11 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── Default subject split ────────────────────────────────────────────────────
-# 18 subjects total → 13 train / 2 val / 3 test
-DEFAULT_TEST_SUBJECTS = ["subject_015", "subject_016", "subject_017"]
-DEFAULT_VAL_SUBJECTS = ["subject_013", "subject_014"]
+# ── Default subject split (biological subject IDs) ──────────────────────────
+# 11 biological subjects → 7 train / 2 val / 2 test
+# All sessions of a subject stay in the same split to prevent data leakage.
+DEFAULT_TEST_SUBJECTS = ["sub-10", "sub-04"]
+DEFAULT_VAL_SUBJECTS = ["sub-11", "sub-05"]
 
 
 def get_device() -> torch.device:
@@ -243,19 +244,32 @@ def main(args):
     if baselines:
         log.info("Loaded baseline references: %s", list(baselines.keys()))
 
-    # ── Subject split ─────────────────────────────────────────────────────────
+    # ── Subject split (by biological subject to prevent leakage) ────────────
     import zarr
 
     store = zarr.open_group(args.zarr_path, mode="r")
-    all_subjects = sorted(store.keys())
-    log.info("Found %d subjects in %s", len(all_subjects), args.zarr_path)
+    all_keys = sorted(store.keys())
+    log.info("Found %d entries in %s", len(all_keys), args.zarr_path)
 
-    test_subjects = args.test_subjects or DEFAULT_TEST_SUBJECTS
-    val_subjects = args.val_subjects or DEFAULT_VAL_SUBJECTS
-    held_out = set(test_subjects) | set(val_subjects)
-    train_subjects = [s for s in all_subjects if s not in held_out]
+    test_bio = args.test_subjects or DEFAULT_TEST_SUBJECTS
+    val_bio = args.val_subjects or DEFAULT_VAL_SUBJECTS
+    held_out = set(test_bio) | set(val_bio)
 
-    log.info("Train: %d  Val: %d  Test: %d", len(train_subjects), len(val_subjects), len(test_subjects))
+    train_subjects, val_subjects, test_subjects = [], [], []
+    for key in all_keys:
+        bio_subject = key.rsplit("_ses-", 1)[0]
+        if bio_subject in test_bio:
+            test_subjects.append(key)
+        elif bio_subject in val_bio:
+            val_subjects.append(key)
+        else:
+            train_subjects.append(key)
+
+    log.info("Train: %d  Val: %d  Test: %d (from %d/%d/%d biological subjects)",
+             len(train_subjects), len(val_subjects), len(test_subjects),
+             len({k.rsplit("_ses-", 1)[0] for k in train_subjects}),
+             len({k.rsplit("_ses-", 1)[0] for k in val_subjects}),
+             len({k.rsplit("_ses-", 1)[0] for k in test_subjects}))
 
     # ── Datasets & loaders ────────────────────────────────────────────────────
     train_ds = DWISliceDataset(args.zarr_path, train_subjects, augment=True)
@@ -296,6 +310,7 @@ def main(args):
         max_n=global_max_n,
         feat_dim=args.feat_dim,
         channels=tuple(args.channels),
+        cholesky=args.cholesky,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -304,7 +319,8 @@ def main(args):
     # Log hyperparameters to TensorBoard
     writer.add_text("hparams", json.dumps({
         "max_n": global_max_n, "feat_dim": args.feat_dim,
-        "channels": list(args.channels), "batch_size": args.batch_size,
+        "channels": list(args.channels), "cholesky": args.cholesky,
+        "batch_size": args.batch_size,
         "lr": args.lr, "weight_decay": args.weight_decay,
         "lambda_scalar": args.lambda_scalar, "patience": args.patience,
         "n_params": n_params,
@@ -386,6 +402,7 @@ def main(args):
                     "max_n": global_max_n,
                     "feat_dim": args.feat_dim,
                     "channels": list(args.channels),
+                    "cholesky": args.cholesky,
                     "dti_scale": train_ds.dti_scale,
                     "max_bval": train_ds.max_bval,
                     "train_subjects": train_subjects,
@@ -432,6 +449,7 @@ def main(args):
             "max_n": global_max_n,
             "feat_dim": args.feat_dim,
             "channels": list(args.channels),
+            "cholesky": args.cholesky,
             "dti_scale": train_ds.dti_scale,
             "max_bval": train_ds.max_bval,
             "train_subjects": train_subjects,
@@ -452,20 +470,22 @@ if __name__ == "__main__":
     parser.add_argument("--zarr_path", default="dataset/pretext_dataset_new.zarr")
     parser.add_argument("--out_dir", default="research/runs/run_01")
     parser.add_argument("--test_subjects", nargs="*", default=None,
-                        help="Test subjects (default: subject_015-017)")
+                        help="Biological subject IDs for test (default: sub-10 sub-11)")
     parser.add_argument("--val_subjects", nargs="*", default=None,
-                        help="Validation subjects (default: subject_013-014)")
+                        help="Biological subject IDs for validation (default: sub-08 sub-09)")
 
     # Model
     parser.add_argument("--feat_dim", type=int, default=64)
     parser.add_argument("--channels", type=int, nargs="+", default=[64, 128, 256, 512])
+    parser.add_argument("--cholesky", action="store_true",
+                        help="Use Cholesky parameterization to guarantee positive semi-definite tensors")
 
     # Training
     parser.add_argument("--epochs", type=int, default=150)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--lambda_scalar", type=float, default=0.1,
+    parser.add_argument("--lambda_scalar", type=float, default=0.3,
                         help="Weight for FA/MD auxiliary loss (0 = tensor MSE only)")
     parser.add_argument("--patience", type=int, default=25)
     parser.add_argument("--vis_every", type=int, default=1,

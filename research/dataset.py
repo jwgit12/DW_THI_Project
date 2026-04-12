@@ -26,7 +26,7 @@ class DWISliceDataset(Dataset):
         subject_keys: list[str],
         augment: bool = False,
         b0_threshold: float = 50.0,
-        brain_mask_frac: float = 0.1,
+        brain_mask_frac: float = 0.15,
     ):
         self.zarr_path = zarr_path
         self.subject_keys = list(subject_keys)
@@ -40,7 +40,7 @@ class DWISliceDataset(Dataset):
         self.samples: list[tuple[str, int]] = []
 
         global_max_bval = 0.0
-        dti_abs_values = []
+        all_dti_abs = []
 
         for key in self.subject_keys:
             grp = store[key]
@@ -56,11 +56,15 @@ class DWISliceDataset(Dataset):
             dti = np.asarray(grp["target_dti_6d"][:], dtype=np.float32)
             nonzero = np.abs(dti[dti != 0])
             if nonzero.size > 0:
-                dti_abs_values.append(float(np.percentile(nonzero, 99)))
+                all_dti_abs.append(nonzero)
 
         # Adaptive normalisation constants derived from the data
         self.max_bval = global_max_bval if global_max_bval > 0 else 1.0
-        self.dti_scale = float(1.0 / np.mean(dti_abs_values)) if dti_abs_values else 1.0
+        if all_dti_abs:
+            pooled = np.concatenate(all_dti_abs)
+            self.dti_scale = float(1.0 / np.percentile(pooled, 99))
+        else:
+            self.dti_scale = 1.0
 
         self._store = None
 
@@ -90,7 +94,8 @@ class DWISliceDataset(Dataset):
         target_slice = target_slice.transpose(2, 0, 1)
 
         # Scale DTI tensor to ~O(1) range for balanced training
-        target_slice = target_slice * self.dti_scale
+        # Clamp to remove extreme outliers from bad DTI fits at brain edges
+        target_slice = np.clip(target_slice * self.dti_scale, -3.0, 3.0)
 
         # Brain mask from mean b0
         b0_idx = bvals < self.b0_threshold
