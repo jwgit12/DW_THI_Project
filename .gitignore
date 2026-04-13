@@ -215,6 +215,7 @@ __marimo__/
 /qc
 /.idea
 /.claude
+CLAUDE.md
 /research/runs/
 /runs/
 *.pt
