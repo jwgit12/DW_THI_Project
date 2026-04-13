@@ -38,6 +38,7 @@ from baselines.utils import (
     _symmetric_limits,
 )
 from research.model import QSpaceUNet
+import config as cfg
 
 logging.basicConfig(
     level=logging.INFO,
@@ -50,11 +51,13 @@ log = logging.getLogger(__name__)
 # Baseline defaults (match the standalone scripts)
 # ─────────────────────────────────────────────────────────────────────────────
 P2S_CFG = dict(
-    model="ols", alpha=1.0, b0_threshold=50, shift_intensity=True,
-    clip_negative=False, b0_denoising=True, dti_fit_method="WLS",
+    model=cfg.P2S_MODEL, alpha=cfg.P2S_ALPHA, b0_threshold=cfg.B0_THRESHOLD,
+    shift_intensity=cfg.P2S_SHIFT_INTENSITY, clip_negative=cfg.P2S_CLIP_NEGATIVE,
+    b0_denoising=cfg.P2S_B0_DENOISING, dti_fit_method=cfg.DTI_FIT_METHOD,
 )
 MPPCA_CFG = dict(
-    patch_radius=2, pca_method="eig", b0_threshold=50, dti_fit_method="WLS",
+    patch_radius=cfg.MPPCA_PATCH_RADIUS, pca_method=cfg.MPPCA_PCA_METHOD,
+    b0_threshold=cfg.B0_THRESHOLD, dti_fit_method=cfg.DTI_FIT_METHOD,
 )
 
 
@@ -71,7 +74,7 @@ def predict_subject(
     zarr_path: str,
     subject_key: str,
     device: torch.device,
-    b0_threshold: float = 50.0,
+    b0_threshold: float = cfg.B0_THRESHOLD,
     dti_scale: float = 1.0,
     max_bval: float = 1000.0,
 ) -> np.ndarray:
@@ -212,8 +215,8 @@ def evaluate_subject(
     zarr_path: str,
     subject_key: str,
     device: torch.device,
-    brain_mask_frac: float = 0.1,
-    b0_threshold: float = 50.0,
+    brain_mask_frac: float = cfg.BRAIN_MASK_FRAC,
+    b0_threshold: float = cfg.B0_THRESHOLD,
     dti_scale: float = 1.0,
     max_bval: float = 1000.0,
     run_baselines: bool = True,
@@ -765,8 +768,8 @@ if __name__ == "__main__":
                         help="Biological subject IDs or Zarr keys to evaluate (default: test subjects from checkpoint)")
     parser.add_argument("--eval_all", action="store_true",
                         help="Evaluate all subjects in the zarr store")
-    parser.add_argument("--brain_mask_frac", type=float, default=0.1)
-    parser.add_argument("--b0_threshold", type=float, default=50.0)
+    parser.add_argument("--brain_mask_frac", type=float, default=cfg.BRAIN_MASK_FRAC)
+    parser.add_argument("--b0_threshold", type=float, default=cfg.B0_THRESHOLD)
     parser.add_argument("--skip_plot", action="store_true",
                         help="Disable saving plots")
     parser.add_argument("--skip_baselines", action="store_true",

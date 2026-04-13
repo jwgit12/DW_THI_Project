@@ -49,6 +49,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+import config as cfg
 from baselines.utils import (
     dwi_metrics,
     dti6d_to_scalar_maps,
@@ -58,24 +59,21 @@ from baselines.utils import (
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DEFAULT CONFIGURATION
+# DEFAULT CONFIGURATION (sourced from config.py)
 # ─────────────────────────────────────────────────────────────────────────────
-ZARR_PATH       = "/path/to/pretext_dataset.zarr"
+ZARR_PATH       = "dataset/pretext_dataset_new.zarr"
 OUT_DIR         = "./mppca_eval"
 N_JOBS          = 4
 
 # MP-PCA
-PATCH_RADIUS    = 2         # local patch radius in voxels (2 → 5×5×5 patches)
-PCA_METHOD      = "eig"     # 'eig' (faster) | 'svd' (occasionally more accurate)
+PATCH_RADIUS    = cfg.MPPCA_PATCH_RADIUS
+PCA_METHOD      = cfg.MPPCA_PCA_METHOD
 
 # DTI fitting
-B0_THRESHOLD    = 50        # raise to ~60-80 for HCP 7T
-DTI_FIT_METHOD  = "WLS"     # 'WLS' (robust) | 'OLS' | 'NLLS'
-FA_MASK_THRESH  = 0.0       # DTI metrics restricted to voxels where target FA >
-                             # this value. 0 = all voxels. Try 0.1 for WM only.
-BRAIN_MASK_FRAC = 0.1       # Fraction of max b0 signal used as brain mask threshold
-                             # for DTI metrics. Background voxels produce garbage
-                             # tensors that dominate RMSE/R². 0 = no mask.
+B0_THRESHOLD    = cfg.B0_THRESHOLD
+DTI_FIT_METHOD  = cfg.DTI_FIT_METHOD
+FA_MASK_THRESH  = cfg.FA_MASK_THRESH
+BRAIN_MASK_FRAC = cfg.BRAIN_MASK_FRAC
 # ─────────────────────────────────────────────────────────────────────────────
 
 logging.basicConfig(

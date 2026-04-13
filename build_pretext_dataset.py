@@ -10,6 +10,7 @@ import numpy as np
 import zarr
 from tqdm import tqdm
 
+import config
 from functions import compute_dti, find_dwi_datasets, load_dwi_dataset, lowres_noise, show_kspace, tensor_to_6d
 
 
@@ -17,9 +18,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build a Zarr pretext dataset from DWI NIfTI files.")
     parser.add_argument("--data_dir", type=str, required=True, help="Directory containing *_dwi.nii.gz + .bval/.bvec files")
     parser.add_argument("--output", type=str, required=True, help="Output Zarr path (e.g. dataset/pretext_dataset.zarr)")
-    parser.add_argument("--keep_fraction", type=float, default=0.6, help="Central k-space keep fraction for low-res degradation")
-    parser.add_argument("--noise_min", type=float, default=0.01, help="Minimum relative Gaussian noise level")
-    parser.add_argument("--noise_max", type=float, default=0.10, help="Maximum relative Gaussian noise level")
+    parser.add_argument("--keep_fraction", type=float, default=config.KEEP_FRACTION, help="Central k-space keep fraction for low-res degradation")
+    parser.add_argument("--noise_min", type=float, default=config.NOISE_MIN, help="Minimum relative Gaussian noise level")
+    parser.add_argument("--noise_max", type=float, default=config.NOISE_MAX, help="Maximum relative Gaussian noise level")
     parser.add_argument("--plot_subjects", type=int, default=3, help="Number of first subjects to export QC plots for")
     parser.add_argument("--plot_dir", type=str, default="dataset/pretext_dataset_qc", help="Directory to store QC plot PNGs")
     parser.add_argument("--max_subjects", type=int, default=None, help="Optional cap for quick test runs")

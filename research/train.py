@@ -23,6 +23,7 @@ from torch.utils.tensorboard import SummaryWriter
 from baselines.utils import dti6d_to_scalar_maps, scalar_map_metrics
 from research.dataset import DWISliceDataset
 from research.model import DTILoss, QSpaceUNet, tensor6_to_fa_md
+import config as cfg
 
 logging.basicConfig(
     level=logging.INFO,
@@ -34,8 +35,8 @@ log = logging.getLogger(__name__)
 # ── Default subject split (biological subject IDs) ──────────────────────────
 # 11 biological subjects → 7 train / 2 val / 2 test
 # All sessions of a subject stay in the same split to prevent data leakage.
-DEFAULT_TEST_SUBJECTS = ["sub-10", "sub-04"]
-DEFAULT_VAL_SUBJECTS = ["sub-11", "sub-05"]
+DEFAULT_TEST_SUBJECTS = cfg.TEST_SUBJECTS
+DEFAULT_VAL_SUBJECTS = cfg.VAL_SUBJECTS
 
 
 def get_device() -> torch.device:
@@ -206,7 +207,7 @@ def run_epoch(
             if is_train:
                 optimizer.zero_grad()
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.GRAD_CLIP)
                 optimizer.step()
 
             total_loss += loss.item()
@@ -475,19 +476,19 @@ if __name__ == "__main__":
                         help="Biological subject IDs for validation (default: sub-08 sub-09)")
 
     # Model
-    parser.add_argument("--feat_dim", type=int, default=64)
-    parser.add_argument("--channels", type=int, nargs="+", default=[64, 128, 256, 512])
+    parser.add_argument("--feat_dim", type=int, default=cfg.FEAT_DIM)
+    parser.add_argument("--channels", type=int, nargs="+", default=cfg.UNET_CHANNELS)
     parser.add_argument("--cholesky", action="store_true",
                         help="Use Cholesky parameterization to guarantee positive semi-definite tensors")
 
     # Training
-    parser.add_argument("--epochs", type=int, default=150)
-    parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--lambda_scalar", type=float, default=0.3,
+    parser.add_argument("--epochs", type=int, default=cfg.EPOCHS)
+    parser.add_argument("--batch_size", type=int, default=cfg.BATCH_SIZE)
+    parser.add_argument("--lr", type=float, default=cfg.LEARNING_RATE)
+    parser.add_argument("--weight_decay", type=float, default=cfg.WEIGHT_DECAY)
+    parser.add_argument("--lambda_scalar", type=float, default=cfg.LAMBDA_SCALAR,
                         help="Weight for FA/MD auxiliary loss (0 = tensor MSE only)")
-    parser.add_argument("--patience", type=int, default=25)
+    parser.add_argument("--patience", type=int, default=cfg.PATIENCE)
     parser.add_argument("--vis_every", type=int, default=1,
                         help="Generate validation visualisation every N epochs (default: every epoch)")
 

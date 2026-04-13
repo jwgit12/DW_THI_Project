@@ -6,6 +6,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import config as cfg
+
 
 # ---------------------------------------------------------------------------
 # Differentiable DTI scalar maps (no eigendecomposition — MPS-safe)
@@ -70,7 +72,7 @@ def tensor6_to_fa_md(tensor6: torch.Tensor):
 class DTILoss(nn.Module):
     """MSE on 6D tensor + optional FA/MD MAE regularisation."""
 
-    def __init__(self, lambda_scalar: float = 0.1):
+    def __init__(self, lambda_scalar: float = cfg.LAMBDA_SCALAR):
         super().__init__()
         self.lambda_scalar = lambda_scalar
 

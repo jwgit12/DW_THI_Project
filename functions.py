@@ -8,6 +8,8 @@ from dipy.io import read_bvals_bvecs
 from dipy.core.gradients import gradient_table
 from dipy.reconst.dti import TensorModel
 
+import config as cfg
+
 
 #%% DWI dataset handling
 def find_dwi_datasets(root_dir):
@@ -75,7 +77,7 @@ def load_all_dwi(root_dir):
 
 
 #%% Image degradation
-def apply_kspace_mask(slice_2d, keep_fraction=0.5):
+def apply_kspace_mask(slice_2d, keep_fraction=cfg.KEEP_FRACTION):
     kspace = np.fft.fftshift(np.fft.fft2(slice_2d))
 
     nx, ny = kspace.shape
@@ -98,7 +100,7 @@ def add_noise(slice_2d, noise_level):
     noise = np.random.normal(0, sigma, slice_2d.shape)
     return slice_2d + noise
 
-def lowres_noise(data, keep_fraction=0.5, noise_min=0.01, noise_max=0.05):
+def lowres_noise(data, keep_fraction=cfg.KEEP_FRACTION, noise_min=cfg.NOISE_MIN, noise_max=cfg.NOISE_MAX):
     h, w = data.shape[:2]
 
     # Vectorized k-space filtering over all slices/volumes at once
@@ -217,7 +219,7 @@ def norm(x, pmin=1, pmax=99):
     vmin, vmax = np.percentile(x[x > 0], (pmin, pmax))
     return np.clip((x - vmin) / (vmax - vmin + 1e-8), 0, 1)
 
-def split_b0_dwi(data, bvals, threshold=50):
+def split_b0_dwi(data, bvals, threshold=cfg.B0_THRESHOLD):
     b0_idx = bvals < threshold
     dwi_idx = bvals >= threshold
     

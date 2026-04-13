@@ -7,6 +7,8 @@ import torch
 from torch.utils.data import Dataset
 import zarr
 
+import config as cfg
+
 
 class DWISliceDataset(Dataset):
     """Loads 2D axial slices from a zarr DWI dataset.
@@ -25,8 +27,8 @@ class DWISliceDataset(Dataset):
         zarr_path: str,
         subject_keys: list[str],
         augment: bool = False,
-        b0_threshold: float = 50.0,
-        brain_mask_frac: float = 0.15,
+        b0_threshold: float = cfg.B0_THRESHOLD,
+        brain_mask_frac: float = cfg.BRAIN_MASK_FRAC,
     ):
         self.zarr_path = zarr_path
         self.subject_keys = list(subject_keys)

@@ -11,6 +11,8 @@ from skimage.metrics import structural_similarity as sk_ssim
 from dipy.core.gradients import gradient_table
 from dipy.reconst.dti import TensorModel
 
+import config as cfg
+
 # ─────────────────────────────────────────────────────────────────────────────
 # DWI-space metric helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -187,7 +189,7 @@ def select_plot_indices(
     dwi_4d: np.ndarray,
     bvals: np.ndarray,
     b0_threshold: float,
-    brain_mask_frac: float = 0.1,
+    brain_mask_frac: float = cfg.BRAIN_MASK_FRAC,
     slice_idx: int | None = None,
     volume_idx: int | None = None,
 ) -> tuple[int, int]:
@@ -237,7 +239,7 @@ def save_denoising_slice_plot(
     bvecs: np.ndarray | None = None,
     target_dti6d: np.ndarray | None = None,
     dti_fit_method: str = "WLS",
-    brain_mask_frac: float = 0.1,
+    brain_mask_frac: float = cfg.BRAIN_MASK_FRAC,
     slice_idx: int | None = None,
     volume_idx: int | None = None,
     before_label: str = "Before denoising",
@@ -438,7 +440,7 @@ def save_prediction_slice_plot(
     target_dwi: np.ndarray | None = None,
     bvecs: np.ndarray | None = None,
     dti_fit_method: str = "WLS",
-    brain_mask_frac: float = 0.1,
+    brain_mask_frac: float = cfg.BRAIN_MASK_FRAC,
     slice_idx: int | None = None,
     volume_idx: int | None = None,
 ) -> dict:
