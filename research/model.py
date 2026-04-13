@@ -150,15 +150,17 @@ class QSpaceEncoder(nn.Module):
 # ---------------------------------------------------------------------------
 
 class ConvBlock(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int):
+    def __init__(self, in_ch: int, out_ch: int, dropout: float = 0.0):
         super().__init__()
         self.block = nn.Sequential(
             nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
             nn.GroupNorm(8, out_ch),
             nn.LeakyReLU(0.1, inplace=True),
+            nn.Dropout2d(dropout) if dropout > 0 else nn.Identity(),
             nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
             nn.GroupNorm(8, out_ch),
             nn.LeakyReLU(0.1, inplace=True),
+            nn.Dropout2d(dropout) if dropout > 0 else nn.Identity(),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -173,6 +175,7 @@ class UNet2D(nn.Module):
         in_ch: int = 64,
         out_ch: int = 6,
         channels: tuple[int, ...] = (64, 128, 256, 512),
+        dropout: float = 0.0,
     ):
         super().__init__()
         self.depth = len(channels)
@@ -182,11 +185,11 @@ class UNet2D(nn.Module):
         self.pools = nn.ModuleList()
         ch = in_ch
         for c in channels:
-            self.encoders.append(ConvBlock(ch, c))
+            self.encoders.append(ConvBlock(ch, c, dropout=dropout))
             self.pools.append(nn.MaxPool2d(2))
             ch = c
 
-        self.bottleneck = ConvBlock(channels[-1], channels[-1] * 2)
+        self.bottleneck = ConvBlock(channels[-1], channels[-1] * 2, dropout=dropout)
 
         # Decoder
         self.upconvs = nn.ModuleList()
@@ -194,7 +197,7 @@ class UNet2D(nn.Module):
         ch = channels[-1] * 2
         for c in reversed(channels):
             self.upconvs.append(nn.ConvTranspose2d(ch, c, 2, stride=2))
-            self.decoders.append(ConvBlock(c * 2, c))
+            self.decoders.append(ConvBlock(c * 2, c, dropout=dropout))
             ch = c
 
         self.head = nn.Conv2d(channels[0], out_ch, 1)
@@ -244,12 +247,13 @@ class QSpaceUNet(nn.Module):
         feat_dim: int = 64,
         channels: tuple[int, ...] = (64, 128, 256, 512),
         cholesky: bool = False,
+        dropout: float = cfg.DROPOUT,
     ):
         super().__init__()
         self.max_n = max_n
         self.cholesky = cholesky
         self.q_encoder = QSpaceEncoder(max_n, feat_dim)
-        self.unet = UNet2D(feat_dim, out_ch=6, channels=channels)
+        self.unet = UNet2D(feat_dim, out_ch=6, channels=channels, dropout=dropout)
 
     def forward(
         self,
