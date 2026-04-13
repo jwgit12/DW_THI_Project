@@ -20,7 +20,7 @@ import torch
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
-from baselines.utils import dti6d_to_scalar_maps, scalar_map_metrics
+from research.utils import dti6d_to_scalar_maps, scalar_map_metrics
 from research.dataset import DWISliceDataset
 from research.model import DTILoss, QSpaceUNet, tensor6_to_fa_md
 import config as cfg
@@ -58,7 +58,7 @@ def load_baseline_metrics(csv_paths: list[Path]) -> dict[str, dict[str, float]]:
         mean_row = df[df["subject"] == "MEAN"]
         if mean_row.empty:
             continue
-        name = csv_path.parent.parent.name  # e.g. "patch2self" or "mppca"
+        name = csv_path.stem.replace("metrics_", "")  # e.g. "patch2self" or "mppca"
         metrics = {}
         for col in ["fa_rmse", "fa_mae", "fa_nrmse", "fa_r2",
                      "adc_rmse", "adc_mae", "adc_nrmse", "adc_r2"]:
@@ -94,6 +94,7 @@ def make_val_figure(
     bvecs = sample["bvecs"].unsqueeze(0).to(device)
     vol_mask = sample["vol_mask"].unsqueeze(0).to(device)
     target = sample["target"].numpy()  # (6, H, W)
+    bmask = sample["brain_mask"].numpy()  # (H, W) float32
 
     model.eval()
     with torch.no_grad():
@@ -117,46 +118,52 @@ def make_val_figure(
     tgt_fa = tgt_fa[:, :, 0]
     tgt_adc = tgt_adc[:, :, 0]
 
-    fa_diff = tgt_fa - pred_fa
-    adc_diff = tgt_adc - pred_adc
+    bmask_bool = bmask > 0.5
+
+    fa_diff = (tgt_fa - pred_fa) * bmask
+    adc_diff = (tgt_adc - pred_adc) * bmask
 
     fig, axes = plt.subplots(2, 4, figsize=(20, 10))
 
     # Row 1: FA
-    axes[0, 0].imshow(np.rot90(tgt_fa), cmap="viridis", vmin=0, vmax=1)
+    axes[0, 0].imshow(np.rot90(tgt_fa * bmask), cmap="viridis", vmin=0, vmax=1)
     axes[0, 0].set_title("Target FA")
-    axes[0, 1].imshow(np.rot90(pred_fa), cmap="viridis", vmin=0, vmax=1)
+    axes[0, 1].imshow(np.rot90(pred_fa * bmask), cmap="viridis", vmin=0, vmax=1)
     axes[0, 1].set_title("Predicted FA")
     fa_abs = max(float(np.max(np.abs(fa_diff))), 1e-6)
     im_fa = axes[0, 2].imshow(np.rot90(fa_diff), cmap="bwr", vmin=-fa_abs, vmax=fa_abs)
     axes[0, 2].set_title("FA Error (tgt - pred)")
     fig.colorbar(im_fa, ax=axes[0, 2], fraction=0.046, pad=0.04)
 
-    # FA scatter
-    axes[0, 3].scatter(tgt_fa.ravel(), pred_fa.ravel(), s=1, alpha=0.3)
+    # FA scatter (brain voxels only)
+    fa_tgt_brain = tgt_fa[bmask_bool]
+    fa_pred_brain = pred_fa[bmask_bool]
+    axes[0, 3].scatter(fa_tgt_brain, fa_pred_brain, s=1, alpha=0.3)
     axes[0, 3].plot([0, 1], [0, 1], "r--", lw=1)
-    m = scalar_map_metrics(tgt_fa, pred_fa)
+    m = scalar_map_metrics(tgt_fa, pred_fa, mask=bmask_bool)
     axes[0, 3].set_title(f"FA: RMSE={m['rmse']:.4f}  R²={m['r2']:.3f}")
     axes[0, 3].set_xlabel("Target")
     axes[0, 3].set_ylabel("Predicted")
     axes[0, 3].set_aspect("equal")
 
     # Row 2: ADC
-    adc_lo, adc_hi = 0, max(float(np.percentile(tgt_adc, 99)), 1e-6)
-    axes[1, 0].imshow(np.rot90(tgt_adc), cmap="magma", vmin=adc_lo, vmax=adc_hi)
+    adc_brain = tgt_adc[bmask_bool]
+    adc_lo, adc_hi = 0, max(float(np.percentile(adc_brain, 99)), 1e-6) if adc_brain.size > 0 else 1e-6
+    axes[1, 0].imshow(np.rot90(tgt_adc * bmask), cmap="magma", vmin=adc_lo, vmax=adc_hi)
     axes[1, 0].set_title("Target ADC")
-    axes[1, 1].imshow(np.rot90(pred_adc), cmap="magma", vmin=adc_lo, vmax=adc_hi)
+    axes[1, 1].imshow(np.rot90(pred_adc * bmask), cmap="magma", vmin=adc_lo, vmax=adc_hi)
     axes[1, 1].set_title("Predicted ADC")
     adc_abs = max(float(np.max(np.abs(adc_diff))), 1e-6)
     im_adc = axes[1, 2].imshow(np.rot90(adc_diff), cmap="bwr", vmin=-adc_abs, vmax=adc_abs)
     axes[1, 2].set_title("ADC Error (tgt - pred)")
     fig.colorbar(im_adc, ax=axes[1, 2], fraction=0.046, pad=0.04)
 
-    # ADC scatter
-    axes[1, 3].scatter(tgt_adc.ravel(), pred_adc.ravel(), s=1, alpha=0.3)
+    # ADC scatter (brain voxels only)
+    adc_pred_brain = pred_adc[bmask_bool]
+    axes[1, 3].scatter(adc_brain, adc_pred_brain, s=1, alpha=0.3)
     lim = adc_hi
     axes[1, 3].plot([0, lim], [0, lim], "r--", lw=1)
-    m = scalar_map_metrics(tgt_adc, pred_adc)
+    m = scalar_map_metrics(tgt_adc, pred_adc, mask=bmask_bool)
     axes[1, 3].set_title(f"ADC: RMSE={m['rmse']:.2e}  R²={m['r2']:.3f}")
     axes[1, 3].set_xlabel("Target")
     axes[1, 3].set_ylabel("Predicted")
@@ -195,9 +202,10 @@ def run_epoch(
             bvals = batch["bvals"].to(device)
             bvecs = batch["bvecs"].to(device)
             vol_mask = batch["vol_mask"].to(device)
+            brain_mask = batch["brain_mask"].to(device)
 
             pred = model(signal, bvals, bvecs, vol_mask)
-            loss, metrics = criterion(pred, target)
+            loss, metrics = criterion(pred, target, mask=brain_mask)
 
             if is_train:
                 optimizer.zero_grad()
@@ -231,10 +239,10 @@ def main(args):
     writer = SummaryWriter(log_dir=str(out_dir / "tb"))
 
     # ── Load baseline metrics for reference lines ────────────────────────────
-    project_root = Path(__file__).resolve().parents[1]
+    # Look for baseline CSVs produced by research.evaluate in the output dir
     baseline_csvs = [
-        project_root / "baselines" / "patch2self" / "results" / "metrics_per_subject.csv",
-        project_root / "baselines" / "mppca" / "results" / "metrics_per_subject.csv",
+        out_dir / "metrics_patch2self.csv",
+        out_dir / "metrics_mppca.csv",
     ]
     baselines = load_baseline_metrics(baseline_csvs)
     if baselines:

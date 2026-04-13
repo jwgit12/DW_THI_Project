@@ -80,13 +80,25 @@ class DTILoss(nn.Module):
         self,
         pred: torch.Tensor,
         target: torch.Tensor,
+        mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        tensor_loss = F.mse_loss(pred, target)
+        if mask is not None:
+            mask_4d = mask.unsqueeze(1)  # (B, 1, H, W)
+            n_elem = mask_4d.sum() * pred.shape[1]
+            tensor_loss = ((pred - target) ** 2 * mask_4d).sum() / n_elem.clamp(min=1)
+        else:
+            tensor_loss = F.mse_loss(pred, target)
+
         if self.lambda_scalar > 0:
             pred_fa, pred_md = tensor6_to_fa_md(pred)
             tgt_fa, tgt_md = tensor6_to_fa_md(target)
-            fa_loss = F.l1_loss(pred_fa, tgt_fa)
-            md_loss = F.l1_loss(pred_md, tgt_md)
+            if mask is not None:
+                n_spatial = mask.sum().clamp(min=1)
+                fa_loss = (torch.abs(pred_fa - tgt_fa) * mask).sum() / n_spatial
+                md_loss = (torch.abs(pred_md - tgt_md) * mask).sum() / n_spatial
+            else:
+                fa_loss = F.l1_loss(pred_fa, tgt_fa)
+                md_loss = F.l1_loss(pred_md, tgt_md)
             total = tensor_loss + self.lambda_scalar * (fa_loss + md_loss)
             return total, {
                 "tensor_mse": tensor_loss.item(),

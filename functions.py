@@ -335,3 +335,25 @@ def brain_mask(image,
         raise ValueError("Input image must be 2D, 3D, or 4D.")
 
     return mask, masked
+
+
+def compute_brain_mask_from_dwi(dwi_4d, bvals, b0_threshold=cfg.B0_THRESHOLD):
+    """Compute a 3D brain mask from DWI data using mean b0 signal.
+
+    Parameters
+    ----------
+    dwi_4d : ndarray, shape (X, Y, Z, N)
+    bvals  : ndarray, shape (N,)
+    b0_threshold : float
+
+    Returns
+    -------
+    mask : ndarray, shape (X, Y, Z), dtype bool
+    """
+    b0_idx = bvals < b0_threshold
+    if b0_idx.any():
+        mean_b0 = dwi_4d[..., b0_idx].mean(axis=-1)
+    else:
+        mean_b0 = dwi_4d.mean(axis=-1)
+    mask, _ = brain_mask(mean_b0)
+    return mask.astype(bool)

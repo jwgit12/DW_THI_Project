@@ -1,4 +1,4 @@
-"""Centralised hyperparameters shared across research, baselines, and data prep.
+"""Centralised hyperparameters shared across research and data prep.
 
 Import from here instead of hardcoding values so that every script uses
 the same constants.  CLI argument defaults should reference these too.

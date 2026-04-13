@@ -1,7 +1,6 @@
 """Evaluate a trained QSpaceUNet on test subjects.
 
-Produces a CSV with DTI-level metrics (tensor RMSE, FA, ADC) that is
-directly comparable to the baseline CSVs in baselines/*/results/.
+Produces a CSV with DTI-level metrics (tensor RMSE, FA, ADC).
 
 When --run_baselines is set (default), Patch2Self and MP-PCA are also
 run on the same subjects, and comparison plots + metric tables are saved.
@@ -28,7 +27,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from baselines.utils import (
+from research.utils import (
     dti6d_to_scalar_maps,
     fit_dti_to_6d,
     scalar_map_metrics,
@@ -37,6 +36,7 @@ from baselines.utils import (
     _robust_limits,
     _symmetric_limits,
 )
+from functions import compute_brain_mask_from_dwi
 from research.model import QSpaceUNet
 import config as cfg
 
@@ -174,6 +174,7 @@ def _baseline_dti_metrics(
     bvecs: np.ndarray,
     b0_threshold: float,
     dti_fit_method: str = "WLS",
+    mask: np.ndarray | None = None,
 ) -> tuple[dict, np.ndarray]:
     """Fit DTI from denoised DWI and compute metrics vs target.
 
@@ -185,12 +186,16 @@ def _baseline_dti_metrics(
         fit_method=dti_fit_method, b0_threshold=b0_threshold,
     )
     diff = fitted_dti6d - target_dti6d
-    tensor_rmse = float(np.sqrt(np.mean(diff ** 2)))
+    if mask is not None:
+        diff_brain = diff[mask]
+        tensor_rmse = float(np.sqrt(np.mean(diff_brain ** 2)))
+    else:
+        tensor_rmse = float(np.sqrt(np.mean(diff ** 2)))
 
     pred_fa, pred_adc = dti6d_to_scalar_maps(fitted_dti6d)
     tgt_fa, tgt_adc = dti6d_to_scalar_maps(target_dti6d)
-    fa_m = scalar_map_metrics(tgt_fa, pred_fa)
-    adc_m = scalar_map_metrics(tgt_adc, pred_adc)
+    fa_m = scalar_map_metrics(tgt_fa, pred_fa, mask=mask)
+    adc_m = scalar_map_metrics(tgt_adc, pred_adc, mask=mask)
 
     metrics = {
         "tensor_rmse": round(tensor_rmse, 6),
@@ -239,15 +244,19 @@ def evaluate_subject(
     bvals = np.asarray(grp["bvals"][:], dtype=np.float32)
     bvecs = np.asarray(grp["bvecs"][:], dtype=np.float32)
 
+    # ── Brain mask (shared across all methods) ─────────────────────────
+    mask_3d = compute_brain_mask_from_dwi(target_dwi, bvals, b0_threshold)
+
     # ── Research model ────────────────────────────────────────────────────
     pred_dti6d = predict_subject(model, zarr_path, subject_key, device, b0_threshold, dti_scale, max_bval)
 
     diff = pred_dti6d - target_dti6d
-    tensor_rmse = float(np.sqrt(np.mean(diff ** 2)))
+    diff_brain = diff[mask_3d]
+    tensor_rmse = float(np.sqrt(np.mean(diff_brain ** 2)))
     pred_fa, pred_adc = dti6d_to_scalar_maps(pred_dti6d)
     tgt_fa, tgt_adc = dti6d_to_scalar_maps(target_dti6d)
-    fa_m = scalar_map_metrics(tgt_fa, pred_fa)
-    adc_m = scalar_map_metrics(tgt_adc, pred_adc)
+    fa_m = scalar_map_metrics(tgt_fa, pred_fa, mask=mask_3d)
+    adc_m = scalar_map_metrics(tgt_adc, pred_adc, mask=mask_3d)
 
     research_elapsed = time.time() - t0
     research_metrics = {
@@ -272,6 +281,7 @@ def evaluate_subject(
         "bvals": bvals,
         "bvecs": bvecs,
         "research_dti6d": pred_dti6d,
+        "brain_mask_3d": mask_3d,
     }
 
     # ── Baselines ─────────────────────────────────────────────────────────
@@ -281,6 +291,7 @@ def evaluate_subject(
         p2s_denoised = _run_patch2self(input_dwi, bvals)
         p2s_metrics, p2s_dti6d = _baseline_dti_metrics(
             p2s_denoised, target_dti6d, bvals, bvecs, b0_threshold,
+            mask=mask_3d,
         )
         p2s_metrics["subject"] = subject_key
         p2s_metrics["elapsed_s"] = round(time.time() - t1, 2)
@@ -292,6 +303,7 @@ def evaluate_subject(
         mppca_denoised = _run_mppca(input_dwi)
         mppca_metrics, mppca_dti6d = _baseline_dti_metrics(
             mppca_denoised, target_dti6d, bvals, bvecs, b0_threshold,
+            mask=mask_3d,
         )
         mppca_metrics["subject"] = subject_key
         mppca_metrics["elapsed_s"] = round(time.time() - t2, 2)
@@ -351,13 +363,23 @@ def save_comparison_plot(
     methods.append(("QSpaceUNet", arrays["research_dti6d"]))
     methods.append(("Target", target_dti6d))
 
+    # Brain mask for this slice
+    mask_2d = arrays.get("brain_mask_3d")
+    if mask_2d is not None:
+        mask_2d = mask_2d[:, :, slice_idx].astype(np.float32)
+
     # Derive FA and ADC for all methods
     fa_maps = []
     adc_maps = []
     for label, dti6d in methods:
         fa, adc = dti6d_to_scalar_maps(dti6d)
-        fa_maps.append((label, fa[:, :, slice_idx]))
-        adc_maps.append((label, adc[:, :, slice_idx]))
+        fa_slice = fa[:, :, slice_idx]
+        adc_slice = adc[:, :, slice_idx]
+        if mask_2d is not None:
+            fa_slice = fa_slice * mask_2d
+            adc_slice = adc_slice * mask_2d
+        fa_maps.append((label, fa_slice))
+        adc_maps.append((label, adc_slice))
 
     tgt_fa_slice = fa_maps[-1][1]
     tgt_adc_slice = adc_maps[-1][1]

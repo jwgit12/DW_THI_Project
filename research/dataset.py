@@ -8,6 +8,7 @@ from torch.utils.data import Dataset
 import zarr
 
 import config as cfg
+from functions import compute_brain_mask_from_dwi
 
 
 class DWISliceDataset(Dataset):
@@ -19,6 +20,7 @@ class DWISliceDataset(Dataset):
         bvals:      (max_n,)        normalised b-values (/ max_bval), padded
         bvecs:      (3, max_n)      b-vectors, padded
         vol_mask:   (max_n,)        1 for real volumes, 0 for padding
+        brain_mask: (H, W)          binary brain mask (1 = brain, 0 = background)
     """
 
     def __init__(
@@ -65,6 +67,16 @@ class DWISliceDataset(Dataset):
         else:
             self.dti_scale = 1.0
 
+        # Pre-compute 3D brain masks per subject from mean b0
+        self._brain_masks: dict[str, np.ndarray] = {}
+        for key in self.subject_keys:
+            grp = store[key]
+            dwi = np.asarray(grp["input_dwi"][:], dtype=np.float32)
+            bvals_raw = np.asarray(grp["bvals"][:], dtype=np.float32)
+            self._brain_masks[key] = compute_brain_mask_from_dwi(
+                dwi, bvals_raw, self.b0_threshold,
+            )
+
         self._store = None
 
     @property
@@ -87,6 +99,9 @@ class DWISliceDataset(Dataset):
         bvecs = np.asarray(grp["bvecs"][:], dtype=np.float32)  # (3, N)
 
         N = bvals.shape[0]
+
+        # Brain mask for this slice
+        bmask = self._brain_masks[key][:, :, z].astype(np.float32)  # (H, W)
 
         # Channels-first: (N, H, W) and (6, H, W)
         input_slice = input_slice.transpose(2, 0, 1)
@@ -122,9 +137,11 @@ class DWISliceDataset(Dataset):
             if random.random() > 0.5:
                 input_slice = np.flip(input_slice, axis=1).copy()
                 target_slice = np.flip(target_slice, axis=1).copy()
+                bmask = np.flip(bmask, axis=0).copy()
             if random.random() > 0.5:
                 input_slice = np.flip(input_slice, axis=2).copy()
                 target_slice = np.flip(target_slice, axis=2).copy()
+                bmask = np.flip(bmask, axis=1).copy()
 
         return {
             "input": torch.from_numpy(input_slice),
@@ -132,4 +149,5 @@ class DWISliceDataset(Dataset):
             "bvals": torch.from_numpy(bvals_norm),
             "bvecs": torch.from_numpy(bvecs),
             "vol_mask": torch.from_numpy(vol_mask),
+            "brain_mask": torch.from_numpy(bmask),
         }
