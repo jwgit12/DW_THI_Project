@@ -189,7 +189,6 @@ def select_plot_indices(
     dwi_4d: np.ndarray,
     bvals: np.ndarray,
     b0_threshold: float,
-    brain_mask_frac: float = cfg.BRAIN_MASK_FRAC,
     slice_idx: int | None = None,
     volume_idx: int | None = None,
 ) -> tuple[int, int]:
@@ -206,22 +205,14 @@ def select_plot_indices(
         raise ValueError(f"volume_idx={volume_idx} is out of bounds for {n_volumes} volumes")
 
     if slice_idx is None:
+        # Pick the slice with the most signal content
         b0_indices = np.where(bvals < b0_threshold)[0]
         if b0_indices.size:
             ref_volume = dwi_4d[..., b0_indices].mean(axis=-1)
         else:
             ref_volume = dwi_4d[..., volume_idx]
-
-        ref_max = float(ref_volume.max())
-        if ref_max > 0.0 and brain_mask_frac > 0.0:
-            brain_mask = ref_volume > (brain_mask_frac * ref_max)
-            slice_scores = brain_mask.sum(axis=(0, 1))
-            if np.any(slice_scores):
-                slice_idx = int(np.argmax(slice_scores))
-            else:
-                slice_idx = n_slices // 2
-        else:
-            slice_idx = n_slices // 2
+        slice_scores = ref_volume.sum(axis=(0, 1))
+        slice_idx = int(np.argmax(slice_scores))
     elif not 0 <= slice_idx < n_slices:
         raise ValueError(f"slice_idx={slice_idx} is out of bounds for {n_slices} slices")
 
@@ -239,7 +230,6 @@ def save_denoising_slice_plot(
     bvecs: np.ndarray | None = None,
     target_dti6d: np.ndarray | None = None,
     dti_fit_method: str = "WLS",
-    brain_mask_frac: float = cfg.BRAIN_MASK_FRAC,
     slice_idx: int | None = None,
     volume_idx: int | None = None,
     before_label: str = "Before denoising",
@@ -255,7 +245,6 @@ def save_denoising_slice_plot(
         dwi_4d=noisy_dwi,
         bvals=bvals,
         b0_threshold=b0_threshold,
-        brain_mask_frac=brain_mask_frac,
         slice_idx=slice_idx,
         volume_idx=volume_idx,
     )
@@ -440,7 +429,6 @@ def save_prediction_slice_plot(
     target_dwi: np.ndarray | None = None,
     bvecs: np.ndarray | None = None,
     dti_fit_method: str = "WLS",
-    brain_mask_frac: float = cfg.BRAIN_MASK_FRAC,
     slice_idx: int | None = None,
     volume_idx: int | None = None,
 ) -> dict:
@@ -463,7 +451,6 @@ def save_prediction_slice_plot(
         dwi_4d=input_dwi,
         bvals=bvals,
         b0_threshold=b0_threshold,
-        brain_mask_frac=brain_mask_frac,
         slice_idx=slice_idx,
         volume_idx=volume_idx,
     )

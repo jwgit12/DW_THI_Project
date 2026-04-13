@@ -172,7 +172,6 @@ def _baseline_dti_metrics(
     target_dti6d: np.ndarray,
     bvals: np.ndarray,
     bvecs: np.ndarray,
-    brain_mask: np.ndarray,
     b0_threshold: float,
     dti_fit_method: str = "WLS",
 ) -> tuple[dict, np.ndarray]:
@@ -186,12 +185,12 @@ def _baseline_dti_metrics(
         fit_method=dti_fit_method, b0_threshold=b0_threshold,
     )
     diff = fitted_dti6d - target_dti6d
-    tensor_rmse = float(np.sqrt(np.mean(diff[brain_mask] ** 2)))
+    tensor_rmse = float(np.sqrt(np.mean(diff ** 2)))
 
     pred_fa, pred_adc = dti6d_to_scalar_maps(fitted_dti6d)
     tgt_fa, tgt_adc = dti6d_to_scalar_maps(target_dti6d)
-    fa_m = scalar_map_metrics(tgt_fa, pred_fa, mask=brain_mask)
-    adc_m = scalar_map_metrics(tgt_adc, pred_adc, mask=brain_mask)
+    fa_m = scalar_map_metrics(tgt_fa, pred_fa)
+    adc_m = scalar_map_metrics(tgt_adc, pred_adc)
 
     metrics = {
         "tensor_rmse": round(tensor_rmse, 6),
@@ -215,7 +214,6 @@ def evaluate_subject(
     zarr_path: str,
     subject_key: str,
     device: torch.device,
-    brain_mask_frac: float = cfg.BRAIN_MASK_FRAC,
     b0_threshold: float = cfg.B0_THRESHOLD,
     dti_scale: float = 1.0,
     max_bval: float = 1000.0,
@@ -241,23 +239,15 @@ def evaluate_subject(
     bvals = np.asarray(grp["bvals"][:], dtype=np.float32)
     bvecs = np.asarray(grp["bvecs"][:], dtype=np.float32)
 
-    # Brain mask (shared across all methods for fair comparison)
-    b0_idx = bvals < b0_threshold
-    if b0_idx.sum() > 0 and brain_mask_frac > 0:
-        mean_b0 = target_dwi[..., b0_idx].mean(axis=-1)
-        brain_mask = mean_b0 > brain_mask_frac * mean_b0.max()
-    else:
-        brain_mask = np.ones(target_dwi.shape[:3], dtype=bool)
-
     # ── Research model ────────────────────────────────────────────────────
     pred_dti6d = predict_subject(model, zarr_path, subject_key, device, b0_threshold, dti_scale, max_bval)
 
     diff = pred_dti6d - target_dti6d
-    tensor_rmse = float(np.sqrt(np.mean(diff[brain_mask] ** 2)))
+    tensor_rmse = float(np.sqrt(np.mean(diff ** 2)))
     pred_fa, pred_adc = dti6d_to_scalar_maps(pred_dti6d)
     tgt_fa, tgt_adc = dti6d_to_scalar_maps(target_dti6d)
-    fa_m = scalar_map_metrics(tgt_fa, pred_fa, mask=brain_mask)
-    adc_m = scalar_map_metrics(tgt_adc, pred_adc, mask=brain_mask)
+    fa_m = scalar_map_metrics(tgt_fa, pred_fa)
+    adc_m = scalar_map_metrics(tgt_adc, pred_adc)
 
     research_elapsed = time.time() - t0
     research_metrics = {
@@ -281,7 +271,6 @@ def evaluate_subject(
         "target_dti6d": target_dti6d,
         "bvals": bvals,
         "bvecs": bvecs,
-        "brain_mask": brain_mask,
         "research_dti6d": pred_dti6d,
     }
 
@@ -291,7 +280,7 @@ def evaluate_subject(
         t1 = time.time()
         p2s_denoised = _run_patch2self(input_dwi, bvals)
         p2s_metrics, p2s_dti6d = _baseline_dti_metrics(
-            p2s_denoised, target_dti6d, bvals, bvecs, brain_mask, b0_threshold,
+            p2s_denoised, target_dti6d, bvals, bvecs, b0_threshold,
         )
         p2s_metrics["subject"] = subject_key
         p2s_metrics["elapsed_s"] = round(time.time() - t1, 2)
@@ -302,7 +291,7 @@ def evaluate_subject(
         t2 = time.time()
         mppca_denoised = _run_mppca(input_dwi)
         mppca_metrics, mppca_dti6d = _baseline_dti_metrics(
-            mppca_denoised, target_dti6d, bvals, bvecs, brain_mask, b0_threshold,
+            mppca_denoised, target_dti6d, bvals, bvecs, b0_threshold,
         )
         mppca_metrics["subject"] = subject_key
         mppca_metrics["elapsed_s"] = round(time.time() - t2, 2)
@@ -321,7 +310,6 @@ def save_comparison_plot(
     subject_key: str,
     out_path: Path,
     b0_threshold: float,
-    brain_mask_frac: float,
     slice_idx: int | None = None,
     volume_idx: int | None = None,
 ) -> dict:
@@ -341,7 +329,7 @@ def save_comparison_plot(
 
     slice_idx, volume_idx = select_plot_indices(
         dwi_4d=input_dwi, bvals=bvals, b0_threshold=b0_threshold,
-        brain_mask_frac=brain_mask_frac, slice_idx=slice_idx, volume_idx=volume_idx,
+        slice_idx=slice_idx, volume_idx=volume_idx,
     )
 
     out_path = Path(out_path)
@@ -588,7 +576,6 @@ def main(args):
         try:
             all_metrics, arrays = evaluate_subject(
                 model, args.zarr_path, subj, device,
-                brain_mask_frac=args.brain_mask_frac,
                 b0_threshold=args.b0_threshold,
                 dti_scale=dti_scale,
                 max_bval=max_bval,
@@ -685,7 +672,6 @@ def main(args):
                     b0_threshold=args.b0_threshold,
                     target_dwi=arrs["target_dwi"],
                     bvecs=arrs["bvecs"],
-                    brain_mask_frac=args.brain_mask_frac,
                     slice_idx=args.plot_slice_idx,
                     volume_idx=args.plot_volume_idx,
                 )
@@ -703,7 +689,6 @@ def main(args):
                         subject_key=plot_subject,
                         out_path=comp_path,
                         b0_threshold=args.b0_threshold,
-                        brain_mask_frac=args.brain_mask_frac,
                         slice_idx=args.plot_slice_idx,
                         volume_idx=args.plot_volume_idx,
                     )
@@ -761,7 +746,6 @@ if __name__ == "__main__":
                         help="Biological subject IDs or Zarr keys to evaluate (default: test subjects from checkpoint)")
     parser.add_argument("--eval_all", action="store_true",
                         help="Evaluate all subjects in the zarr store")
-    parser.add_argument("--brain_mask_frac", type=float, default=cfg.BRAIN_MASK_FRAC)
     parser.add_argument("--b0_threshold", type=float, default=cfg.B0_THRESHOLD)
     parser.add_argument("--skip_plot", action="store_true",
                         help="Disable saving plots")

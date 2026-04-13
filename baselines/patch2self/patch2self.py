@@ -71,8 +71,6 @@ B0_DENOISING    = cfg.P2S_B0_DENOISING
 
 # DTI fitting
 DTI_FIT_METHOD  = cfg.DTI_FIT_METHOD
-FA_MASK_THRESH  = cfg.FA_MASK_THRESH
-BRAIN_MASK_FRAC = cfg.BRAIN_MASK_FRAC
 # ─────────────────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
@@ -129,7 +127,6 @@ def save_example_plot(
         bvecs=bvecs,
         target_dti6d=target_dti6d,
         dti_fit_method=cfg["dti_fit_method"],
-        brain_mask_frac=cfg["brain_mask_frac"],
         slice_idx=slice_idx,
         volume_idx=volume_idx,
         before_label="Before denoising",
@@ -175,26 +172,13 @@ def evaluate_subject(zarr_path: str, subject_key: str, cfg: dict) -> dict | str:
         fa_den, adc_den = dti6d_to_scalar_maps(denoised_dti6d)
         fa_tgt, adc_tgt = dti6d_to_scalar_maps(target_dti6d)
 
-        # Brain mask from mean b=0 signal — excludes background voxels where
-        # DTI fitting is undefined and produces extreme outlier eigenvalues
-        b0_idx = bvals < cfg["b0_threshold"]
-        if b0_idx.sum() > 0 and cfg["brain_mask_frac"] > 0:
-            mean_b0 = target_dwi[..., b0_idx].mean(axis=-1)
-            brain_mask = mean_b0 > cfg["brain_mask_frac"] * mean_b0.max()
-        else:
-            brain_mask = np.ones(target_dwi.shape[:3], dtype=bool)
-
-        # Optional FA threshold on top of brain mask
-        if cfg["fa_mask_thresh"] > 0:
-            brain_mask = brain_mask & (fa_tgt > cfg["fa_mask_thresh"])
-
-        # ── 6. Tensor RMSE within brain mask ─────────────────────────────────
+        # ── 6. Tensor RMSE ───────────────────────────────────────────────────
         diff = denoised_dti6d - target_dti6d
-        tensor_rmse = float(np.sqrt(np.mean(diff[brain_mask] ** 2)))
+        tensor_rmse = float(np.sqrt(np.mean(diff ** 2)))
 
         # ── 7. DTI-space metrics ──────────────────────────────────────────────
-        fa_m  = scalar_map_metrics(fa_tgt,  fa_den,  mask=brain_mask)
-        adc_m = scalar_map_metrics(adc_tgt, adc_den, mask=brain_mask)
+        fa_m  = scalar_map_metrics(fa_tgt,  fa_den)
+        adc_m = scalar_map_metrics(adc_tgt, adc_den)
 
         elapsed = time.time() - t0
         return {
@@ -266,10 +250,9 @@ def main(args):
         return
 
     log.info("Found %d subjects  |  workers=%d  p2s_model=%s  "
-             "dti_fit=%s  b0_thr=%d  brain_mask=%.2f  fa_mask=%.2f",
+             "dti_fit=%s  b0_thr=%d",
              len(subjects), args.n_jobs, args.model,
-             args.dti_fit_method, args.b0_threshold,
-             args.brain_mask_frac, args.fa_mask_thresh)
+             args.dti_fit_method, args.b0_threshold)
 
     cfg = dict(
         model          = args.model,
@@ -279,8 +262,6 @@ def main(args):
         clip_negative  = args.clip_negative,
         b0_denoising   = not args.skip_b0,
         dti_fit_method = args.dti_fit_method,
-        fa_mask_thresh = args.fa_mask_thresh,
-        brain_mask_frac= args.brain_mask_frac,
     )
 
     # ── Parallel evaluation ───────────────────────────────────────────────────
@@ -395,12 +376,6 @@ if __name__ == "__main__":
     parser.add_argument("--dti_fit_method", default=DTI_FIT_METHOD,
                         choices=["WLS", "OLS", "NLLS"],
                         help="DTI fitting algorithm (default: WLS)")
-    parser.add_argument("--fa_mask_thresh", type=float, default=FA_MASK_THRESH,
-                        help="Restrict DTI metrics to voxels with target FA above "
-                             "this threshold (0=all voxels, 0.1=white matter only)")
-    parser.add_argument("--brain_mask_frac", type=float, default=BRAIN_MASK_FRAC,
-                        help="Brain mask: fraction of max b0 signal. Voxels below "
-                             "this are excluded from DTI metrics (default: 0.1)")
     parser.add_argument("--skip_plot",      action="store_true",
                         help="Disable saving the notebook-style denoising slice plot")
     parser.add_argument("--plot_subject",   default=None,

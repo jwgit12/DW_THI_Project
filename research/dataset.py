@@ -19,7 +19,6 @@ class DWISliceDataset(Dataset):
         bvals:      (max_n,)        normalised b-values (/ max_bval), padded
         bvecs:      (3, max_n)      b-vectors, padded
         vol_mask:   (max_n,)        1 for real volumes, 0 for padding
-        brain_mask: (H, W)          brain region mask (for masked loss)
     """
 
     def __init__(
@@ -28,19 +27,16 @@ class DWISliceDataset(Dataset):
         subject_keys: list[str],
         augment: bool = False,
         b0_threshold: float = cfg.B0_THRESHOLD,
-        brain_mask_frac: float = cfg.BRAIN_MASK_FRAC,
     ):
         self.zarr_path = zarr_path
         self.subject_keys = list(subject_keys)
         self.augment = augment
         self.b0_threshold = b0_threshold
-        self.brain_mask_frac = brain_mask_frac
 
         store = zarr.open_group(zarr_path, mode="r")
 
         self.max_n = 0
         self.samples: list[tuple[str, int]] = []
-        self._brain_masks: dict[str, np.ndarray] = {}
 
         global_max_bval = 0.0
         all_dti_abs = []
@@ -60,22 +56,6 @@ class DWISliceDataset(Dataset):
             nonzero = np.abs(dti[dti != 0])
             if nonzero.size > 0:
                 all_dti_abs.append(nonzero)
-
-            # Pre-compute brain mask from clean target DWI b0 signal.
-            # Using clean target (not noisy input) keeps the mask stable
-            # regardless of noise level.
-            b0_mask = bvals < self.b0_threshold
-            if b0_mask.any() and self.brain_mask_frac > 0:
-                target_dwi = np.asarray(grp["target_dwi"][:], dtype=np.float32)
-                mean_b0 = target_dwi[..., b0_mask].mean(axis=-1)
-                self._brain_masks[key] = (
-                    mean_b0 > self.brain_mask_frac * mean_b0.max()
-                ).astype(np.float32)
-                del target_dwi
-            else:
-                self._brain_masks[key] = np.ones(
-                    grp["target_dti_6d"].shape[:3], dtype=np.float32
-                )
 
         # Adaptive normalisation constants derived from the data
         self.max_bval = global_max_bval if global_max_bval > 0 else 1.0
@@ -116,15 +96,11 @@ class DWISliceDataset(Dataset):
         # Clamp to remove extreme outliers from bad DTI fits at brain edges
         target_slice = np.clip(target_slice * self.dti_scale, -3.0, 3.0)
 
-        # Brain mask (pre-computed from clean target DWI in __init__)
-        brain_mask = self._brain_masks[key][:, :, z]
-
-        # Normalise input by mean b0 signal inside brain
+        # Normalise input by mean b0 signal
         b0_idx = bvals < self.b0_threshold
         if b0_idx.any():
             mean_b0 = input_slice[b0_idx].mean(axis=0)
-            brain_vals = mean_b0[brain_mask > 0]
-            b0_norm = float(brain_vals.mean()) if brain_vals.size > 0 else float(mean_b0.mean())
+            b0_norm = float(mean_b0[mean_b0 > 0].mean()) if (mean_b0 > 0).any() else 1.0
             if b0_norm > 0:
                 input_slice = input_slice / b0_norm
 
@@ -146,11 +122,9 @@ class DWISliceDataset(Dataset):
             if random.random() > 0.5:
                 input_slice = np.flip(input_slice, axis=1).copy()
                 target_slice = np.flip(target_slice, axis=1).copy()
-                brain_mask = np.flip(brain_mask, axis=0).copy()
             if random.random() > 0.5:
                 input_slice = np.flip(input_slice, axis=2).copy()
                 target_slice = np.flip(target_slice, axis=2).copy()
-                brain_mask = np.flip(brain_mask, axis=1).copy()
 
         return {
             "input": torch.from_numpy(input_slice),
@@ -158,5 +132,4 @@ class DWISliceDataset(Dataset):
             "bvals": torch.from_numpy(bvals_norm),
             "bvecs": torch.from_numpy(bvecs),
             "vol_mask": torch.from_numpy(vol_mask),
-            "brain_mask": torch.from_numpy(brain_mask),
         }

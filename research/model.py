@@ -80,40 +80,19 @@ class DTILoss(nn.Module):
         self,
         pred: torch.Tensor,
         target: torch.Tensor,
-        brain_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        if brain_mask is not None:
-            mask_4d = brain_mask.unsqueeze(1)  # (B, 1, H, W)
-            n_voxels = mask_4d.sum().clamp(min=1)
-
-            tensor_loss = ((pred - target) ** 2 * mask_4d).sum() / (n_voxels * 6)
-
-            if self.lambda_scalar > 0:
-                pred_fa, pred_md = tensor6_to_fa_md(pred)
-                tgt_fa, tgt_md = tensor6_to_fa_md(target)
-                mask_2d = brain_mask
-                n_2d = mask_2d.sum().clamp(min=1)
-                fa_loss = (torch.abs(pred_fa - tgt_fa) * mask_2d).sum() / n_2d
-                md_loss = (torch.abs(pred_md - tgt_md) * mask_2d).sum() / n_2d
-                total = tensor_loss + self.lambda_scalar * (fa_loss + md_loss)
-                return total, {
-                    "tensor_mse": tensor_loss.item(),
-                    "fa_mae": fa_loss.item(),
-                    "md_mae": md_loss.item(),
-                }
-        else:
-            tensor_loss = F.mse_loss(pred, target)
-            if self.lambda_scalar > 0:
-                pred_fa, pred_md = tensor6_to_fa_md(pred)
-                tgt_fa, tgt_md = tensor6_to_fa_md(target)
-                fa_loss = F.l1_loss(pred_fa, tgt_fa)
-                md_loss = F.l1_loss(pred_md, tgt_md)
-                total = tensor_loss + self.lambda_scalar * (fa_loss + md_loss)
-                return total, {
-                    "tensor_mse": tensor_loss.item(),
-                    "fa_mae": fa_loss.item(),
-                    "md_mae": md_loss.item(),
-                }
+        tensor_loss = F.mse_loss(pred, target)
+        if self.lambda_scalar > 0:
+            pred_fa, pred_md = tensor6_to_fa_md(pred)
+            tgt_fa, tgt_md = tensor6_to_fa_md(target)
+            fa_loss = F.l1_loss(pred_fa, tgt_fa)
+            md_loss = F.l1_loss(pred_md, tgt_md)
+            total = tensor_loss + self.lambda_scalar * (fa_loss + md_loss)
+            return total, {
+                "tensor_mse": tensor_loss.item(),
+                "fa_mae": fa_loss.item(),
+                "md_mae": md_loss.item(),
+            }
 
         return tensor_loss, {"tensor_mse": tensor_loss.item()}
 

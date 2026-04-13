@@ -15,9 +15,7 @@ NOISE_MAX = 0.10             # maximum relative Gaussian noise level
 # DWI / DTI shared constants
 # ─────────────────────────────────────────────────────────────────────────────
 B0_THRESHOLD = 50.0          # b-value threshold separating b0 from DWI volumes
-BRAIN_MASK_FRAC = 0.15        # fraction of max b0 signal used as brain mask threshold
 DTI_FIT_METHOD = "WLS"       # DTI fitting algorithm: 'WLS' | 'OLS' | 'NLLS'
-FA_MASK_THRESH = 0.0        # FA threshold for metric restriction (0 = all voxels)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Subject split (biological subject IDs — all sessions stay together)

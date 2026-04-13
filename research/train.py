@@ -94,7 +94,6 @@ def make_val_figure(
     bvecs = sample["bvecs"].unsqueeze(0).to(device)
     vol_mask = sample["vol_mask"].unsqueeze(0).to(device)
     target = sample["target"].numpy()  # (6, H, W)
-    brain_mask = sample["brain_mask"].numpy()  # (H, W)
 
     model.eval()
     with torch.no_grad():
@@ -117,7 +116,6 @@ def make_val_figure(
     pred_adc = pred_adc[:, :, 0]
     tgt_fa = tgt_fa[:, :, 0]
     tgt_adc = tgt_adc[:, :, 0]
-    mask = brain_mask > 0.5
 
     fa_diff = tgt_fa - pred_fa
     adc_diff = tgt_adc - pred_adc
@@ -129,39 +127,37 @@ def make_val_figure(
     axes[0, 0].set_title("Target FA")
     axes[0, 1].imshow(np.rot90(pred_fa), cmap="viridis", vmin=0, vmax=1)
     axes[0, 1].set_title("Predicted FA")
-    fa_abs = np.max(np.abs(fa_diff[mask])) if mask.any() else 0.5
+    fa_abs = max(float(np.max(np.abs(fa_diff))), 1e-6)
     im_fa = axes[0, 2].imshow(np.rot90(fa_diff), cmap="bwr", vmin=-fa_abs, vmax=fa_abs)
     axes[0, 2].set_title("FA Error (tgt - pred)")
     fig.colorbar(im_fa, ax=axes[0, 2], fraction=0.046, pad=0.04)
 
     # FA scatter
-    if mask.any():
-        axes[0, 3].scatter(tgt_fa[mask].ravel(), pred_fa[mask].ravel(), s=1, alpha=0.3)
-        axes[0, 3].plot([0, 1], [0, 1], "r--", lw=1)
-        m = scalar_map_metrics(tgt_fa, pred_fa, mask)
-        axes[0, 3].set_title(f"FA: RMSE={m['rmse']:.4f}  R²={m['r2']:.3f}")
+    axes[0, 3].scatter(tgt_fa.ravel(), pred_fa.ravel(), s=1, alpha=0.3)
+    axes[0, 3].plot([0, 1], [0, 1], "r--", lw=1)
+    m = scalar_map_metrics(tgt_fa, pred_fa)
+    axes[0, 3].set_title(f"FA: RMSE={m['rmse']:.4f}  R²={m['r2']:.3f}")
     axes[0, 3].set_xlabel("Target")
     axes[0, 3].set_ylabel("Predicted")
     axes[0, 3].set_aspect("equal")
 
     # Row 2: ADC
-    adc_lo, adc_hi = 0, max(float(np.percentile(tgt_adc[mask], 99)) if mask.any() else 0.003, 1e-6)
+    adc_lo, adc_hi = 0, max(float(np.percentile(tgt_adc, 99)), 1e-6)
     axes[1, 0].imshow(np.rot90(tgt_adc), cmap="magma", vmin=adc_lo, vmax=adc_hi)
     axes[1, 0].set_title("Target ADC")
     axes[1, 1].imshow(np.rot90(pred_adc), cmap="magma", vmin=adc_lo, vmax=adc_hi)
     axes[1, 1].set_title("Predicted ADC")
-    adc_abs = np.max(np.abs(adc_diff[mask])) if mask.any() else 0.001
+    adc_abs = max(float(np.max(np.abs(adc_diff))), 1e-6)
     im_adc = axes[1, 2].imshow(np.rot90(adc_diff), cmap="bwr", vmin=-adc_abs, vmax=adc_abs)
     axes[1, 2].set_title("ADC Error (tgt - pred)")
     fig.colorbar(im_adc, ax=axes[1, 2], fraction=0.046, pad=0.04)
 
     # ADC scatter
-    if mask.any():
-        axes[1, 3].scatter(tgt_adc[mask].ravel(), pred_adc[mask].ravel(), s=1, alpha=0.3)
-        lim = adc_hi
-        axes[1, 3].plot([0, lim], [0, lim], "r--", lw=1)
-        m = scalar_map_metrics(tgt_adc, pred_adc, mask)
-        axes[1, 3].set_title(f"ADC: RMSE={m['rmse']:.2e}  R²={m['r2']:.3f}")
+    axes[1, 3].scatter(tgt_adc.ravel(), pred_adc.ravel(), s=1, alpha=0.3)
+    lim = adc_hi
+    axes[1, 3].plot([0, lim], [0, lim], "r--", lw=1)
+    m = scalar_map_metrics(tgt_adc, pred_adc)
+    axes[1, 3].set_title(f"ADC: RMSE={m['rmse']:.2e}  R²={m['r2']:.3f}")
     axes[1, 3].set_xlabel("Target")
     axes[1, 3].set_ylabel("Predicted")
     axes[1, 3].set_aspect("equal")
@@ -199,10 +195,9 @@ def run_epoch(
             bvals = batch["bvals"].to(device)
             bvecs = batch["bvecs"].to(device)
             vol_mask = batch["vol_mask"].to(device)
-            brain_mask = batch["brain_mask"].to(device)
 
             pred = model(signal, bvals, bvecs, vol_mask)
-            loss, metrics = criterion(pred, target, brain_mask)
+            loss, metrics = criterion(pred, target)
 
             if is_train:
                 optimizer.zero_grad()
