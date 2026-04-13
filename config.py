@@ -16,6 +16,7 @@ NOISE_MAX = 0.10             # maximum relative Gaussian noise level
 # ─────────────────────────────────────────────────────────────────────────────
 B0_THRESHOLD = 50.0          # b-value threshold separating b0 from DWI volumes
 DTI_FIT_METHOD = "WLS"       # DTI fitting algorithm: 'WLS' | 'OLS' | 'NLLS'
+MAX_DIFFUSIVITY = 0.01       # mm²/s, eigenvalue cap for physically plausible DTI
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Subject split (biological subject IDs — all sessions stay together)

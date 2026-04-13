@@ -67,11 +67,11 @@ class DWISliceDataset(Dataset):
         else:
             self.dti_scale = 1.0
 
-        # Pre-compute 3D brain masks per subject from mean b0
+        # Pre-compute 3D brain masks per subject from clean target DWI
         self._brain_masks: dict[str, np.ndarray] = {}
         for key in self.subject_keys:
             grp = store[key]
-            dwi = np.asarray(grp["input_dwi"][:], dtype=np.float32)
+            dwi = np.asarray(grp["target_dwi"][:], dtype=np.float32)
             bvals_raw = np.asarray(grp["bvals"][:], dtype=np.float32)
             self._brain_masks[key] = compute_brain_mask_from_dwi(
                 dwi, bvals_raw, self.b0_threshold,

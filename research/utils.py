@@ -54,6 +54,41 @@ def dwi_metrics(ref_4d: np.ndarray, est_4d: np.ndarray) -> dict:
 # ═════════════════════════════════════════════════════════════════════════════════
 # DTI helpers
 # ═════════════════════
+def sanitize_dti6d(dti_6d: np.ndarray,
+                   max_eigenvalue: float = 0.01) -> np.ndarray:
+    """Project DTI tensors to PSD and cap eigenvalues for physical plausibility.
+
+    Ensures all eigenvalues are in [0, max_eigenvalue], which removes
+    non-physical negative eigenvalues and extreme positive outliers from
+    poor DTI fits.  Applied identically to all methods before metric
+    computation so that comparisons are on equal footing.
+    """
+    shape = dti_6d.shape[:-1]  # spatial dims
+    dxx, dxy, dyy, dxz, dyz, dzz = (dti_6d[..., i] for i in range(6))
+
+    flat = np.stack([
+        dxx.ravel(), dxy.ravel(), dxz.ravel(),
+        dxy.ravel(), dyy.ravel(), dyz.ravel(),
+        dxz.ravel(), dyz.ravel(), dzz.ravel(),
+    ], axis=-1).reshape(-1, 3, 3).astype(np.float64)
+
+    evals, evecs = np.linalg.eigh(flat)
+    evals = np.clip(evals, 0.0, max_eigenvalue)
+
+    # Reconstruct: V @ diag(evals) @ V^T
+    reconstructed = np.einsum('...ij,...j,...kj->...ik', evecs, evals, evecs)
+    reconstructed = reconstructed.reshape(*shape, 3, 3).astype(np.float32)
+
+    return np.stack([
+        reconstructed[..., 0, 0],
+        reconstructed[..., 0, 1],
+        reconstructed[..., 1, 1],
+        reconstructed[..., 0, 2],
+        reconstructed[..., 1, 2],
+        reconstructed[..., 2, 2],
+    ], axis=-1)
+
+
 def dti6d_to_evals(dti_6d: np.ndarray) -> np.ndarray:
     X, Y, Z = dti_6d.shape[:3]
     dxx = dti_6d[..., 0]; dxy = dti_6d[..., 1]

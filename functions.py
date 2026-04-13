@@ -340,6 +340,9 @@ def brain_mask(image,
 def compute_brain_mask_from_dwi(dwi_4d, bvals, b0_threshold=cfg.B0_THRESHOLD):
     """Compute a 3D brain mask from DWI data using mean b0 signal.
 
+    Uses Otsu thresholding on each axial slice of the mean b0, followed by
+    morphological cleanup and largest-component selection for a robust mask.
+
     Parameters
     ----------
     dwi_4d : ndarray, shape (X, Y, Z, N)
@@ -352,8 +355,43 @@ def compute_brain_mask_from_dwi(dwi_4d, bvals, b0_threshold=cfg.B0_THRESHOLD):
     """
     b0_idx = bvals < b0_threshold
     if b0_idx.any():
-        mean_b0 = dwi_4d[..., b0_idx].mean(axis=-1)
+        mean_b0 = dwi_4d[..., b0_idx].mean(axis=-1)  # (X, Y, Z)
     else:
         mean_b0 = dwi_4d.mean(axis=-1)
-    mask, _ = brain_mask(mean_b0)
+
+    Z = mean_b0.shape[2]
+    mask = np.zeros(mean_b0.shape, dtype=np.uint8)
+
+    close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    open_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    dilate_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+
+    for z in range(Z):
+        sl = mean_b0[:, :, z].astype(np.float64)
+
+        # Normalise to uint8 for Otsu
+        if sl.max() - sl.min() < 1e-8:
+            continue
+        sl_u8 = cv2.normalize(sl, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+        # Otsu threshold
+        _, bin_mask = cv2.threshold(sl_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+        # Morphological cleanup: close holes, remove small islands
+        bin_mask = cv2.morphologyEx(bin_mask, cv2.MORPH_CLOSE, close_k, iterations=2)
+        bin_mask = cv2.morphologyEx(bin_mask, cv2.MORPH_OPEN, open_k)
+
+        # Keep only the largest connected component
+        n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(bin_mask, connectivity=8)
+        if n_labels > 1:
+            # Label 0 is background
+            areas = stats[1:, cv2.CC_STAT_AREA]
+            largest = 1 + int(np.argmax(areas))
+            bin_mask = ((labels == largest) * 255).astype(np.uint8)
+
+        # Slight dilation to ensure brain edges are included
+        bin_mask = cv2.dilate(bin_mask, dilate_k, iterations=1)
+
+        mask[:, :, z] = (bin_mask > 0).astype(np.uint8)
+
     return mask.astype(bool)

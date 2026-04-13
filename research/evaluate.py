@@ -30,6 +30,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from research.utils import (
     dti6d_to_scalar_maps,
     fit_dti_to_6d,
+    sanitize_dti6d,
     scalar_map_metrics,
     save_prediction_slice_plot,
     select_plot_indices,
@@ -167,6 +168,46 @@ def _run_mppca(noisy: np.ndarray) -> np.ndarray:
         ).astype(np.float32)
 
 
+def _compute_dti_metrics(
+    pred_dti6d: np.ndarray,
+    target_dti6d: np.ndarray,
+    mask: np.ndarray | None = None,
+    max_diffusivity: float = cfg.MAX_DIFFUSIVITY,
+) -> dict:
+    """Compute DTI metrics from predicted and target 6D tensors.
+
+    Both tensors are sanitized (eigenvalue clamped to [0, max_diffusivity])
+    before metric computation so that all methods are evaluated under
+    identical physical constraints.
+    """
+    pred_clean = sanitize_dti6d(pred_dti6d, max_eigenvalue=max_diffusivity)
+    tgt_clean = sanitize_dti6d(target_dti6d, max_eigenvalue=max_diffusivity)
+
+    diff = pred_clean - tgt_clean
+    if mask is not None:
+        diff_brain = diff[mask]
+        tensor_rmse = float(np.sqrt(np.mean(diff_brain ** 2)))
+    else:
+        tensor_rmse = float(np.sqrt(np.mean(diff ** 2)))
+
+    pred_fa, pred_adc = dti6d_to_scalar_maps(pred_clean)
+    tgt_fa, tgt_adc = dti6d_to_scalar_maps(tgt_clean)
+    fa_m = scalar_map_metrics(tgt_fa, pred_fa, mask=mask)
+    adc_m = scalar_map_metrics(tgt_adc, pred_adc, mask=mask)
+
+    return {
+        "tensor_rmse": round(tensor_rmse, 6),
+        "fa_rmse": round(fa_m["rmse"], 6),
+        "fa_mae": round(fa_m["mae"], 6),
+        "fa_nrmse": round(fa_m["nrmse"], 6),
+        "fa_r2": round(fa_m["r2"], 4),
+        "adc_rmse": round(adc_m["rmse"], 8),
+        "adc_mae": round(adc_m["mae"], 8),
+        "adc_nrmse": round(adc_m["nrmse"], 6),
+        "adc_r2": round(adc_m["r2"], 4),
+    }
+
+
 def _baseline_dti_metrics(
     denoised_dwi: np.ndarray,
     target_dti6d: np.ndarray,
@@ -178,36 +219,16 @@ def _baseline_dti_metrics(
 ) -> tuple[dict, np.ndarray]:
     """Fit DTI from denoised DWI and compute metrics vs target.
 
-    Returns (metrics_dict, fitted_dti6d).
+    Clips DWI to non-negative before fitting to prevent unstable DTI
+    estimates from negative signal values introduced during degradation.
     """
     bvecs_n3 = bvecs.T if bvecs.shape[0] == 3 else bvecs
+    denoised_dwi = np.maximum(denoised_dwi, 0.0)
     fitted_dti6d = fit_dti_to_6d(
         denoised_dwi, bvals, bvecs_n3=bvecs_n3,
         fit_method=dti_fit_method, b0_threshold=b0_threshold,
     )
-    diff = fitted_dti6d - target_dti6d
-    if mask is not None:
-        diff_brain = diff[mask]
-        tensor_rmse = float(np.sqrt(np.mean(diff_brain ** 2)))
-    else:
-        tensor_rmse = float(np.sqrt(np.mean(diff ** 2)))
-
-    pred_fa, pred_adc = dti6d_to_scalar_maps(fitted_dti6d)
-    tgt_fa, tgt_adc = dti6d_to_scalar_maps(target_dti6d)
-    fa_m = scalar_map_metrics(tgt_fa, pred_fa, mask=mask)
-    adc_m = scalar_map_metrics(tgt_adc, pred_adc, mask=mask)
-
-    metrics = {
-        "tensor_rmse": round(tensor_rmse, 6),
-        "fa_rmse": round(fa_m["rmse"], 6),
-        "fa_mae": round(fa_m["mae"], 6),
-        "fa_nrmse": round(fa_m["nrmse"], 6),
-        "fa_r2": round(fa_m["r2"], 4),
-        "adc_rmse": round(adc_m["rmse"], 8),
-        "adc_mae": round(adc_m["mae"], 8),
-        "adc_nrmse": round(adc_m["nrmse"], 6),
-        "adc_r2": round(adc_m["r2"], 4),
-    }
+    metrics = _compute_dti_metrics(fitted_dti6d, target_dti6d, mask=mask)
     return metrics, fitted_dti6d
 
 
@@ -250,28 +271,10 @@ def evaluate_subject(
     # ── Research model ────────────────────────────────────────────────────
     pred_dti6d = predict_subject(model, zarr_path, subject_key, device, b0_threshold, dti_scale, max_bval)
 
-    diff = pred_dti6d - target_dti6d
-    diff_brain = diff[mask_3d]
-    tensor_rmse = float(np.sqrt(np.mean(diff_brain ** 2)))
-    pred_fa, pred_adc = dti6d_to_scalar_maps(pred_dti6d)
-    tgt_fa, tgt_adc = dti6d_to_scalar_maps(target_dti6d)
-    fa_m = scalar_map_metrics(tgt_fa, pred_fa, mask=mask_3d)
-    adc_m = scalar_map_metrics(tgt_adc, pred_adc, mask=mask_3d)
-
     research_elapsed = time.time() - t0
-    research_metrics = {
-        "subject": subject_key,
-        "elapsed_s": round(research_elapsed, 2),
-        "tensor_rmse": round(tensor_rmse, 6),
-        "fa_rmse": round(fa_m["rmse"], 6),
-        "fa_mae": round(fa_m["mae"], 6),
-        "fa_nrmse": round(fa_m["nrmse"], 6),
-        "fa_r2": round(fa_m["r2"], 4),
-        "adc_rmse": round(adc_m["rmse"], 8),
-        "adc_mae": round(adc_m["mae"], 8),
-        "adc_nrmse": round(adc_m["nrmse"], 6),
-        "adc_r2": round(adc_m["r2"], 4),
-    }
+    research_metrics = _compute_dti_metrics(pred_dti6d, target_dti6d, mask=mask_3d)
+    research_metrics["subject"] = subject_key
+    research_metrics["elapsed_s"] = round(research_elapsed, 2)
 
     all_metrics = {"research": research_metrics}
     arrays = {
