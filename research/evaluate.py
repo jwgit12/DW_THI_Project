@@ -618,10 +618,7 @@ def main(args):
                          all_metrics["mppca"]["fa_r2"],
                          all_metrics["mppca"]["elapsed_s"])
 
-            if not plot_arrays:
-                plot_arrays[subj] = arrays
-            elif subj == args.plot_subject:
-                plot_arrays[subj] = arrays
+            plot_arrays[subj] = arrays
         except Exception as exc:
             log.warning("FAIL  %s  —  %s", subj, exc)
 
@@ -674,50 +671,46 @@ def main(args):
 
     # ── Visualization ─────────────────────────────────────────────────────
     if research_rows and not args.skip_plot and plot_arrays:
-        plot_subject = args.plot_subject if (args.plot_subject and args.plot_subject in plot_arrays) else next(iter(plot_arrays))
-        if args.plot_subject and args.plot_subject not in plot_arrays:
-            log.warning("Plot subject %s not found. Falling back to %s.", args.plot_subject, plot_subject)
-        arrs = plot_arrays[plot_subject]
-
-        # Original prediction plot
-        plot_path = out_dir / f"prediction_example_{plot_subject}.png"
-        try:
-            plot_meta = save_prediction_slice_plot(
-                input_dwi=arrs["input_dwi"],
-                pred_dti6d=arrs["research_dti6d"],
-                target_dti6d=arrs["target_dti6d"],
-                bvals=arrs["bvals"],
-                out_path=plot_path,
-                subject_key=plot_subject,
-                b0_threshold=args.b0_threshold,
-                target_dwi=arrs["target_dwi"],
-                bvecs=arrs["bvecs"],
-                brain_mask_frac=args.brain_mask_frac,
-                slice_idx=args.plot_slice_idx,
-                volume_idx=args.plot_volume_idx,
-            )
-            log.info("Saved prediction plot -> %s  (z=%d, volume=%d)",
-                     plot_meta["out_path"], plot_meta["slice_idx"], plot_meta["volume_idx"])
-        except Exception as exc:
-            log.warning("Could not save prediction plot for %s: %s", plot_subject, exc)
-
-        # All-methods comparison plot
-        if run_baselines and "patch2self_dti6d" in arrs:
-            comp_path = out_dir / f"comparison_{plot_subject}.png"
+        for plot_subject, arrs in plot_arrays.items():
+            # Original prediction plot
+            plot_path = out_dir / f"prediction_example_{plot_subject}.png"
             try:
-                comp_meta = save_comparison_plot(
-                    arrays=arrs,
+                plot_meta = save_prediction_slice_plot(
+                    input_dwi=arrs["input_dwi"],
+                    pred_dti6d=arrs["research_dti6d"],
+                    target_dti6d=arrs["target_dti6d"],
+                    bvals=arrs["bvals"],
+                    out_path=plot_path,
                     subject_key=plot_subject,
-                    out_path=comp_path,
                     b0_threshold=args.b0_threshold,
+                    target_dwi=arrs["target_dwi"],
+                    bvecs=arrs["bvecs"],
                     brain_mask_frac=args.brain_mask_frac,
                     slice_idx=args.plot_slice_idx,
                     volume_idx=args.plot_volume_idx,
                 )
-                log.info("Saved comparison plot -> %s  (z=%d)",
-                         comp_meta["out_path"], comp_meta["slice_idx"])
+                log.info("Saved prediction plot -> %s  (z=%d, volume=%d)",
+                         plot_meta["out_path"], plot_meta["slice_idx"], plot_meta["volume_idx"])
             except Exception as exc:
-                log.warning("Could not save comparison plot for %s: %s", plot_subject, exc)
+                log.warning("Could not save prediction plot for %s: %s", plot_subject, exc)
+
+            # All-methods comparison plot
+            if run_baselines and "patch2self_dti6d" in arrs:
+                comp_path = out_dir / f"comparison_{plot_subject}.png"
+                try:
+                    comp_meta = save_comparison_plot(
+                        arrays=arrs,
+                        subject_key=plot_subject,
+                        out_path=comp_path,
+                        b0_threshold=args.b0_threshold,
+                        brain_mask_frac=args.brain_mask_frac,
+                        slice_idx=args.plot_slice_idx,
+                        volume_idx=args.plot_volume_idx,
+                    )
+                    log.info("Saved comparison plot -> %s  (z=%d)",
+                             comp_meta["out_path"], comp_meta["slice_idx"])
+                except Exception as exc:
+                    log.warning("Could not save comparison plot for %s: %s", plot_subject, exc)
 
     # ── Console summary ───────────────────────────────────────────────────
     print(f"\n{'=' * 72}")
@@ -762,7 +755,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate QSpaceUNet on test subjects")
     parser.add_argument("--checkpoint", required=True, help="Path to model checkpoint")
-    parser.add_argument("--zarr_path", default="dataset/pretext_dataset_new.zarr")
+    parser.add_argument("--zarr_path", default="dataset/default_dataset.zarr")
     parser.add_argument("--out_dir", default="research/results")
     parser.add_argument("--subjects", nargs="*", default=None,
                         help="Biological subject IDs or Zarr keys to evaluate (default: test subjects from checkpoint)")

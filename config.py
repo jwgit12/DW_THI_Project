@@ -37,7 +37,7 @@ LAMBDA_SCALAR = 0.3          # weight for FA/MD auxiliary loss
 # ─────────────────────────────────────────────────────────────────────────────
 EPOCHS = 150
 BATCH_SIZE = 8
-LEARNING_RATE = 5e-4
+LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 1e-4
 PATIENCE = 25                # early stopping patience (epochs)
 GRAD_CLIP = 1.0              # gradient norm clipping value

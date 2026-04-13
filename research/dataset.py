@@ -40,6 +40,7 @@ class DWISliceDataset(Dataset):
 
         self.max_n = 0
         self.samples: list[tuple[str, int]] = []
+        self._brain_masks: dict[str, np.ndarray] = {}
 
         global_max_bval = 0.0
         all_dti_abs = []
@@ -59,6 +60,22 @@ class DWISliceDataset(Dataset):
             nonzero = np.abs(dti[dti != 0])
             if nonzero.size > 0:
                 all_dti_abs.append(nonzero)
+
+            # Pre-compute brain mask from clean target DWI b0 signal.
+            # Using clean target (not noisy input) keeps the mask stable
+            # regardless of noise level.
+            b0_mask = bvals < self.b0_threshold
+            if b0_mask.any() and self.brain_mask_frac > 0:
+                target_dwi = np.asarray(grp["target_dwi"][:], dtype=np.float32)
+                mean_b0 = target_dwi[..., b0_mask].mean(axis=-1)
+                self._brain_masks[key] = (
+                    mean_b0 > self.brain_mask_frac * mean_b0.max()
+                ).astype(np.float32)
+                del target_dwi
+            else:
+                self._brain_masks[key] = np.ones(
+                    grp["target_dti_6d"].shape[:3], dtype=np.float32
+                )
 
         # Adaptive normalisation constants derived from the data
         self.max_bval = global_max_bval if global_max_bval > 0 else 1.0
@@ -99,15 +116,11 @@ class DWISliceDataset(Dataset):
         # Clamp to remove extreme outliers from bad DTI fits at brain edges
         target_slice = np.clip(target_slice * self.dti_scale, -3.0, 3.0)
 
-        # Brain mask from mean b0
-        b0_idx = bvals < self.b0_threshold
-        if b0_idx.any() and self.brain_mask_frac > 0:
-            mean_b0 = input_slice[b0_idx].mean(axis=0)
-            brain_mask = (mean_b0 > self.brain_mask_frac * mean_b0.max()).astype(np.float32)
-        else:
-            brain_mask = np.ones(input_slice.shape[1:], dtype=np.float32)
+        # Brain mask (pre-computed from clean target DWI in __init__)
+        brain_mask = self._brain_masks[key][:, :, z]
 
         # Normalise input by mean b0 signal inside brain
+        b0_idx = bvals < self.b0_threshold
         if b0_idx.any():
             mean_b0 = input_slice[b0_idx].mean(axis=0)
             brain_vals = mean_b0[brain_mask > 0]
