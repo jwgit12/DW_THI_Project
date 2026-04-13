@@ -216,7 +216,7 @@ Evaluate the trained model on test subjects:
 
 ```bash
 python3 -m research.evaluate \
-  --checkpoint research/runs/run_01/best_model.pt \
+  --checkpoint research/runs/run_02/best_model.pt \
   --zarr_path dataset/pretext_dataset_new.zarr \
   --out_dir research/results
 ```
