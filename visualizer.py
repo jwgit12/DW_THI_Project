@@ -13,6 +13,7 @@ from pathlib import Path
 
 import matplotlib
 import numpy as np
+import torch
 import zarr
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
@@ -37,7 +38,9 @@ ROOT_DIR = Path(__file__).resolve().parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
+import config as cfg
 from functions import compute_color_fa_from_tensor6, compute_fa_from_tensor6, compute_md_from_tensor6
+from research.model import QSpaceUNet
 
 matplotlib.rcParams["font.family"] = "DejaVu Sans"
 
@@ -62,6 +65,12 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Optional subject key to open first (for example: subject_010).",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        help="Path to a QSpaceUNet checkpoint (.pt). Enables live prediction panels.",
     )
     parser.add_argument(
         "--summary-only",
@@ -253,8 +262,16 @@ def dataset_summary(zarr_path: str) -> str:
     return "\n".join(lines)
 
 
+def get_device() -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
 class DatasetViewer(QMainWindow):
-    def __init__(self, zarr_path: str, initial_subject: str | None = None):
+    def __init__(self, zarr_path: str, initial_subject: str | None = None, checkpoint_path: str | None = None):
         super().__init__()
         self.zarr_path = zarr_path
         self.store = zarr.open_group(zarr_path, mode="r")
@@ -268,9 +285,29 @@ class DatasetViewer(QMainWindow):
         self.current_bvals = np.array([], dtype=np.float32)
         self.current_bvecs = np.empty((3, 0), dtype=np.float32)
         self.slice_metric_cache: dict[tuple[str, str, int], dict[str, np.ndarray]] = {}
+        self.pred_cache: dict[tuple[str, int], dict[str, np.ndarray]] = {}
+
+        # Load model if checkpoint provided
+        self.model: QSpaceUNet | None = None
+        self.dti_scale = 1.0
+        self.max_bval = 1000.0
+        self.device = torch.device("cpu")
+        if checkpoint_path is not None:
+            self.device = get_device()
+            ckpt = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+            max_n = ckpt["max_n"]
+            feat_dim = ckpt.get("feat_dim", 64)
+            channels = tuple(ckpt.get("channels", [64, 128, 256, 512]))
+            cholesky = ckpt.get("cholesky", False)
+            self.dti_scale = ckpt.get("dti_scale", 1.0)
+            self.max_bval = ckpt.get("max_bval", 1000.0)
+            self.model = QSpaceUNet(max_n=max_n, feat_dim=feat_dim, channels=channels, cholesky=cholesky).to(self.device)
+            self.model.load_state_dict(ckpt["model_state_dict"])
+            self.model.eval()
+            print(f"Model loaded from {checkpoint_path} (epoch {ckpt['epoch']}, device={self.device})")
 
         self.setWindowTitle("DW_THI Dataset Viewer")
-        self.setMinimumSize(1550, 950)
+        self.setMinimumSize(1550, 1300 if self.model is not None else 950)
         self._build_ui()
         self._load_subject_by_name(initial_subject or self.subjects[0])
 
@@ -324,11 +361,17 @@ class DatasetViewer(QMainWindow):
             ("FA Map", 1, 0),
             ("MD Map", 1, 1),
             ("Color FA", 1, 2),
+            ("Predicted FA", 2, 0),
+            ("Predicted MD", 2, 1),
+            ("Predicted Color FA", 2, 2),
         ]
         for title, row, col in panel_specs:
             panel = ImagePanel(title)
             images.addWidget(panel, row, col)
             self.panels[title] = panel
+
+        for key in ("Predicted FA", "Predicted MD", "Predicted Color FA"):
+            self.panels[key].setVisible(self.model is not None)
 
         info_box = QGroupBox("Subject Summary")
         info_layout = QVBoxLayout(info_box)
@@ -354,10 +397,13 @@ class DatasetViewer(QMainWindow):
 
         help_box = QGroupBox("Viewer Notes")
         help_layout = QVBoxLayout(help_box)
-        help_label = QLabel(
+        help_text = (
             "The first row follows the selected diffusion volume. "
             "The second row shows DTI-derived maps for the selected plane and slice."
         )
+        if self.model is not None:
+            help_text += " The third row shows neural network predictions (axial plane only)."
+        help_label = QLabel(help_text)
         help_label.setWordWrap(True)
         help_layout.addWidget(help_label)
         right.addWidget(help_box)
@@ -376,6 +422,7 @@ class DatasetViewer(QMainWindow):
         self.current_bvals = np.asarray(self.current_group["bvals"][:], dtype=np.float32)
         self.current_bvecs = np.asarray(self.current_group["bvecs"][:], dtype=np.float32)
         self.slice_metric_cache.clear()
+        self.pred_cache.clear()
 
         subject_index = self.subjects.index(subject_name)
         if self.subject_combo.currentIndex() != subject_index:
@@ -420,6 +467,63 @@ class DatasetViewer(QMainWindow):
                 "color_fa": np.asarray(compute_color_fa_from_tensor6(tensor6), dtype=np.float32),
             }
         return self.slice_metric_cache[cache_key]
+
+    def _get_predicted_metrics(self, slice_idx: int) -> dict[str, np.ndarray] | None:
+        if self.model is None or self.plane != "Axial":
+            return None
+
+        cache_key = (self.current_subject, slice_idx)
+        if cache_key in self.pred_cache:
+            return self.pred_cache[cache_key]
+
+        bvals = self.current_bvals.copy()
+        bvecs = self.current_bvecs.copy()
+        N = bvals.shape[0]
+        max_n = self.model.max_n
+
+        bvals_norm = bvals / self.max_bval
+
+        if N < max_n:
+            pad = max_n - N
+            bvals_norm = np.pad(bvals_norm, (0, pad))
+            bvecs = np.pad(bvecs, ((0, 0), (0, pad)))
+
+        vol_mask = np.zeros(max_n, dtype=np.float32)
+        vol_mask[:N] = 1.0
+
+        bvals_t = torch.from_numpy(bvals_norm).unsqueeze(0).to(self.device)
+        bvecs_t = torch.from_numpy(bvecs.astype(np.float32)).unsqueeze(0).to(self.device)
+        vol_mask_t = torch.from_numpy(vol_mask).unsqueeze(0).to(self.device)
+
+        # Extract axial slice and pad
+        signal_slice = np.asarray(self.current_group["input_dwi"][:, :, slice_idx, :], dtype=np.float32)  # (X, Y, N)
+        if N < max_n:
+            signal_slice = np.pad(signal_slice, ((0, 0), (0, 0), (0, max_n - N)))
+        signal = signal_slice.transpose(2, 0, 1)  # (max_n, H, W)
+
+        # b0 normalization
+        b0_idx = self.current_bvals < cfg.B0_THRESHOLD
+        if b0_idx.any():
+            b0_slice = np.asarray(self.current_group["input_dwi"][:, :, slice_idx, :], dtype=np.float32)[..., b0_idx].mean(axis=-1)
+        else:
+            b0_slice = signal_slice[..., :N].mean(axis=-1)
+        b0_norm = float(b0_slice[b0_slice > 0.1 * b0_slice.max()].mean()) if (b0_slice > 0).any() else 1.0
+        if b0_norm > 0:
+            signal = signal / b0_norm
+
+        signal_t = torch.from_numpy(signal).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            pred = self.model(signal_t, bvals_t, bvecs_t, vol_mask_t)
+
+        pred_tensor6 = pred[0].permute(1, 2, 0).cpu().numpy() / self.dti_scale
+
+        result = {
+            "fa": np.asarray(compute_fa_from_tensor6(pred_tensor6), dtype=np.float32),
+            "md": np.asarray(compute_md_from_tensor6(pred_tensor6), dtype=np.float32),
+            "color_fa": np.asarray(compute_color_fa_from_tensor6(pred_tensor6), dtype=np.float32),
+        }
+        self.pred_cache[cache_key] = result
+        return result
 
     def _update_subject_summary(self) -> None:
         source = self.current_group.attrs.get("source_dwi", "unknown")
@@ -483,6 +587,30 @@ class DatasetViewer(QMainWindow):
         self.volume_info_label.setText(volume_text)
 
         self.bvals_canvas.update_plot(self.current_bvals, volume_idx)
+
+        pred_metrics = self._get_predicted_metrics(slice_idx)
+        if pred_metrics is not None:
+            self.panels["Predicted FA"].set_pixmap(
+                make_pixmap(pred_metrics["fa"], cmap="viridis"),
+                f"mean={format_float(float(np.mean(pred_metrics['fa'])))}  max={format_float(float(np.max(pred_metrics['fa'])))}",
+            )
+            self.panels["Predicted MD"].set_pixmap(
+                make_pixmap(pred_metrics["md"], cmap="plasma"),
+                f"mean={format_float(float(np.mean(pred_metrics['md'])))}  max={format_float(float(np.max(pred_metrics['md'])))}",
+            )
+            self.panels["Predicted Color FA"].set_pixmap(
+                make_pixmap(pred_metrics["color_fa"]),
+                "predicted principal direction RGB weighted by FA",
+            )
+            for key in ("Predicted FA", "Predicted MD", "Predicted Color FA"):
+                self.panels[key].setVisible(True)
+        elif self.model is not None:
+            for key in ("Predicted FA", "Predicted MD", "Predicted Color FA"):
+                self.panels[key].image_label.setPixmap(QPixmap())
+                self.panels[key].image_label.setText("Axial plane only")
+                self.panels[key].caption_label.setText("")
+                self.panels[key].setVisible(True)
+
         self.statusBar().showMessage(
             f"{self.current_subject} | {self.plane} slice {slice_idx} | volume {volume_idx} | {shell_name(current_bval)}"
         )
@@ -495,7 +623,7 @@ def main() -> None:
         return
 
     app = QApplication(sys.argv)
-    viewer = DatasetViewer(args.zarr_path, initial_subject=args.subject)
+    viewer = DatasetViewer(args.zarr_path, initial_subject=args.subject, checkpoint_path=args.checkpoint)
     viewer.show()
     sys.exit(app.exec())
 
