@@ -275,9 +275,18 @@ class DatasetViewer(QMainWindow):
         super().__init__()
         self.zarr_path = zarr_path
         self.store = zarr.open_group(zarr_path, mode="r")
-        self.subjects = sorted(self.store.group_keys())
-        if not self.subjects:
+        all_subjects = sorted(self.store.group_keys())
+        if not all_subjects:
             raise RuntimeError(f"No subjects found in {zarr_path}")
+
+        # When a checkpoint is provided, restrict to test and validation subjects only
+        if checkpoint_path is not None:
+            allowed_ids = set(cfg.TEST_SUBJECTS + cfg.VAL_SUBJECTS)
+            self.subjects = [s for s in all_subjects if any(s.startswith(sid) for sid in allowed_ids)]
+            if not self.subjects:
+                raise RuntimeError("No test/val subjects found in dataset")
+        else:
+            self.subjects = all_subjects
 
         self.current_group = None
         self.current_subject = ""

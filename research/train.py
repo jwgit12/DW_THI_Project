@@ -279,17 +279,17 @@ def main(args):
     train_ds = DWISliceDataset(args.zarr_path, train_subjects, augment=True)
     val_ds = DWISliceDataset(args.zarr_path, val_subjects, augment=False)
 
-    # Ensure both datasets use the same max_n and normalisation constants
+    # Derive all normalisation constants from training data only to prevent
+    # information leakage from val/test into training.
+    # max_n must accommodate the largest subject across all splits (structural
+    # padding requirement), but max_bval and dti_scale are true normalisation
+    # scales and must come from training data exclusively.
     global_max_n = max(train_ds.max_n, val_ds.max_n)
     train_ds.max_n = global_max_n
     val_ds.max_n = global_max_n
 
-    global_max_bval = max(train_ds.max_bval, val_ds.max_bval)
-    global_dti_scale = train_ds.dti_scale  # use train stats for normalisation
-    train_ds.max_bval = global_max_bval
-    train_ds.dti_scale = global_dti_scale
-    val_ds.max_bval = global_max_bval
-    val_ds.dti_scale = global_dti_scale
+    val_ds.max_bval = train_ds.max_bval            # use train max_bval for val
+    val_ds.dti_scale = train_ds.dti_scale          # use train dti_scale for val
 
     train_loader = DataLoader(
         train_ds,
