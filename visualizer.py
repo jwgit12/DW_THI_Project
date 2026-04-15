@@ -2,7 +2,7 @@
 """Lightweight desktop viewer for DW_THI Zarr datasets.
 
 Usage:
-    python3 visualizer.py --zarr_path dataset/pretext_dataset_new.zarr
+    python3 visualizer.py --zarr_path dataset/default_dataset.zarr
 """
 
 from __future__ import annotations

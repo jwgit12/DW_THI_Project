@@ -288,8 +288,12 @@ def main(args):
     train_ds.max_n = global_max_n
     val_ds.max_n = global_max_n
 
-    val_ds.max_bval = train_ds.max_bval            # use train max_bval for val
-    val_ds.dti_scale = train_ds.dti_scale          # use train dti_scale for val
+    # Keep explicit local names for logging and checkpoint metadata.
+    global_max_bval = train_ds.max_bval
+    global_dti_scale = train_ds.dti_scale
+
+    val_ds.max_bval = global_max_bval
+    val_ds.dti_scale = global_dti_scale
 
     train_loader = DataLoader(
         train_ds,

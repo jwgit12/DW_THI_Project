@@ -6,7 +6,7 @@ When --run_baselines is set (default), Patch2Self and MP-PCA are also
 run on the same subjects, and comparison plots + metric tables are saved.
 
 Usage:
-    python -m research.evaluate --checkpoint research/runs/run_01/best_model.pt
+    python -m research.evaluate --checkpoint research/runs/run_full/best_model.pt
     python -m research.evaluate --checkpoint research/runs/run_01/best_model.pt --subjects sub-10 sub-11
     python -m research.evaluate --checkpoint research/runs/run_01/best_model.pt --skip_baselines
 """
