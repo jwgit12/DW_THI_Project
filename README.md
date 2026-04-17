@@ -39,9 +39,11 @@ DW_THI_Project/
 ├── research/
 │   ├── dataset.py               # Zarr slice-based PyTorch dataset
 │   ├── model.py                 # QSpaceUNet (q-space encoder + 2D U-Net)
+│   ├── loss.py                  # Masked DTI tensor + FA/MD loss
 │   ├── train.py                 # Training script
 │   ├── evaluate.py              # Evaluation with integrated baselines
-│   └── utils.py                 # Shared DWI/DTI metrics, DTI sanitization, plotting
+│   ├── utils.py                 # Shared DWI/DTI metrics, DTI sanitization, plotting
+│   └── __init__.py              # Python package marker
 ├── requirements.txt             # Python dependencies
 └── dti_prep.ipynb               # Exploratory notebook
 ```
@@ -51,8 +53,8 @@ DW_THI_Project/
 `research/model.py` implements the model:
 
 - **Q-space encoder**: 1x1 conv compresses `N` DWI volumes into `C` feature channels, with FiLM conditioning from a gradient table MLP (bvals/bvecs -> scale + shift)
-- **2D U-Net backbone**: 4-level encoder-decoder (64->128->256->512) with skip connections, GroupNorm, and spatial dropout
-- **Cholesky output head**: guarantees positive semi-definite 6-channel DTI tensor `[Dxx, Dxy, Dyy, Dxz, Dyz, Dzz]`
+- **2D U-Net backbone**: configurable encoder-decoder channel stack (default `64->128->256`) with skip connections, GroupNorm, and spatial dropout
+- **Output head**: predicts 6-channel DTI tensor `[Dxx, Dxy, Dyy, Dxz, Dyz, Dzz]`; `--cholesky` switches to a positive-semidefinite Cholesky parameterization
 
 Variable `N` is handled by zero-padding to `max_n` with a volume mask. The gradient FiLM conditioning adapts features to the acquisition protocol.
 
@@ -63,7 +65,7 @@ Variable `N` is handled by zero-padding to `max_n` with a volume mask. The gradi
 - **Loss**: MSE on 6D tensor + lambda x (FA MAE + MD MAE), computed within a brain mask
 - **FA/MD computation**: Frobenius norm formulation (no eigendecomposition -- MPS-safe)
 - **Optimizer**: AdamW with cosine annealing, gradient clipping
-- **Split**: 7 train / 2 val / 2 test (biological subject-level, all sessions grouped)
+- **Split**: train / val / test by biological subject ID, with all sessions grouped to prevent leakage. Defaults are `VAL_SUBJECTS = ["sub-05", "sub-11"]` and `TEST_SUBJECTS = ["sub-03", "sub-04"]` in `config.py`.
 - **Augmentation**: random horizontal/vertical flips
 - **Early stopping**: patience=25 on validation loss
 
@@ -83,7 +85,7 @@ Variable `N` is handled by zero-padding to `max_n` with a volume mask. The gradi
 | `baselines/fa_rmse/patch2self` | Patch2Self mean FA RMSE (flat reference line) |
 | `baselines/fa_rmse/mppca` | MP-PCA mean FA RMSE (flat reference line) |
 
-**Images logged every `--vis_every` epochs (default: 1):**
+**Images logged every `--vis_every` epochs (default: 10):**
 
 `val_prediction` -- a 2x4 panel showing for a fixed validation slice: target FA, predicted FA, FA error map, FA scatter plot (with RMSE and R2), and the same four panels for ADC.
 
@@ -101,6 +103,75 @@ Outputs:
 - Per-subject prediction plots (FA/ADC maps)
 - Side-by-side comparison plots across all methods
 - Summary bar chart of mean metrics
+
+## Research modules
+
+Only `research.train` and `research.evaluate` are command-line entry points. The other files are imported by those scripts.
+
+| File | Usage |
+|---|---|
+| `research/dataset.py` | Defines `DWISliceDataset`, which preloads selected Zarr subjects into RAM, builds axial 2D samples, computes target-side brain masks from clean `target_dwi`, normalizes DWI by mean b0 signal, scales/clips tensor targets, pads variable `N`, and returns `vol_mask` plus `brain_mask`. |
+| `research/model.py` | Defines `QSpaceUNet`, `QSpaceEncoder`, `UNet2D`, and optional Cholesky-to-tensor conversion. Imported by training, evaluation, and the viewer. |
+| `research/loss.py` | Defines `DTILoss`, a masked tensor MSE plus optional FA/MD MAE auxiliary loss controlled by `--lambda_scalar`. |
+| `research/utils.py` | Shared metric and plotting helpers: DWI metrics, DTI fitting, tensor sanitization, FA/ADC conversion, scalar-map metrics, automatic plot slice/volume selection, denoising plots, and prediction plots. |
+| `research/train.py` | CLI for supervised QSpaceUNet training. Writes checkpoints, `history.json`, and TensorBoard logs. |
+| `research/evaluate.py` | CLI for checkpoint evaluation. Runs QSpaceUNet and, unless skipped, Patch2Self and MP-PCA baselines through the same brain-mask metric pipeline. |
+| `research/__init__.py` | Marks `research` as an importable package for `python3 -m research.train` and `python3 -m research.evaluate`. |
+
+### `research.train` options
+
+```bash
+python3 -m research.train \
+  --zarr_path dataset/pretext_dataset_new.zarr \
+  --out_dir research/runs/run_01 \
+  --epochs 150 \
+  --batch_size 8 \
+  --lr 1e-3 \
+  --weight_decay 1e-4 \
+  --lambda_scalar 0.3 \
+  --patience 25 \
+  --vis_every 10 \
+  --num_workers 0
+```
+
+Useful optional overrides:
+- `--test_subjects sub-03 sub-04` and `--val_subjects sub-05 sub-11` override the biological-subject split.
+- `--feat_dim 128` and `--channels 64 128 256` override the q-space feature width and U-Net channel stack.
+- `--cholesky` enables positive-semidefinite tensor output parameterization.
+
+Training outputs in `--out_dir`:
+- `best_model.pt` and `last_model.pt`
+- `history.json`
+- `tb/` TensorBoard event files
+
+### `research.evaluate` options
+
+```bash
+python3 -m research.evaluate \
+  --checkpoint research/runs/run_01/best_model.pt \
+  --zarr_path dataset/default_dataset.zarr \
+  --out_dir research/results
+```
+
+Subject selection:
+- Default: checkpoint `test_subjects`; falls back to all Zarr groups if the checkpoint has no test split metadata.
+- `--subjects sub-03 sub-04` accepts biological subject IDs and expands to matching session keys.
+- `--subjects sub-03_ses-1` also accepts exact Zarr group keys.
+- `--eval_all` evaluates every group in the Zarr store.
+
+Evaluation controls:
+- `--skip_baselines` runs only QSpaceUNet.
+- `--skip_plot` disables PNG plot generation.
+- `--b0_threshold 50` overrides the b0/DWI split threshold.
+- `--plot_slice_idx` and `--plot_volume_idx` force the axial slice and DWI volume used for saved plots; otherwise they are selected automatically.
+
+Evaluation outputs in `--out_dir`:
+- `metrics_research.csv`
+- `metrics_per_subject.csv` for backward-compatible research-model results
+- `metrics_patch2self.csv` and `metrics_mppca.csv` when baselines are enabled
+- `comparison_metrics.csv`, `comparison_per_subject.csv`, and `comparison_metrics.png` when all methods are available
+- `prediction_example_<subject>.png` for each evaluated subject unless `--skip_plot` is used
+- `comparison_<subject>.png` for each evaluated subject when baselines and plots are enabled
 
 ## Shared configuration
 
