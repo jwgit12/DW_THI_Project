@@ -2,13 +2,14 @@
 """Lightweight desktop viewer for DW_THI Zarr datasets.
 
 Usage:
-    python3 visualizer.py --zarr_path dataset/default_dataset.zarr
+    python3 visualizer.py --zarr_path dataset/default_dataset.zarr --checkpoint research/runs/run_small/best_model.pt
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
+import threading
 from pathlib import Path
 
 import matplotlib
@@ -18,12 +19,12 @@ import zarr
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 from matplotlib import colormaps
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QRunnable, QThreadPool, pyqtSignal, QObject, pyqtSlot
 from PyQt6.QtGui import QImage, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
-    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -49,6 +50,17 @@ PLANE_TO_AXIS = {
     "Axial": 2,
     "Coronal": 1,
     "Sagittal": 0,
+}
+
+ROW_GROUPS: dict[str, tuple[str, ...]] = {
+    "dwi": ("Input DWI", "Target DWI", "Absolute Difference"),
+    "dti": ("FA Map", "MD Map", "Color FA"),
+    "pred": ("Predicted FA", "Predicted MD", "Predicted Color FA"),
+}
+ROW_LABELS: dict[str, str] = {
+    "dwi": "DWI Volumes",
+    "dti": "DTI Maps (ground truth)",
+    "pred": "NN Predictions",
 }
 
 
@@ -270,6 +282,123 @@ def get_device() -> torch.device:
     return torch.device("cpu")
 
 
+# ---------------------------------------------------------------------------
+# Background worker infrastructure
+# ---------------------------------------------------------------------------
+
+class WorkerSignals(QObject):
+    metrics_ready = pyqtSignal(str, str, int, object)   # subject, plane, slice_idx, result
+    prediction_ready = pyqtSignal(str, int, object)      # subject, slice_idx, result
+
+
+class MetricsWorker(QRunnable):
+    """Loads a DTI tensor slice from zarr and computes FA/MD/ColorFA off the main thread."""
+
+    def __init__(self, subject: str, plane: str, slice_idx: int,
+                 zarr_group, signals: WorkerSignals):
+        super().__init__()
+        self.subject = subject
+        self.plane = plane
+        self.slice_idx = slice_idx
+        self.zarr_group = zarr_group
+        self.signals = signals
+        self.setAutoDelete(True)
+
+    def run(self) -> None:
+        try:
+            tensor6 = extract_tensor_slice(self.zarr_group["target_dti_6d"], self.plane, self.slice_idx)
+            result = {
+                "fa": np.asarray(compute_fa_from_tensor6(tensor6), dtype=np.float32),
+                "md": np.asarray(compute_md_from_tensor6(tensor6), dtype=np.float32),
+                "color_fa": np.asarray(compute_color_fa_from_tensor6(tensor6), dtype=np.float32),
+            }
+            self.signals.metrics_ready.emit(self.subject, self.plane, self.slice_idx, result)
+        except Exception as exc:
+            print(f"[MetricsWorker] {exc}", file=sys.stderr)
+
+
+class PredictionWorker(QRunnable):
+    """Runs QSpaceUNet inference for one axial slice off the main thread."""
+
+    def __init__(self, subject: str, slice_idx: int,
+                 zarr_group, bvals: np.ndarray, bvecs: np.ndarray,
+                 model: QSpaceUNet, device: torch.device,
+                 dti_scale: float, max_bval: float, b0_threshold: float,
+                 model_lock: threading.Lock, signals: WorkerSignals):
+        super().__init__()
+        self.subject = subject
+        self.slice_idx = slice_idx
+        self.zarr_group = zarr_group
+        self.bvals = bvals
+        self.bvecs = bvecs
+        self.model = model
+        self.device = device
+        self.dti_scale = dti_scale
+        self.max_bval = max_bval
+        self.b0_threshold = b0_threshold
+        self.model_lock = model_lock
+        self.signals = signals
+        self.setAutoDelete(True)
+
+    def run(self) -> None:
+        try:
+            bvals = self.bvals.copy()
+            bvecs = self.bvecs.copy()
+            N = bvals.shape[0]
+            max_n = self.model.max_n
+
+            bvals_norm = bvals / self.max_bval
+            if N < max_n:
+                pad = max_n - N
+                bvals_norm = np.pad(bvals_norm, (0, pad))
+                bvecs = np.pad(bvecs, ((0, 0), (0, pad)))
+
+            vol_mask = np.zeros(max_n, dtype=np.float32)
+            vol_mask[:N] = 1.0
+
+            bvals_t = torch.from_numpy(bvals_norm).unsqueeze(0).to(self.device)
+            bvecs_t = torch.from_numpy(bvecs.astype(np.float32)).unsqueeze(0).to(self.device)
+            vol_mask_t = torch.from_numpy(vol_mask).unsqueeze(0).to(self.device)
+
+            signal_slice = np.asarray(
+                self.zarr_group["input_dwi"][:, :, self.slice_idx, :], dtype=np.float32
+            )
+            if N < max_n:
+                signal_slice = np.pad(signal_slice, ((0, 0), (0, 0), (0, max_n - N)))
+            signal = signal_slice.transpose(2, 0, 1)  # (max_n, H, W)
+
+            b0_idx = self.bvals < self.b0_threshold
+            if b0_idx.any():
+                b0_slice = np.asarray(
+                    self.zarr_group["input_dwi"][:, :, self.slice_idx, :], dtype=np.float32
+                )[..., b0_idx].mean(axis=-1)
+            else:
+                b0_slice = signal_slice[..., :N].mean(axis=-1)
+            b0_norm = compute_b0_norm(b0_slice)
+            if b0_norm > 0:
+                signal = signal / b0_norm
+
+            signal_t = torch.from_numpy(signal).unsqueeze(0).to(self.device)
+
+            with self.model_lock:
+                with torch.no_grad():
+                    pred = self.model(signal_t, bvals_t, bvecs_t, vol_mask_t)
+
+            pred_tensor6 = pred[0].permute(1, 2, 0).cpu().numpy() / self.dti_scale
+            result = {
+                "fa": np.asarray(compute_fa_from_tensor6(pred_tensor6), dtype=np.float32),
+                "md": np.asarray(compute_md_from_tensor6(pred_tensor6), dtype=np.float32),
+                "color_fa": np.asarray(compute_color_fa_from_tensor6(pred_tensor6), dtype=np.float32),
+            }
+            self.signals.prediction_ready.emit(self.subject, self.slice_idx, result)
+        except Exception as exc:
+            print(f"[PredictionWorker] {exc}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Main viewer window
+# ---------------------------------------------------------------------------
+
 class DatasetViewer(QMainWindow):
     def __init__(self, zarr_path: str, initial_subject: str | None = None, checkpoint_path: str | None = None):
         super().__init__()
@@ -279,7 +408,6 @@ class DatasetViewer(QMainWindow):
         if not all_subjects:
             raise RuntimeError(f"No subjects found in {zarr_path}")
 
-        # When a checkpoint is provided, restrict to test and validation subjects only
         if checkpoint_path is not None:
             allowed_ids = set(cfg.TEST_SUBJECTS + cfg.VAL_SUBJECTS)
             self.subjects = [s for s in all_subjects if any(s.startswith(sid) for sid in allowed_ids)]
@@ -293,14 +421,17 @@ class DatasetViewer(QMainWindow):
         self.current_shape = (0, 0, 0, 0)
         self.current_bvals = np.array([], dtype=np.float32)
         self.current_bvecs = np.empty((3, 0), dtype=np.float32)
-        self.slice_metric_cache: dict[tuple[str, str, int], dict[str, np.ndarray]] = {}
-        self.pred_cache: dict[tuple[str, int], dict[str, np.ndarray]] = {}
+        self.slice_metric_cache: dict[tuple, dict] = {}
+        self.pred_cache: dict[tuple, dict] = {}
+        self._pending_metrics: set[tuple] = set()
+        self._pending_predictions: set[tuple] = set()
 
-        # Load model if checkpoint provided
         self.model: QSpaceUNet | None = None
         self.dti_scale = 1.0
         self.max_bval = 1000.0
         self.device = torch.device("cpu")
+        self.model_lock = threading.Lock()
+
         if checkpoint_path is not None:
             self.device = get_device()
             ckpt = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
@@ -315,8 +446,14 @@ class DatasetViewer(QMainWindow):
             self.model.eval()
             print(f"Model loaded from {checkpoint_path} (epoch {ckpt['epoch']}, device={self.device})")
 
+        self.worker_signals = WorkerSignals()
+        self.worker_signals.metrics_ready.connect(self._on_metrics_ready)
+        self.worker_signals.prediction_ready.connect(self._on_prediction_ready)
+        self.thread_pool = QThreadPool()
+        self.thread_pool.setMaxThreadCount(4)
+
         self.setWindowTitle("DW_THI Dataset Viewer")
-        self.setMinimumSize(1550, 1300 if self.model is not None else 950)
+        self.setMinimumSize(1550, 1200 if self.model is not None else 900)
         self._build_ui()
         self._load_subject_by_name(initial_subject or self.subjects[0])
 
@@ -330,6 +467,7 @@ class DatasetViewer(QMainWindow):
         page.addLayout(left, stretch=4)
         page.addLayout(right, stretch=1)
 
+        # ── Controls bar ──────────────────────────────────────────────────
         controls = QHBoxLayout()
         left.addLayout(controls)
 
@@ -359,29 +497,27 @@ class DatasetViewer(QMainWindow):
         self.volume_label = QLabel("0 / 0")
         controls.addWidget(self.volume_label)
 
-        images = QGridLayout()
-        left.addLayout(images, stretch=1)
+        # ── Image rows (QVBoxLayout so hidden rows collapse) ──────────────
+        rows_container = QVBoxLayout()
+        left.addLayout(rows_container, stretch=1)
 
         self.panels: dict[str, ImagePanel] = {}
-        panel_specs = [
-            ("Input DWI", 0, 0),
-            ("Target DWI", 0, 1),
-            ("Absolute Difference", 0, 2),
-            ("FA Map", 1, 0),
-            ("MD Map", 1, 1),
-            ("Color FA", 1, 2),
-            ("Predicted FA", 2, 0),
-            ("Predicted MD", 2, 1),
-            ("Predicted Color FA", 2, 2),
-        ]
-        for title, row, col in panel_specs:
-            panel = ImagePanel(title)
-            images.addWidget(panel, row, col)
-            self.panels[title] = panel
+        self.row_widgets: dict[str, QWidget] = {}
 
-        for key in ("Predicted FA", "Predicted MD", "Predicted Color FA"):
-            self.panels[key].setVisible(self.model is not None)
+        for row_key, panel_names in ROW_GROUPS.items():
+            if row_key == "pred" and self.model is None:
+                continue
+            row_widget = QWidget()
+            row_layout = QHBoxLayout(row_widget)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            for name in panel_names:
+                panel = ImagePanel(name)
+                row_layout.addWidget(panel)
+                self.panels[name] = panel
+            self.row_widgets[row_key] = row_widget
+            rows_container.addWidget(row_widget, stretch=1)
 
+        # ── Right panel ───────────────────────────────────────────────────
         info_box = QGroupBox("Subject Summary")
         info_layout = QVBoxLayout(info_box)
         self.subject_info_label = QLabel("")
@@ -404,18 +540,50 @@ class DatasetViewer(QMainWindow):
         bvals_layout.addWidget(self.bvals_canvas)
         right.addWidget(bvals_box, stretch=1)
 
+        # ── Visibility checkboxes ─────────────────────────────────────────
+        vis_box = QGroupBox("Visible Panels")
+        vis_layout = QVBoxLayout(vis_box)
+        vis_layout.setSpacing(2)
+        self.panel_checks: dict[str, QCheckBox] = {}
+
+        for row_key, panel_names in ROW_GROUPS.items():
+            if row_key == "pred" and self.model is None:
+                continue
+            row_header = QLabel(f"<b>{ROW_LABELS[row_key]}</b>")
+            vis_layout.addWidget(row_header)
+            for name in panel_names:
+                cb = QCheckBox(name)
+                cb.setChecked(True)
+                cb.toggled.connect(lambda checked, n=name: self._toggle_panel(n, checked))
+                vis_layout.addWidget(cb)
+                self.panel_checks[name] = cb
+
+        right.addWidget(vis_box)
+
         help_box = QGroupBox("Viewer Notes")
         help_layout = QVBoxLayout(help_box)
         help_text = (
-            "The first row follows the selected diffusion volume. "
-            "The second row shows DTI-derived maps for the selected plane and slice."
+            "Row 1: DWI volumes for the selected diffusion volume. "
+            "Row 2: DTI-derived maps computed from ground-truth tensors. "
         )
         if self.model is not None:
-            help_text += " The third row shows neural network predictions (axial plane only)."
+            help_text += "Row 3: live NN predictions (axial plane only). "
+        help_text += "DTI and NN panels load in the background — the GUI stays responsive."
         help_label = QLabel(help_text)
         help_label.setWordWrap(True)
         help_layout.addWidget(help_label)
         right.addWidget(help_box)
+
+    def _toggle_panel(self, panel_name: str, visible: bool) -> None:
+        if panel_name in self.panels:
+            self.panels[panel_name].setVisible(visible)
+        # Collapse row container when all its panels are hidden
+        for row_key, panel_names in ROW_GROUPS.items():
+            if panel_name in panel_names and row_key in self.row_widgets:
+                row_visible = any(
+                    self.panels[n].isVisible() for n in panel_names if n in self.panels
+                )
+                self.row_widgets[row_key].setVisible(row_visible)
 
     @property
     def plane(self) -> str:
@@ -432,6 +600,8 @@ class DatasetViewer(QMainWindow):
         self.current_bvecs = np.asarray(self.current_group["bvecs"][:], dtype=np.float32)
         self.slice_metric_cache.clear()
         self.pred_cache.clear()
+        self._pending_metrics.clear()
+        self._pending_predictions.clear()
 
         subject_index = self.subjects.index(subject_name)
         if self.subject_combo.currentIndex() != subject_index:
@@ -466,74 +636,6 @@ class DatasetViewer(QMainWindow):
         self.volume_slider.setValue(initial_volume)
         self.volume_slider.blockSignals(False)
 
-    def _get_slice_metrics(self, slice_idx: int) -> dict[str, np.ndarray]:
-        cache_key = (self.current_subject, self.plane, slice_idx)
-        if cache_key not in self.slice_metric_cache:
-            tensor6 = extract_tensor_slice(self.current_group["target_dti_6d"], self.plane, slice_idx)
-            self.slice_metric_cache[cache_key] = {
-                "fa": np.asarray(compute_fa_from_tensor6(tensor6), dtype=np.float32),
-                "md": np.asarray(compute_md_from_tensor6(tensor6), dtype=np.float32),
-                "color_fa": np.asarray(compute_color_fa_from_tensor6(tensor6), dtype=np.float32),
-            }
-        return self.slice_metric_cache[cache_key]
-
-    def _get_predicted_metrics(self, slice_idx: int) -> dict[str, np.ndarray] | None:
-        if self.model is None or self.plane != "Axial":
-            return None
-
-        cache_key = (self.current_subject, slice_idx)
-        if cache_key in self.pred_cache:
-            return self.pred_cache[cache_key]
-
-        bvals = self.current_bvals.copy()
-        bvecs = self.current_bvecs.copy()
-        N = bvals.shape[0]
-        max_n = self.model.max_n
-
-        bvals_norm = bvals / self.max_bval
-
-        if N < max_n:
-            pad = max_n - N
-            bvals_norm = np.pad(bvals_norm, (0, pad))
-            bvecs = np.pad(bvecs, ((0, 0), (0, pad)))
-
-        vol_mask = np.zeros(max_n, dtype=np.float32)
-        vol_mask[:N] = 1.0
-
-        bvals_t = torch.from_numpy(bvals_norm).unsqueeze(0).to(self.device)
-        bvecs_t = torch.from_numpy(bvecs.astype(np.float32)).unsqueeze(0).to(self.device)
-        vol_mask_t = torch.from_numpy(vol_mask).unsqueeze(0).to(self.device)
-
-        # Extract axial slice and pad
-        signal_slice = np.asarray(self.current_group["input_dwi"][:, :, slice_idx, :], dtype=np.float32)  # (X, Y, N)
-        if N < max_n:
-            signal_slice = np.pad(signal_slice, ((0, 0), (0, 0), (0, max_n - N)))
-        signal = signal_slice.transpose(2, 0, 1)  # (max_n, H, W)
-
-        # b0 normalization
-        b0_idx = self.current_bvals < cfg.B0_THRESHOLD
-        if b0_idx.any():
-            b0_slice = np.asarray(self.current_group["input_dwi"][:, :, slice_idx, :], dtype=np.float32)[..., b0_idx].mean(axis=-1)
-        else:
-            b0_slice = signal_slice[..., :N].mean(axis=-1)
-        b0_norm = compute_b0_norm(b0_slice)
-        if b0_norm > 0:
-            signal = signal / b0_norm
-
-        signal_t = torch.from_numpy(signal).unsqueeze(0).to(self.device)
-        with torch.no_grad():
-            pred = self.model(signal_t, bvals_t, bvecs_t, vol_mask_t)
-
-        pred_tensor6 = pred[0].permute(1, 2, 0).cpu().numpy() / self.dti_scale
-
-        result = {
-            "fa": np.asarray(compute_fa_from_tensor6(pred_tensor6), dtype=np.float32),
-            "md": np.asarray(compute_md_from_tensor6(pred_tensor6), dtype=np.float32),
-            "color_fa": np.asarray(compute_color_fa_from_tensor6(pred_tensor6), dtype=np.float32),
-        }
-        self.pred_cache[cache_key] = result
-        return result
-
     def _update_subject_summary(self) -> None:
         source = self.current_group.attrs.get("source_dwi", "unknown")
         shells = summarize_shells(self.current_bvals)
@@ -554,10 +656,10 @@ class DatasetViewer(QMainWindow):
         self.slice_label.setText(f"{slice_idx} / {self.slice_slider.maximum()}")
         self.volume_label.setText(f"{volume_idx} / {self.volume_slider.maximum()}")
 
+        # ── DWI panels: fast zarr slicing, runs synchronously ─────────────
         input_slice = extract_volume_slice(self.current_group["input_dwi"], self.plane, slice_idx, volume_idx)
         target_slice = extract_volume_slice(self.current_group["target_dwi"], self.plane, slice_idx, volume_idx)
         diff_slice = np.abs(input_slice - target_slice)
-        metrics = self._get_slice_metrics(slice_idx)
 
         self.panels["Input DWI"].set_pixmap(
             make_pixmap(input_slice, cmap="gray"),
@@ -571,6 +673,68 @@ class DatasetViewer(QMainWindow):
             make_pixmap(diff_slice, cmap="magma"),
             f"mean={format_float(float(np.mean(diff_slice)))}  max={format_float(float(np.max(diff_slice)))}",
         )
+
+        current_bval = float(self.current_bvals[volume_idx])
+        current_bvec = self.current_bvecs[:, volume_idx]
+        self.volume_info_label.setText(
+            f"Plane: {self.plane}\n"
+            f"Slice: {slice_idx}\n"
+            f"Volume: {volume_idx}  ({shell_name(current_bval)})\n"
+            f"bvec: [{current_bvec[0]:.3f}, {current_bvec[1]:.3f}, {current_bvec[2]:.3f}]\n"
+            f"Input-target abs diff mean: {format_float(float(np.mean(diff_slice)))}"
+        )
+        self.bvals_canvas.update_plot(self.current_bvals, volume_idx)
+
+        # ── DTI metrics: serve from cache or queue background worker ───────
+        metrics_key = (self.current_subject, self.plane, slice_idx)
+        if metrics_key in self.slice_metric_cache:
+            self._apply_metrics(self.slice_metric_cache[metrics_key])
+        elif metrics_key not in self._pending_metrics:
+            self._pending_metrics.add(metrics_key)
+            for p in ("FA Map", "MD Map", "Color FA"):
+                self.panels[p].image_label.setPixmap(QPixmap())
+                self.panels[p].image_label.setText("Computing…")
+                self.panels[p].caption_label.setText("")
+            self.thread_pool.start(
+                MetricsWorker(
+                    self.current_subject, self.plane, slice_idx,
+                    self.current_group, self.worker_signals,
+                )
+            )
+
+        # ── NN predictions: serve from cache or queue background worker ────
+        if self.model is not None:
+            if self.plane != "Axial":
+                for p in ("Predicted FA", "Predicted MD", "Predicted Color FA"):
+                    self.panels[p].image_label.setPixmap(QPixmap())
+                    self.panels[p].image_label.setText("Axial plane only")
+                    self.panels[p].caption_label.setText("")
+            else:
+                pred_key = (self.current_subject, slice_idx)
+                if pred_key in self.pred_cache:
+                    self._apply_predictions(self.pred_cache[pred_key])
+                elif pred_key not in self._pending_predictions:
+                    self._pending_predictions.add(pred_key)
+                    for p in ("Predicted FA", "Predicted MD", "Predicted Color FA"):
+                        self.panels[p].image_label.setPixmap(QPixmap())
+                        self.panels[p].image_label.setText("Computing…")
+                        self.panels[p].caption_label.setText("")
+                    self.thread_pool.start(
+                        PredictionWorker(
+                            self.current_subject, slice_idx,
+                            self.current_group,
+                            self.current_bvals.copy(), self.current_bvecs.copy(),
+                            self.model, self.device,
+                            self.dti_scale, self.max_bval, cfg.B0_THRESHOLD,
+                            self.model_lock, self.worker_signals,
+                        )
+                    )
+
+        self.statusBar().showMessage(
+            f"{self.current_subject} | {self.plane} slice {slice_idx} | volume {volume_idx} | {shell_name(current_bval)}"
+        )
+
+    def _apply_metrics(self, metrics: dict) -> None:
         self.panels["FA Map"].set_pixmap(
             make_pixmap(metrics["fa"], cmap="viridis"),
             f"mean={format_float(float(np.mean(metrics['fa'])))}  max={format_float(float(np.max(metrics['fa'])))}",
@@ -584,45 +748,37 @@ class DatasetViewer(QMainWindow):
             "principal direction RGB weighted by FA",
         )
 
-        current_bval = float(self.current_bvals[volume_idx])
-        current_bvec = self.current_bvecs[:, volume_idx]
-        volume_text = (
-            f"Plane: {self.plane}\n"
-            f"Slice: {slice_idx}\n"
-            f"Volume: {volume_idx}  ({shell_name(current_bval)})\n"
-            f"bvec: [{current_bvec[0]:.3f}, {current_bvec[1]:.3f}, {current_bvec[2]:.3f}]\n"
-            f"Input-target abs diff mean: {format_float(float(np.mean(diff_slice)))}"
+    def _apply_predictions(self, pred_metrics: dict) -> None:
+        self.panels["Predicted FA"].set_pixmap(
+            make_pixmap(pred_metrics["fa"], cmap="viridis"),
+            f"mean={format_float(float(np.mean(pred_metrics['fa'])))}  max={format_float(float(np.max(pred_metrics['fa'])))}",
         )
-        self.volume_info_label.setText(volume_text)
-
-        self.bvals_canvas.update_plot(self.current_bvals, volume_idx)
-
-        pred_metrics = self._get_predicted_metrics(slice_idx)
-        if pred_metrics is not None:
-            self.panels["Predicted FA"].set_pixmap(
-                make_pixmap(pred_metrics["fa"], cmap="viridis"),
-                f"mean={format_float(float(np.mean(pred_metrics['fa'])))}  max={format_float(float(np.max(pred_metrics['fa'])))}",
-            )
-            self.panels["Predicted MD"].set_pixmap(
-                make_pixmap(pred_metrics["md"], cmap="plasma"),
-                f"mean={format_float(float(np.mean(pred_metrics['md'])))}  max={format_float(float(np.max(pred_metrics['md'])))}",
-            )
-            self.panels["Predicted Color FA"].set_pixmap(
-                make_pixmap(pred_metrics["color_fa"]),
-                "predicted principal direction RGB weighted by FA",
-            )
-            for key in ("Predicted FA", "Predicted MD", "Predicted Color FA"):
-                self.panels[key].setVisible(True)
-        elif self.model is not None:
-            for key in ("Predicted FA", "Predicted MD", "Predicted Color FA"):
-                self.panels[key].image_label.setPixmap(QPixmap())
-                self.panels[key].image_label.setText("Axial plane only")
-                self.panels[key].caption_label.setText("")
-                self.panels[key].setVisible(True)
-
-        self.statusBar().showMessage(
-            f"{self.current_subject} | {self.plane} slice {slice_idx} | volume {volume_idx} | {shell_name(current_bval)}"
+        self.panels["Predicted MD"].set_pixmap(
+            make_pixmap(pred_metrics["md"], cmap="plasma"),
+            f"mean={format_float(float(np.mean(pred_metrics['md'])))}  max={format_float(float(np.max(pred_metrics['md'])))}",
         )
+        self.panels["Predicted Color FA"].set_pixmap(
+            make_pixmap(pred_metrics["color_fa"]),
+            "predicted principal direction RGB weighted by FA",
+        )
+
+    @pyqtSlot(str, str, int, object)
+    def _on_metrics_ready(self, subject: str, plane: str, slice_idx: int, result: dict) -> None:
+        self._pending_metrics.discard((subject, plane, slice_idx))
+        self.slice_metric_cache[(subject, plane, slice_idx)] = result
+        if (subject == self.current_subject
+                and plane == self.plane
+                and slice_idx == self.slice_slider.value()):
+            self._apply_metrics(result)
+
+    @pyqtSlot(str, int, object)
+    def _on_prediction_ready(self, subject: str, slice_idx: int, result: dict) -> None:
+        self._pending_predictions.discard((subject, slice_idx))
+        self.pred_cache[(subject, slice_idx)] = result
+        if (subject == self.current_subject
+                and slice_idx == self.slice_slider.value()
+                and self.plane == "Axial"):
+            self._apply_predictions(result)
 
 
 def main() -> None:
