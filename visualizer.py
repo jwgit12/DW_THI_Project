@@ -40,7 +40,13 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 import config as cfg
-from functions import compute_b0_norm, compute_color_fa_from_tensor6, compute_fa_from_tensor6, compute_md_from_tensor6
+from functions import (
+    compute_b0_norm,
+    compute_brain_mask_from_dwi,
+    compute_color_fa_from_tensor6,
+    compute_fa_from_tensor6,
+    compute_md_from_tensor6,
+)
 from research.model import QSpaceUNet
 
 matplotlib.rcParams["font.family"] = "DejaVu Sans"
@@ -198,6 +204,35 @@ def extract_tensor_slice(array: zarr.Array, plane: str, slice_idx: int) -> np.nd
     if plane == "Coronal":
         return np.asarray(array[:, slice_idx, :, :], dtype=np.float32)
     return np.asarray(array[slice_idx, :, :, :], dtype=np.float32)
+
+
+def extract_mask_slice(mask: np.ndarray, plane: str, slice_idx: int) -> np.ndarray:
+    if plane == "Axial":
+        return np.asarray(mask[:, :, slice_idx], dtype=bool)
+    if plane == "Coronal":
+        return np.asarray(mask[:, slice_idx, :], dtype=bool)
+    return np.asarray(mask[slice_idx, :, :], dtype=bool)
+
+
+def apply_display_mask(arr: np.ndarray, mask: np.ndarray | None) -> np.ndarray:
+    arr = np.asarray(arr, dtype=np.float32)
+    if mask is None:
+        return arr
+    mask_f = np.asarray(mask, dtype=np.float32)
+    if arr.ndim == 3:
+        mask_f = mask_f[..., None]
+    return arr * mask_f
+
+
+def masked_stats(arr: np.ndarray, mask: np.ndarray | None = None) -> tuple[float, float]:
+    arr = np.asarray(arr, dtype=np.float32)
+    finite = np.isfinite(arr)
+    if mask is not None:
+        finite &= np.asarray(mask, dtype=bool)
+    values = arr[finite]
+    if values.size == 0:
+        return 0.0, 0.0
+    return float(np.mean(values)), float(np.max(values))
 
 
 class ImagePanel(QGroupBox):
@@ -421,6 +456,8 @@ class DatasetViewer(QMainWindow):
         self.current_shape = (0, 0, 0, 0)
         self.current_bvals = np.array([], dtype=np.float32)
         self.current_bvecs = np.empty((3, 0), dtype=np.float32)
+        self.current_brain_mask: np.ndarray | None = None
+        self.brain_mask_cache: dict[str, np.ndarray] = {}
         self.slice_metric_cache: dict[tuple, dict] = {}
         self.pred_cache: dict[tuple, dict] = {}
         self._pending_metrics: set[tuple] = set()
@@ -568,6 +605,7 @@ class DatasetViewer(QMainWindow):
         )
         if self.model is not None:
             help_text += "Row 3: live NN predictions (axial plane only). "
+        help_text += "DWI, DTI, and NN panels are masked to the target-side brain mask. "
         help_text += "DTI and NN panels load in the background — the GUI stays responsive."
         help_label = QLabel(help_text)
         help_label.setWordWrap(True)
@@ -598,6 +636,7 @@ class DatasetViewer(QMainWindow):
         self.current_shape = tuple(self.current_group["input_dwi"].shape)
         self.current_bvals = np.asarray(self.current_group["bvals"][:], dtype=np.float32)
         self.current_bvecs = np.asarray(self.current_group["bvecs"][:], dtype=np.float32)
+        self.current_brain_mask = self._get_brain_mask(subject_name)
         self.slice_metric_cache.clear()
         self.pred_cache.clear()
         self._pending_metrics.clear()
@@ -613,6 +652,26 @@ class DatasetViewer(QMainWindow):
         self._reset_volume_slider()
         self._update_subject_summary()
         self._update_view()
+
+    def _get_brain_mask(self, subject_name: str) -> np.ndarray:
+        if subject_name in self.brain_mask_cache:
+            return self.brain_mask_cache[subject_name]
+
+        group = self.store[subject_name]
+        if "brain_mask" in group:
+            mask = np.asarray(group["brain_mask"][:], dtype=bool)
+        else:
+            target_dwi = np.asarray(group["target_dwi"][:], dtype=np.float32)
+            bvals = np.asarray(group["bvals"][:], dtype=np.float32)
+            mask = compute_brain_mask_from_dwi(target_dwi, bvals, cfg.B0_THRESHOLD)
+
+        self.brain_mask_cache[subject_name] = mask
+        return mask
+
+    def _current_mask_slice(self) -> np.ndarray | None:
+        if self.current_brain_mask is None:
+            return None
+        return extract_mask_slice(self.current_brain_mask, self.plane, self.slice_slider.value())
 
     def _handle_plane_change(self) -> None:
         self._reset_slice_slider()
@@ -639,10 +698,14 @@ class DatasetViewer(QMainWindow):
     def _update_subject_summary(self) -> None:
         source = self.current_group.attrs.get("source_dwi", "unknown")
         shells = summarize_shells(self.current_bvals)
+        mask_voxels = int(np.count_nonzero(self.current_brain_mask)) if self.current_brain_mask is not None else 0
+        total_voxels = int(np.prod(self.current_shape[:3])) if self.current_shape[:3] else 0
+        mask_fraction = 100.0 * mask_voxels / total_voxels if total_voxels else 0.0
         summary = (
             f"Subject: {self.current_subject}\n"
             f"Source: {source}\n"
             f"Shape: {self.current_shape[:3]}  Volumes: {self.current_shape[3]}\n"
+            f"Brain mask: {mask_voxels} voxels ({mask_fraction:.1f}%)\n"
             f"Shell counts: {shells}"
         )
         self.subject_info_label.setText(summary)
@@ -660,18 +723,25 @@ class DatasetViewer(QMainWindow):
         input_slice = extract_volume_slice(self.current_group["input_dwi"], self.plane, slice_idx, volume_idx)
         target_slice = extract_volume_slice(self.current_group["target_dwi"], self.plane, slice_idx, volume_idx)
         diff_slice = np.abs(input_slice - target_slice)
+        mask_slice = self._current_mask_slice()
+        input_display = apply_display_mask(input_slice, mask_slice)
+        target_display = apply_display_mask(target_slice, mask_slice)
+        diff_display = apply_display_mask(diff_slice, mask_slice)
+        input_mean, input_max = masked_stats(input_slice, mask_slice)
+        target_mean, target_max = masked_stats(target_slice, mask_slice)
+        diff_mean, diff_max = masked_stats(diff_slice, mask_slice)
 
         self.panels["Input DWI"].set_pixmap(
-            make_pixmap(input_slice, cmap="gray"),
-            f"mean={format_float(float(np.mean(input_slice)))}  max={format_float(float(np.max(input_slice)))}",
+            make_pixmap(input_display, cmap="gray"),
+            f"brain mean={format_float(input_mean)}  max={format_float(input_max)}",
         )
         self.panels["Target DWI"].set_pixmap(
-            make_pixmap(target_slice, cmap="gray"),
-            f"mean={format_float(float(np.mean(target_slice)))}  max={format_float(float(np.max(target_slice)))}",
+            make_pixmap(target_display, cmap="gray"),
+            f"brain mean={format_float(target_mean)}  max={format_float(target_max)}",
         )
         self.panels["Absolute Difference"].set_pixmap(
-            make_pixmap(diff_slice, cmap="magma"),
-            f"mean={format_float(float(np.mean(diff_slice)))}  max={format_float(float(np.max(diff_slice)))}",
+            make_pixmap(diff_display, cmap="magma"),
+            f"brain mean={format_float(diff_mean)}  max={format_float(diff_max)}",
         )
 
         current_bval = float(self.current_bvals[volume_idx])
@@ -681,7 +751,8 @@ class DatasetViewer(QMainWindow):
             f"Slice: {slice_idx}\n"
             f"Volume: {volume_idx}  ({shell_name(current_bval)})\n"
             f"bvec: [{current_bvec[0]:.3f}, {current_bvec[1]:.3f}, {current_bvec[2]:.3f}]\n"
-            f"Input-target abs diff mean: {format_float(float(np.mean(diff_slice)))}"
+            f"Brain-mask voxels in slice: {int(np.count_nonzero(mask_slice)) if mask_slice is not None else 0}\n"
+            f"Input-target abs diff brain mean: {format_float(diff_mean)}"
         )
         self.bvals_canvas.update_plot(self.current_bvals, volume_idx)
 
@@ -735,31 +806,45 @@ class DatasetViewer(QMainWindow):
         )
 
     def _apply_metrics(self, metrics: dict) -> None:
+        mask_slice = self._current_mask_slice()
+        fa_display = apply_display_mask(metrics["fa"], mask_slice)
+        md_display = apply_display_mask(metrics["md"], mask_slice)
+        color_fa_display = apply_display_mask(metrics["color_fa"], mask_slice)
+        fa_mean, fa_max = masked_stats(metrics["fa"], mask_slice)
+        md_mean, md_max = masked_stats(metrics["md"], mask_slice)
+
         self.panels["FA Map"].set_pixmap(
-            make_pixmap(metrics["fa"], cmap="viridis"),
-            f"mean={format_float(float(np.mean(metrics['fa'])))}  max={format_float(float(np.max(metrics['fa'])))}",
+            make_pixmap(fa_display, cmap="viridis"),
+            f"brain mean={format_float(fa_mean)}  max={format_float(fa_max)}",
         )
         self.panels["MD Map"].set_pixmap(
-            make_pixmap(metrics["md"], cmap="plasma"),
-            f"mean={format_float(float(np.mean(metrics['md'])))}  max={format_float(float(np.max(metrics['md'])))}",
+            make_pixmap(md_display, cmap="plasma"),
+            f"brain mean={format_float(md_mean)}  max={format_float(md_max)}",
         )
         self.panels["Color FA"].set_pixmap(
-            make_pixmap(metrics["color_fa"]),
-            "principal direction RGB weighted by FA",
+            make_pixmap(color_fa_display),
+            "masked principal direction RGB weighted by FA",
         )
 
     def _apply_predictions(self, pred_metrics: dict) -> None:
+        mask_slice = self._current_mask_slice()
+        fa_display = apply_display_mask(pred_metrics["fa"], mask_slice)
+        md_display = apply_display_mask(pred_metrics["md"], mask_slice)
+        color_fa_display = apply_display_mask(pred_metrics["color_fa"], mask_slice)
+        fa_mean, fa_max = masked_stats(pred_metrics["fa"], mask_slice)
+        md_mean, md_max = masked_stats(pred_metrics["md"], mask_slice)
+
         self.panels["Predicted FA"].set_pixmap(
-            make_pixmap(pred_metrics["fa"], cmap="viridis"),
-            f"mean={format_float(float(np.mean(pred_metrics['fa'])))}  max={format_float(float(np.max(pred_metrics['fa'])))}",
+            make_pixmap(fa_display, cmap="viridis"),
+            f"brain mean={format_float(fa_mean)}  max={format_float(fa_max)}",
         )
         self.panels["Predicted MD"].set_pixmap(
-            make_pixmap(pred_metrics["md"], cmap="plasma"),
-            f"mean={format_float(float(np.mean(pred_metrics['md'])))}  max={format_float(float(np.max(pred_metrics['md'])))}",
+            make_pixmap(md_display, cmap="plasma"),
+            f"brain mean={format_float(md_mean)}  max={format_float(md_max)}",
         )
         self.panels["Predicted Color FA"].set_pixmap(
-            make_pixmap(pred_metrics["color_fa"]),
-            "predicted principal direction RGB weighted by FA",
+            make_pixmap(color_fa_display),
+            "masked predicted principal direction RGB weighted by FA",
         )
 
     @pyqtSlot(str, str, int, object)
