@@ -22,7 +22,8 @@ from torch.utils.tensorboard import SummaryWriter
 
 from research.utils import dti6d_to_scalar_maps, scalar_map_metrics
 from research.dataset import DWISliceDataset
-from research.model import DTILoss, QSpaceUNet, tensor6_to_fa_md
+from research.loss import DTILoss
+from research.model import QSpaceUNet
 import config as cfg
 
 logging.basicConfig(

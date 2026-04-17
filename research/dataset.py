@@ -8,7 +8,7 @@ from torch.utils.data import Dataset
 import zarr
 
 import config as cfg
-from functions import compute_brain_mask_from_dwi
+from functions import compute_b0_norm, compute_brain_mask_from_dwi
 
 
 class DWISliceDataset(Dataset):
@@ -114,8 +114,8 @@ class DWISliceDataset(Dataset):
         # Normalise input by mean b0 signal
         b0_idx = bvals < self.b0_threshold
         if b0_idx.any():
-            mean_b0 = input_slice[b0_idx].mean(axis=0)
-            b0_norm = float(mean_b0[mean_b0 > 0].mean()) if (mean_b0 > 0).any() else 1.0
+            mean_b0 = input_slice[b0_idx].mean(axis=0)  # (H, W)
+            b0_norm = compute_b0_norm(mean_b0)
             if b0_norm > 0:
                 input_slice = input_slice / b0_norm
 

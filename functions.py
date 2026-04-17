@@ -337,6 +337,21 @@ def brain_mask(image,
     return mask, masked
 
 
+def compute_b0_norm(mean_b0_slice: np.ndarray) -> float:
+    """Return a scalar normalization factor from a 2D mean-b0 slice.
+
+    Selects voxels above 10 % of the slice maximum so that low-signal
+    background noise does not bias the estimate.  Falls back to 1.0 when
+    no positive voxels are present.
+
+    Use this function in every place that normalises DWI signal by b0
+    (training, inference, visualizer) to guarantee identical scaling.
+    """
+    threshold = 0.1 * float(mean_b0_slice.max())
+    brain_voxels = mean_b0_slice[mean_b0_slice > threshold]
+    return float(brain_voxels.mean()) if brain_voxels.size > 0 else 1.0
+
+
 def compute_brain_mask_from_dwi(dwi_4d, bvals, b0_threshold=cfg.B0_THRESHOLD):
     """Compute a 3D brain mask from DWI data using mean b0 signal.
 

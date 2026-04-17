@@ -39,7 +39,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 import config as cfg
-from functions import compute_color_fa_from_tensor6, compute_fa_from_tensor6, compute_md_from_tensor6
+from functions import compute_b0_norm, compute_color_fa_from_tensor6, compute_fa_from_tensor6, compute_md_from_tensor6
 from research.model import QSpaceUNet
 
 matplotlib.rcParams["font.family"] = "DejaVu Sans"
@@ -516,7 +516,7 @@ class DatasetViewer(QMainWindow):
             b0_slice = np.asarray(self.current_group["input_dwi"][:, :, slice_idx, :], dtype=np.float32)[..., b0_idx].mean(axis=-1)
         else:
             b0_slice = signal_slice[..., :N].mean(axis=-1)
-        b0_norm = float(b0_slice[b0_slice > 0.1 * b0_slice.max()].mean()) if (b0_slice > 0).any() else 1.0
+        b0_norm = compute_b0_norm(b0_slice)
         if b0_norm > 0:
             signal = signal / b0_norm
 

@@ -37,7 +37,7 @@ from research.utils import (
     _robust_limits,
     _symmetric_limits,
 )
-from functions import compute_brain_mask_from_dwi
+from functions import compute_b0_norm, compute_brain_mask_from_dwi
 from research.model import QSpaceUNet
 import config as cfg
 
@@ -127,7 +127,7 @@ def predict_subject(
             signal = input_dwi[:, :, z, :].transpose(2, 0, 1).astype(np.float32)  # (max_n, H, W)
 
             b0_slice = mean_b0_vol[:, :, z]
-            b0_norm = float(b0_slice[b0_slice > 0.1 * b0_slice.max()].mean()) if (b0_slice > 0).any() else 1.0
+            b0_norm = compute_b0_norm(b0_slice)
             if b0_norm > 0:
                 signal = signal / b0_norm
 
