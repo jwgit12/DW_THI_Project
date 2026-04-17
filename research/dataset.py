@@ -77,6 +77,17 @@ class DWISliceDataset(Dataset):
                 dwi, bvals_raw, self.b0_threshold,
             )
 
+        # Pre-load all subject arrays into RAM to eliminate zarr I/O from __getitem__
+        self._data: dict[str, dict[str, np.ndarray]] = {}
+        for key in self.subject_keys:
+            grp = store[key]
+            self._data[key] = {
+                "input_dwi": np.asarray(grp["input_dwi"][:], dtype=np.float32),
+                "target_dti_6d": np.asarray(grp["target_dti_6d"][:], dtype=np.float32),
+                "bvals": np.asarray(grp["bvals"][:], dtype=np.float32),
+                "bvecs": np.asarray(grp["bvecs"][:], dtype=np.float32),
+            }
+
         self._store = None
 
     @property
@@ -91,21 +102,18 @@ class DWISliceDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         key, z = self.samples[idx]
-        grp = self.store[key]
+        d = self._data[key]
 
-        input_slice = np.asarray(grp["input_dwi"][:, :, z, :], dtype=np.float32)  # (H, W, N)
-        target_slice = np.asarray(grp["target_dti_6d"][:, :, z, :], dtype=np.float32)  # (H, W, 6)
-        bvals = np.asarray(grp["bvals"][:], dtype=np.float32)  # (N,)
-        bvecs = np.asarray(grp["bvecs"][:], dtype=np.float32)  # (3, N)
+        # Slice from RAM cache; .copy() ensures C-contiguous arrays for torch
+        input_slice = d["input_dwi"][:, :, z, :].transpose(2, 0, 1).copy()    # (N, H, W)
+        target_slice = d["target_dti_6d"][:, :, z, :].transpose(2, 0, 1).copy()  # (6, H, W)
+        bvals = d["bvals"].copy()    # (N,)
+        bvecs = d["bvecs"].copy()    # (3, N)
 
         N = bvals.shape[0]
 
         # Brain mask for this slice
         bmask = self._brain_masks[key][:, :, z].astype(np.float32)  # (H, W)
-
-        # Channels-first: (N, H, W) and (6, H, W)
-        input_slice = input_slice.transpose(2, 0, 1)
-        target_slice = target_slice.transpose(2, 0, 1)
 
         # Scale DTI tensor to ~O(1) range for balanced training
         # Clamp to remove extreme outliers from bad DTI fits at brain edges

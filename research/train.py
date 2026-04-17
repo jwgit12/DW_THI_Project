@@ -1,7 +1,7 @@
 """Training script for the QSpaceUNet DTI prediction model.
 
 Usage:
-    python -m research.train --zarr_path dataset/pretext_dataset_new.zarr
+    python -m research.train --zarr_path dataset/default_dataset.zarr --cholesky --out_dir research/runs/run_small
     python -m research.train --zarr_path dataset/pretext_dataset_new.zarr --epochs 200 --batch_size 8
 """
 
@@ -209,7 +209,7 @@ def run_epoch(
             loss, metrics = criterion(pred, target, mask=brain_mask)
 
             if is_train:
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.GRAD_CLIP)
                 optimizer.step()
@@ -300,15 +300,17 @@ def main(args):
         train_ds,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=0,
-        pin_memory=(device.type != "cpu"),
+        num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"),
+        persistent_workers=args.num_workers > 0,
     )
     val_loader = DataLoader(
         val_ds,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=0,
-        pin_memory=(device.type != "cpu"),
+        num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"),
+        persistent_workers=args.num_workers > 0,
     )
 
     log.info("Train slices: %d  Val slices: %d  max_n: %d  max_bval: %.0f  dti_scale: %.4f",
@@ -343,7 +345,7 @@ def main(args):
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.lr * 0.01)
 
     # ── Pick a fixed validation slice for visualisation ───────────────────────
-    vis_slice_idx = len(val_ds) // 2
+    vis_slice_idx = -1
 
     # ── Training loop ─────────────────────────────────────────────────────────
     best_val_loss = float("inf")
@@ -497,7 +499,9 @@ if __name__ == "__main__":
     parser.add_argument("--lambda_scalar", type=float, default=cfg.LAMBDA_SCALAR,
                         help="Weight for FA/MD auxiliary loss (0 = tensor MSE only)")
     parser.add_argument("--patience", type=int, default=cfg.PATIENCE)
-    parser.add_argument("--vis_every", type=int, default=1,
-                        help="Generate validation visualisation every N epochs (default: every epoch)")
+    parser.add_argument("--vis_every", type=int, default=10,
+                        help="Generate validation visualisation every N epochs (default: 10)")
+    parser.add_argument("--num_workers", type=int, default=0,
+                        help="DataLoader worker processes (0=main process; data is pre-loaded into RAM)")
 
     main(parser.parse_args())

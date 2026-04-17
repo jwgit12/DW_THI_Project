@@ -27,8 +27,8 @@ VAL_SUBJECTS = ["sub-05", "sub-11"]
 # ─────────────────────────────────────────────────────────────────────────────
 # Model architecture
 # ─────────────────────────────────────────────────────────────────────────────
-FEAT_DIM = 64                # q-space encoder feature dimension
-UNET_CHANNELS = [64, 128, 256, 512]
+FEAT_DIM = 128                # q-space encoder feature dimension
+UNET_CHANNELS = [64, 128, 256]
 DROPOUT = 0.1                # spatial dropout rate in U-Net conv blocks
 LAMBDA_SCALAR = 0.3          # weight for FA/MD auxiliary loss
 
