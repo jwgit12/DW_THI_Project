@@ -29,11 +29,13 @@ class DWISliceDataset(Dataset):
         subject_keys: list[str],
         augment: bool = False,
         b0_threshold: float = cfg.B0_THRESHOLD,
+        use_brain_mask: bool = True,
     ):
         self.zarr_path = zarr_path
         self.subject_keys = list(subject_keys)
         self.augment = augment
         self.b0_threshold = b0_threshold
+        self.use_brain_mask = use_brain_mask
 
         store = zarr.open_group(zarr_path, mode="r")
 
@@ -69,13 +71,14 @@ class DWISliceDataset(Dataset):
 
         # Pre-compute 3D brain masks per subject from clean target DWI
         self._brain_masks: dict[str, np.ndarray] = {}
-        for key in self.subject_keys:
-            grp = store[key]
-            dwi = np.asarray(grp["target_dwi"][:], dtype=np.float32)
-            bvals_raw = np.asarray(grp["bvals"][:], dtype=np.float32)
-            self._brain_masks[key] = compute_brain_mask_from_dwi(
-                dwi, bvals_raw, self.b0_threshold,
-            )
+        if self.use_brain_mask:
+            for key in self.subject_keys:
+                grp = store[key]
+                dwi = np.asarray(grp["target_dwi"][:], dtype=np.float32)
+                bvals_raw = np.asarray(grp["bvals"][:], dtype=np.float32)
+                self._brain_masks[key] = compute_brain_mask_from_dwi(
+                    dwi, bvals_raw, self.b0_threshold,
+                )
 
         # Pre-load all subject arrays into RAM to eliminate zarr I/O from __getitem__
         self._data: dict[str, dict[str, np.ndarray]] = {}
@@ -113,7 +116,10 @@ class DWISliceDataset(Dataset):
         N = bvals.shape[0]
 
         # Brain mask for this slice
-        bmask = self._brain_masks[key][:, :, z].astype(np.float32)  # (H, W)
+        if self.use_brain_mask:
+            bmask = self._brain_masks[key][:, :, z].astype(np.float32)  # (H, W)
+        else:
+            bmask = np.ones(target_slice.shape[1:], dtype=np.float32)
 
         # Scale DTI tensor to ~O(1) range for balanced training
         # Clamp to remove extreme outliers from bad DTI fits at brain edges

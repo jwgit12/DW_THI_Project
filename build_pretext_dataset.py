@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+from collections import defaultdict
 import json
 from pathlib import Path
 
@@ -154,6 +155,22 @@ def validate_store(store: zarr.Group) -> None:
                 raise ValueError(f"{subject_id} contains non-finite values in {key}")
 
 
+def validate_unique_subject_keys(entries: list[dict]) -> None:
+    paths_by_key = defaultdict(list)
+    for entry in entries:
+        paths_by_key[entry["key"]].append(entry["dwi"])
+
+    duplicates = {key: paths for key, paths in paths_by_key.items() if len(paths) > 1}
+    if not duplicates:
+        return
+
+    lines = ["Duplicate Zarr group keys found. Conflicting DWI files:"]
+    for key, paths in sorted(duplicates.items()):
+        lines.append(f"  {key}:")
+        lines.extend(f"    - {path}" for path in sorted(paths))
+    raise ValueError("\n".join(lines))
+
+
 def main() -> None:
     args = parse_args()
 
@@ -163,6 +180,7 @@ def main() -> None:
 
     if not entries:
         raise FileNotFoundError(f"No DWI datasets found in: {args.data_dir}")
+    validate_unique_subject_keys(entries)
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -190,11 +208,12 @@ def main() -> None:
 
         tensor_clean_6d = tensor_to_6d(compute_dti(clean_dwi, sample["gtab"])).astype(np.float32)
 
-        subject_id = f"{entry['subject']}_{entry['session']}"
+        subject_id = entry["key"]
         group = store.create_group(subject_id)
         group.attrs["source_dwi"] = entry["dwi"]
         group.attrs["original_subject"] = entry["subject"]
         group.attrs["original_session"] = entry["session"]
+        group.attrs["original_run"] = entry["run"]
 
         group.create_array("input_dwi", data=degraded_dwi)
         group.create_array("target_dwi", data=clean_dwi)

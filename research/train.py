@@ -184,6 +184,7 @@ def run_epoch(
     criterion: DTILoss,
     device: torch.device,
     optimizer: torch.optim.Optimizer | None = None,
+    use_brain_mask: bool = True,
 ) -> dict[str, float]:
     """Run one train or validation epoch. Pass optimizer=None for val."""
     is_train = optimizer is not None
@@ -203,7 +204,7 @@ def run_epoch(
             bvals = batch["bvals"].to(device)
             bvecs = batch["bvecs"].to(device)
             vol_mask = batch["vol_mask"].to(device)
-            brain_mask = batch["brain_mask"].to(device)
+            brain_mask = batch["brain_mask"].to(device) if use_brain_mask else None
 
             pred = model(signal, bvals, bvecs, vol_mask)
             loss, metrics = criterion(pred, target, mask=brain_mask)
@@ -277,8 +278,9 @@ def main(args):
              len({k.rsplit("_ses-", 1)[0] for k in test_subjects}))
 
     # ── Datasets & loaders ────────────────────────────────────────────────────
-    train_ds = DWISliceDataset(args.zarr_path, train_subjects, augment=True)
-    val_ds = DWISliceDataset(args.zarr_path, val_subjects, augment=False)
+    use_brain_mask = not args.no_brain_mask
+    train_ds = DWISliceDataset(args.zarr_path, train_subjects, augment=True, use_brain_mask=use_brain_mask)
+    val_ds = DWISliceDataset(args.zarr_path, val_subjects, augment=False, use_brain_mask=use_brain_mask)
 
     # Derive all normalisation constants from training data only to prevent
     # information leakage from val/test into training.
@@ -334,6 +336,7 @@ def main(args):
         "batch_size": args.batch_size,
         "lr": args.lr, "weight_decay": args.weight_decay,
         "lambda_scalar": args.lambda_scalar, "patience": args.patience,
+        "use_brain_mask": use_brain_mask,
         "n_params": n_params,
         "train_subjects": train_subjects, "val_subjects": val_subjects,
         "test_subjects": test_subjects,
@@ -357,8 +360,8 @@ def main(args):
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
 
-        train_metrics = run_epoch(model, train_loader, criterion, device, optimizer)
-        val_metrics = run_epoch(model, val_loader, criterion, device, optimizer=None)
+        train_metrics = run_epoch(model, train_loader, criterion, device, optimizer, use_brain_mask=use_brain_mask)
+        val_metrics = run_epoch(model, val_loader, criterion, device, optimizer=None, use_brain_mask=use_brain_mask)
         scheduler.step()
 
         lr = optimizer.param_groups[0]["lr"]
@@ -419,6 +422,7 @@ def main(args):
                     "train_subjects": train_subjects,
                     "val_subjects": val_subjects,
                     "test_subjects": test_subjects,
+                    "use_brain_mask": use_brain_mask,
                 },
                 out_dir / "best_model.pt",
             )
@@ -466,6 +470,7 @@ def main(args):
             "train_subjects": train_subjects,
             "val_subjects": val_subjects,
             "test_subjects": test_subjects,
+            "use_brain_mask": use_brain_mask,
         },
         out_dir / "last_model.pt",
     )
@@ -503,5 +508,7 @@ if __name__ == "__main__":
                         help="Generate validation visualisation every N epochs (default: 10)")
     parser.add_argument("--num_workers", type=int, default=0,
                         help="DataLoader worker processes (0=main process; data is pre-loaded into RAM)")
+    parser.add_argument("--no_brain_mask", action="store_true",
+                        help="Train and validate losses over the full image instead of brain-mask voxels only")
 
     main(parser.parse_args())

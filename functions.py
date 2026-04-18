@@ -12,6 +12,40 @@ import config as cfg
 
 
 #%% DWI dataset handling
+def _parse_dwi_entities(dwi_path):
+    """Parse BIDS-style entities from converted DWI filenames."""
+    basename = os.path.basename(dwi_path)
+    stem = basename.removesuffix(".nii.gz")
+
+    # Converted files commonly look like:
+    # sub-01__ses-1__dwi__sub-01_ses-1_dwi.nii.gz
+    # Prefer the trailing BIDS-like name because it includes run-* when present.
+    bids_stem = stem.split("__")[-1]
+    if bids_stem.endswith("_dwi"):
+        bids_stem = bids_stem[:-4]
+
+    entities = {}
+    key_parts = []
+    for part in bids_stem.split("_"):
+        if "-" not in part:
+            continue
+        name, _ = part.split("-", 1)
+        if name in {"sub", "ses", "run", "acq", "dir"}:
+            entities[name] = part
+            key_parts.append(part)
+
+    if "sub" not in entities:
+        raise ValueError(f"Could not parse subject from DWI filename: {basename}")
+
+    key = "_".join(key_parts) if key_parts else entities["sub"]
+    return {
+        "subject": entities["sub"],
+        "session": entities.get("ses", ""),
+        "run": entities.get("run", ""),
+        "key": key,
+    }
+
+
 def find_dwi_datasets(root_dir):
     dwi_files = glob.glob(os.path.join(root_dir, "*_dwi.nii.gz"))
     
@@ -24,18 +58,12 @@ def find_dwi_datasets(root_dir):
         bvec_path = base + ".bvec"
 
         if os.path.exists(bval_path) and os.path.exists(bvec_path):
-            # Parse subject and session from filename convention:
-            # sub-XX__ses-Y__dwi__sub-XX_ses-Y_dwi.nii.gz
-            basename = os.path.basename(dwi_path)
-            parts = basename.split("__")
-            sub_id = parts[0]   # e.g., "sub-01"
-            ses_id = parts[1]   # e.g., "ses-1"
+            entities = _parse_dwi_entities(dwi_path)
             datasets.append({
                 "dwi": dwi_path,
                 "bval": bval_path,
                 "bvec": bvec_path,
-                "subject": sub_id,
-                "session": ses_id,
+                **entities,
             })
         else:
             print(f"Missing gradients for {dwi_path}")

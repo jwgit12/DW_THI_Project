@@ -21,14 +21,14 @@ MAX_DIFFUSIVITY = 0.01       # mm²/s, eigenvalue cap for physically plausible D
 # ─────────────────────────────────────────────────────────────────────────────
 # Subject split (biological subject IDs — all sessions stay together)
 # ─────────────────────────────────────────────────────────────────────────────
-TEST_SUBJECTS = ["sub-03", "sub-04"]
-VAL_SUBJECTS = ["sub-05", "sub-11"]
+TEST_SUBJECTS = ["sub-012", "sub-031"]
+VAL_SUBJECTS = ["sub-014", "sub-035"]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Model architecture
 # ─────────────────────────────────────────────────────────────────────────────
 FEAT_DIM = 128                # q-space encoder feature dimension
-UNET_CHANNELS = [64, 128, 256]
+UNET_CHANNELS = [32, 64, 128, 256]
 DROPOUT = 0.1                # spatial dropout rate in U-Net conv blocks
 LAMBDA_SCALAR = 0.3          # weight for FA/MD auxiliary loss
 
@@ -36,7 +36,7 @@ LAMBDA_SCALAR = 0.3          # weight for FA/MD auxiliary loss
 # Training
 # ─────────────────────────────────────────────────────────────────────────────
 EPOCHS = 150
-BATCH_SIZE = 8
+BATCH_SIZE = 16
 LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 1e-4
 PATIENCE = 25                # early stopping patience (epochs)
