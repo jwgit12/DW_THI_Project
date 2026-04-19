@@ -15,6 +15,9 @@ from pathlib import Path
 
 import matplotlib
 import numpy as np
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.collections import LineCollection
+from matplotlib.figure import Figure
 import torch
 import zarr
 from matplotlib import colormaps
@@ -45,8 +48,10 @@ from functions import (
     compute_color_fa_from_tensor6,
     compute_fa_from_tensor6,
     compute_md_from_tensor6,
+    tensor6_to_full,
+    tensor_to_eig,
 )
-from research.augment import degrade_dwi_slice
+from research.augment import degrade_dwi_slice, degrade_dwi_volume
 from research.model import QSpaceUNet
 from research.utils import fit_dti_to_6d, sanitize_dti6d
 
@@ -101,12 +106,25 @@ ROW_GROUPS: dict[str, tuple[str, ...]] = {
     "noisy": ("Noisy FA", "Noisy MD", "Noisy Color FA"),
     "dti": ("FA Map", "MD Map", "Color FA"),
     "pred": ("Predicted FA", "Predicted MD", "Predicted Color FA"),
+    "tracts": ("Tracts (Clean)", "Tracts (Predicted)"),
 }
 ROW_LABELS: dict[str, str] = {
     "noisy": "Noisy Input DTI Fit",
     "dti": "DTI Maps (ground truth)",
     "pred": "NN Predictions",
+    "tracts": "Fiber Tracts",
 }
+
+# Tractography parameters (deterministic Euler integration on principal eigvec).
+TRACT_FA_THRESHOLD = 0.15
+TRACT_STEP_SIZE = 0.5
+TRACT_MAX_ANGLE_COS = 0.5      # cos(60°)
+TRACT_MAX_STEPS = 200
+TRACT_MIN_LENGTH = 12
+TRACT_SEED_DENSITY = 0.30      # fraction of valid voxels used as seeds
+TRACT_SLICE_TOLERANCE = 0.75   # voxels above/below the slice that still display
+TRACT_RENDER_UPSCALE = 6       # super-sample factor for the matplotlib renderer
+TRACT_DISPLAY_WIDTH = 560      # pixmap width (px) for tract panels — larger than 240
 
 
 def parse_args() -> argparse.Namespace:
@@ -272,6 +290,184 @@ def masked_stats(arr: np.ndarray, mask: np.ndarray | None = None) -> tuple[float
     return float(np.mean(values)), float(np.max(values))
 
 
+# ---------------------------------------------------------------------------
+# Tractography (deterministic Euler integration of principal eigvec field)
+# ---------------------------------------------------------------------------
+
+def compute_principal_evec_field(tensor6_volume: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return ``(pev (X, Y, Z, 3), fa (X, Y, Z))`` from a 6D tensor volume."""
+    full = tensor6_to_full(tensor6_volume)
+    evals, evecs = tensor_to_eig(full)
+    pev = np.ascontiguousarray(evecs[..., :, 0], dtype=np.float32)
+    fa = np.asarray(compute_fa_from_tensor6(tensor6_volume), dtype=np.float32)
+    return pev, fa
+
+
+def _trace_streamline(
+    seed: np.ndarray,
+    pev: np.ndarray,
+    fa: np.ndarray,
+    mask: np.ndarray,
+    sign: int,
+    fa_thresh: float,
+    step_size: float,
+    max_angle_cos: float,
+    max_steps: int,
+) -> np.ndarray:
+    shape = np.array(fa.shape, dtype=np.int64)
+    pts = [seed.astype(np.float32).copy()]
+    p = seed.astype(np.float32).copy()
+    prev_dir: np.ndarray | None = None
+    for _ in range(max_steps):
+        ip = p.astype(np.int64)
+        if (ip < 0).any() or (ip >= shape).any():
+            break
+        if not mask[ip[0], ip[1], ip[2]]:
+            break
+        if fa[ip[0], ip[1], ip[2]] < fa_thresh:
+            break
+        v = pev[ip[0], ip[1], ip[2]].astype(np.float32).copy()
+        if prev_dir is None:
+            v = sign * v
+        else:
+            if float(np.dot(v, prev_dir)) < 0.0:
+                v = -v
+            if float(np.dot(v, prev_dir)) < max_angle_cos:
+                break
+        p = p + step_size * v
+        pts.append(p.copy())
+        prev_dir = v
+    return np.asarray(pts, dtype=np.float32)
+
+
+def deterministic_track(
+    pev: np.ndarray,
+    fa: np.ndarray,
+    mask: np.ndarray,
+    fa_thresh: float = TRACT_FA_THRESHOLD,
+    step_size: float = TRACT_STEP_SIZE,
+    max_angle_cos: float = TRACT_MAX_ANGLE_COS,
+    max_steps: int = TRACT_MAX_STEPS,
+    min_streamline_length: int = TRACT_MIN_LENGTH,
+    seed_density: float = TRACT_SEED_DENSITY,
+    rng_seed: int = 0,
+) -> list[np.ndarray]:
+    """Generate streamlines (lists of (M, 3) float arrays in voxel coordinates)."""
+    pev = np.ascontiguousarray(pev, dtype=np.float32)
+    fa = np.ascontiguousarray(fa, dtype=np.float32)
+    mask = np.ascontiguousarray(mask, dtype=bool)
+
+    valid = (fa > fa_thresh) & mask
+    seed_idx = np.argwhere(valid)
+    if seed_idx.size == 0:
+        return []
+
+    if seed_density < 1.0:
+        rng = np.random.default_rng(rng_seed)
+        n = max(1, int(round(seed_density * len(seed_idx))))
+        sel = rng.choice(len(seed_idx), n, replace=False)
+        seed_idx = seed_idx[sel]
+
+    streamlines: list[np.ndarray] = []
+    for ijk in seed_idx:
+        seed = ijk.astype(np.float32) + 0.5
+        forward = _trace_streamline(seed, pev, fa, mask, +1,
+                                    fa_thresh, step_size, max_angle_cos, max_steps)
+        backward = _trace_streamline(seed, pev, fa, mask, -1,
+                                     fa_thresh, step_size, max_angle_cos, max_steps)
+        if len(backward) > 1:
+            full = np.concatenate([backward[:0:-1], forward], axis=0)
+        else:
+            full = forward
+        if len(full) >= min_streamline_length:
+            streamlines.append(full.astype(np.float32))
+    return streamlines
+
+
+def render_tract_overlay(
+    streamlines: list[np.ndarray],
+    plane: str,
+    slice_idx: int,
+    underlay_fa_slice: np.ndarray,
+    slice_tolerance: float = TRACT_SLICE_TOLERANCE,
+    line_width: float = 0.45,
+    upscale: int = TRACT_RENDER_UPSCALE,
+) -> np.ndarray:
+    """Render tract segments crossing the slice as antialiased lines on a dim FA underlay.
+
+    Returns an ``(H, W, 3)`` RGB image in the same ``(axis_a, axis_b)`` order
+    as ``underlay_fa_slice`` — :func:`make_pixmap` will apply the display rotation.
+    """
+    axis = PLANE_TO_AXIS[plane]
+    other_axes = [a for a in (0, 1, 2) if a != axis]
+
+    underlay = normalize_image(np.asarray(underlay_fa_slice, dtype=np.float32))
+    h, w = underlay.shape  # (axis_a, axis_b)
+
+    # Render at upscale × resolution for crisp antialiased lines, then return
+    # the raw RGB pixels — make_pixmap handles rotation + final downscale.
+    dpi = 100
+    fig = Figure(figsize=(w * upscale / dpi, h * upscale / dpi), dpi=dpi, frameon=False)
+    canvas = FigureCanvasAgg(fig)
+    ax = fig.add_axes((0, 0, 1, 1))
+    ax.set_axis_off()
+    ax.imshow(
+        underlay * 0.35, cmap="gray", vmin=0.0, vmax=1.0,
+        origin="upper", extent=(0.0, float(w), float(h), 0.0),
+        interpolation="nearest", aspect="auto",
+    )
+
+    segments: list[np.ndarray] = []
+    colors: list[np.ndarray] = []
+    for sl in streamlines:
+        if len(sl) < 2:
+            continue
+        z = sl[:, axis]
+        within = np.abs(z - (slice_idx + 0.5)) <= slice_tolerance
+        idx = np.where(within)[0]
+        if len(idx) < 2:
+            continue
+        breaks = np.where(np.diff(idx) > 1)[0] + 1
+        runs = np.split(idx, breaks)
+        for run in runs:
+            if len(run) < 2:
+                continue
+            pts = sl[run]
+            # imshow with extent (0,w,h,0) plots column-axis as x and row-axis as y;
+            # streamline coords are (axis_a, axis_b) → x=axis_b, y=axis_a.
+            xs = pts[:, other_axes[1]]
+            ys = pts[:, other_axes[0]]
+            line = np.column_stack([xs, ys])
+            seg_pairs = np.stack([line[:-1], line[1:]], axis=1)  # (K-1, 2, 2)
+            tangents = line[1:] - line[:-1]
+            mags = np.linalg.norm(tangents, axis=1, keepdims=True)
+            mags = np.where(mags < 1e-6, 1.0, mags)
+            unit = tangents / mags
+            # Color each segment by the *local* fiber direction (RGB = |dx,dy,dz|).
+            tangent3 = pts[1:] - pts[:-1]
+            t3_mags = np.linalg.norm(tangent3, axis=1, keepdims=True)
+            t3_mags = np.where(t3_mags < 1e-6, 1.0, t3_mags)
+            seg_colors = np.clip(np.abs(tangent3 / t3_mags), 0.0, 1.0)
+            segments.append(seg_pairs)
+            colors.append(seg_colors)
+
+    if segments:
+        all_segments = np.concatenate(segments, axis=0)
+        all_colors = np.concatenate(colors, axis=0)
+        lc = LineCollection(
+            all_segments, colors=all_colors, linewidths=line_width,
+            antialiased=True, capstyle="round",
+        )
+        ax.add_collection(lc)
+
+    ax.set_xlim(0.0, float(w))
+    ax.set_ylim(float(h), 0.0)
+
+    canvas.draw()
+    rgba = np.asarray(canvas.buffer_rgba())
+    return rgba[..., :3].astype(np.float32) / 255.0
+
+
 class ImagePanel(QGroupBox):
     def __init__(self, title: str):
         super().__init__(title)
@@ -344,6 +540,8 @@ class WorkerSignals(QObject):
     metrics_ready = pyqtSignal(str, str, int, object)   # subject, plane, slice_idx, result
     noisy_metrics_ready = pyqtSignal(object, object)    # noisy_key, result
     prediction_ready = pyqtSignal(object, object)        # pred_key, result
+    clean_tracts_ready = pyqtSignal(str, object)         # subject, streamlines
+    pred_tracts_ready = pyqtSignal(object, object)       # pred_tract_key, streamlines
 
 
 class MetricsWorker(QRunnable):
@@ -483,6 +681,110 @@ class PredictionWorker(QRunnable):
             print(f"[PredictionWorker] {exc}", file=sys.stderr)
 
 
+class CleanTractWorker(QRunnable):
+    """Computes deterministic streamlines from the ground-truth DTI volume."""
+
+    def __init__(self, subject: str, tensor6_volume: np.ndarray,
+                 brain_mask: np.ndarray, signals: WorkerSignals):
+        super().__init__()
+        self.subject = subject
+        self.tensor6_volume = np.ascontiguousarray(tensor6_volume, dtype=np.float32)
+        self.brain_mask = np.ascontiguousarray(brain_mask, dtype=bool)
+        self.signals = signals
+        self.setAutoDelete(True)
+
+    def run(self) -> None:
+        try:
+            tensor6 = sanitize_dti6d(self.tensor6_volume, max_eigenvalue=cfg.MAX_DIFFUSIVITY)
+            pev, fa = compute_principal_evec_field(tensor6)
+            streamlines = deterministic_track(pev, fa, self.brain_mask, rng_seed=0)
+            self.signals.clean_tracts_ready.emit(self.subject, streamlines)
+        except Exception as exc:
+            print(f"[CleanTractWorker] {exc}", file=sys.stderr)
+
+
+class PredTractWorker(QRunnable):
+    """Predicts the full DTI tensor volume axial-slice-by-slice and tracks it."""
+
+    def __init__(self, pred_tract_key: tuple, target_dwi_xyzn: np.ndarray,
+                 brain_mask: np.ndarray, bvals: np.ndarray, bvecs: np.ndarray,
+                 keep_fraction: float, noise_level: float, seed: int,
+                 model: QSpaceUNet, device: torch.device,
+                 dti_scale: float, max_bval: float, b0_threshold: float,
+                 model_lock: threading.Lock, signals: WorkerSignals):
+        super().__init__()
+        self.pred_tract_key = pred_tract_key
+        self.target_dwi_xyzn = np.ascontiguousarray(target_dwi_xyzn, dtype=np.float32)
+        self.brain_mask = np.ascontiguousarray(brain_mask, dtype=bool)
+        self.bvals = np.asarray(bvals, dtype=np.float32)
+        self.bvecs = np.asarray(bvecs, dtype=np.float32)
+        self.keep_fraction = float(keep_fraction)
+        self.noise_level = float(noise_level)
+        self.seed = int(seed)
+        self.model = model
+        self.device = device
+        self.dti_scale = float(dti_scale)
+        self.max_bval = float(max_bval)
+        self.b0_threshold = float(b0_threshold)
+        self.model_lock = model_lock
+        self.signals = signals
+        self.setAutoDelete(True)
+
+    def run(self) -> None:
+        try:
+            degraded = degrade_dwi_volume(
+                self.target_dwi_xyzn,
+                self.keep_fraction,
+                self.noise_level,
+                seed=self.seed,
+            )
+
+            x, y, z, n = degraded.shape
+            max_n = self.model.max_n
+            bvals_norm = self.bvals / self.max_bval
+            bvecs = self.bvecs.astype(np.float32)
+            if n < max_n:
+                bvals_norm = np.pad(bvals_norm, (0, max_n - n))
+                bvecs = np.pad(bvecs, ((0, 0), (0, max_n - n)))
+            vol_mask = np.zeros(max_n, dtype=np.float32)
+            vol_mask[:n] = 1.0
+
+            bvals_t = torch.from_numpy(bvals_norm.astype(np.float32)).unsqueeze(0).to(self.device)
+            bvecs_t = torch.from_numpy(bvecs).unsqueeze(0).to(self.device)
+            vol_mask_t = torch.from_numpy(vol_mask).unsqueeze(0).to(self.device)
+
+            b0_idx = self.bvals < self.b0_threshold
+            tensor6_volume = np.zeros((x, y, z, 6), dtype=np.float32)
+            with self.model_lock, torch.no_grad():
+                for k in range(z):
+                    slice_nhw = np.ascontiguousarray(
+                        degraded[:, :, k, :].transpose(2, 0, 1)
+                    )
+                    if b0_idx.any():
+                        b0_slice = slice_nhw[b0_idx].mean(axis=0)
+                    else:
+                        b0_slice = slice_nhw.mean(axis=0)
+                    b0_norm = compute_b0_norm(b0_slice)
+                    if n < max_n:
+                        signal = np.pad(slice_nhw, ((0, max_n - n), (0, 0), (0, 0)))
+                    else:
+                        signal = slice_nhw
+                    if b0_norm > 0:
+                        signal = signal / b0_norm
+                    signal_t = torch.from_numpy(np.ascontiguousarray(signal)).unsqueeze(0).to(self.device)
+                    pred = self.model(signal_t, bvals_t, bvecs_t, vol_mask_t)
+                    tensor6_volume[:, :, k, :] = (
+                        pred[0].permute(1, 2, 0).cpu().numpy() / self.dti_scale
+                    )
+
+            tensor6_volume = sanitize_dti6d(tensor6_volume, max_eigenvalue=cfg.MAX_DIFFUSIVITY)
+            pev, fa = compute_principal_evec_field(tensor6_volume)
+            streamlines = deterministic_track(pev, fa, self.brain_mask, rng_seed=0)
+            self.signals.pred_tracts_ready.emit(self.pred_tract_key, streamlines)
+        except Exception as exc:
+            print(f"[PredTractWorker] {exc}", file=sys.stderr)
+
+
 # ---------------------------------------------------------------------------
 # Main viewer window
 # ---------------------------------------------------------------------------
@@ -515,9 +817,14 @@ class DatasetViewer(QMainWindow):
         self.noisy_metric_cache: dict[tuple, dict] = {}
         self.slice_metric_cache: dict[tuple, dict] = {}
         self.pred_cache: dict[tuple, dict] = {}
+        self.clean_tract_cache: dict[str, list[np.ndarray]] = {}
+        self.pred_tract_cache: dict[tuple, list[np.ndarray]] = {}
         self._pending_noisy_metrics: set[tuple] = set()
         self._pending_metrics: set[tuple] = set()
         self._pending_predictions: set[tuple] = set()
+        self._pending_clean_tracts: set[str] = set()
+        self._pending_pred_tracts: set[tuple] = set()
+        self.tracts_enabled = False
 
         self.model: QSpaceUNet | None = None
         self.dti_scale = 1.0
@@ -543,6 +850,8 @@ class DatasetViewer(QMainWindow):
         self.worker_signals.metrics_ready.connect(self._on_metrics_ready)
         self.worker_signals.noisy_metrics_ready.connect(self._on_noisy_metrics_ready)
         self.worker_signals.prediction_ready.connect(self._on_prediction_ready)
+        self.worker_signals.clean_tracts_ready.connect(self._on_clean_tracts_ready)
+        self.worker_signals.pred_tracts_ready.connect(self._on_pred_tracts_ready)
         self.thread_pool = QThreadPool()
         self.thread_pool.setMaxThreadCount(4)
 
@@ -617,16 +926,21 @@ class DatasetViewer(QMainWindow):
         for row_key, panel_names in ROW_GROUPS.items():
             if row_key == "pred" and self.model is None:
                 continue
+            visible_names = panel_names
+            if row_key == "tracts" and self.model is None:
+                visible_names = ("Tracts (Clean)",)
             row_widget = QWidget()
             row_layout = QHBoxLayout(row_widget)
             row_layout.setContentsMargins(0, 0, 0, 0)
             row_layout.setSpacing(4)
-            for name in panel_names:
+            for name in visible_names:
                 panel = ImagePanel(name)
                 row_layout.addWidget(panel)
                 self.panels[name] = panel
             self.row_widgets[row_key] = row_widget
             rows_container.addWidget(row_widget, stretch=1)
+            if row_key == "tracts":
+                row_widget.setVisible(False)  # hidden until user enables tract panels
 
         # ── Right panel ───────────────────────────────────────────────────
         info_box = QGroupBox("Subject Summary")
@@ -702,11 +1016,14 @@ class DatasetViewer(QMainWindow):
         for row_key, panel_names in ROW_GROUPS.items():
             if row_key == "pred" and self.model is None:
                 continue
+            visible_names = panel_names
+            if row_key == "tracts" and self.model is None:
+                visible_names = ("Tracts (Clean)",)
             row_header = QLabel(f"<b>{ROW_LABELS[row_key]}</b>")
             vis_layout.addWidget(row_header)
-            for name in panel_names:
+            for name in visible_names:
                 cb = QCheckBox(name)
-                cb.setChecked(True)
+                cb.setChecked(row_key != "tracts")  # tracts off by default — expensive
                 cb.toggled.connect(lambda checked, n=name: self._toggle_panel(n, checked))
                 vis_layout.addWidget(cb)
                 self.panel_checks[name] = cb
@@ -721,6 +1038,13 @@ class DatasetViewer(QMainWindow):
         )
         if self.model is not None:
             help_text += "Row 3: live NN predictions (axial plane only). "
+        help_text += (
+            "Toggle Tracts (Clean/Predicted) under 'Visible Panels' to enable "
+            "deterministic tractography over the full volume; tracts crossing "
+            "the current slice are projected onto a dim FA underlay (RGB = "
+            "absolute fiber direction). Computation runs once per subject "
+            "(clean) or per (subject, keep, noise) (predicted). "
+        )
         help_text += "Noisy, DTI, and NN panels are masked to the target-side brain mask. "
         help_text += "Noisy DTI, ground-truth DTI, and NN panels load in the background — the GUI stays responsive."
         help_label = QLabel(help_text)
@@ -731,13 +1055,21 @@ class DatasetViewer(QMainWindow):
     def _toggle_panel(self, panel_name: str, visible: bool) -> None:
         if panel_name in self.panels:
             self.panels[panel_name].setVisible(visible)
-        # Collapse row container when all its panels are hidden
+        # Collapse a row when *all* its panel checkboxes are unchecked.
+        # Use checkbox state (not isVisible) — a freshly-shown child of a still-
+        # hidden row reports isVisible()==False until the next event loop tick.
+        triggered_tracts = False
         for row_key, panel_names in ROW_GROUPS.items():
             if panel_name in panel_names and row_key in self.row_widgets:
                 row_visible = any(
-                    self.panels[n].isVisible() for n in panel_names if n in self.panels
+                    self.panel_checks[n].isChecked()
+                    for n in panel_names if n in self.panel_checks
                 )
                 self.row_widgets[row_key].setVisible(row_visible)
+                if row_key == "tracts" and visible:
+                    triggered_tracts = True
+        if triggered_tracts:
+            self._update_view()
 
     def _update_degradation_labels(self) -> None:
         self.keep_label.setText(f"{self.keep_fraction:.3f}")
@@ -748,8 +1080,10 @@ class DatasetViewer(QMainWindow):
         self.degraded_slice_cache.clear()
         self.noisy_metric_cache.clear()
         self.pred_cache.clear()
+        self.pred_tract_cache.clear()
         self._pending_noisy_metrics.clear()
         self._pending_predictions.clear()
+        self._pending_pred_tracts.clear()
         self._update_view()
 
     def _degradation_slider_active(self) -> bool:
@@ -773,9 +1107,11 @@ class DatasetViewer(QMainWindow):
         self.noisy_metric_cache.clear()
         self.slice_metric_cache.clear()
         self.pred_cache.clear()
+        self.pred_tract_cache.clear()
         self._pending_noisy_metrics.clear()
         self._pending_metrics.clear()
         self._pending_predictions.clear()
+        self._pending_pred_tracts.clear()
 
         subject_index = self.subjects.index(subject_name)
         if self.subject_combo.currentIndex() != subject_index:
@@ -831,6 +1167,13 @@ class DatasetViewer(QMainWindow):
         return (
             self.current_subject,
             int(slice_idx),
+            self.keep_slider.value(),
+            self.noise_slider.value(),
+        )
+
+    def _pred_tract_key(self) -> tuple:
+        return (
+            self.current_subject,
             self.keep_slider.value(),
             self.noise_slider.value(),
         )
@@ -981,9 +1324,110 @@ class DatasetViewer(QMainWindow):
                         )
                     )
 
+        # ── Fiber tracts: only compute when the user has the tract row visible
+        self._update_tract_panels(slice_idx)
+
         self.statusBar().showMessage(
             f"{self.current_subject} | {self.plane} slice {slice_idx} | "
             f"keep={self.keep_fraction:.3f} noise={100.0 * self.noise_level:.1f}%"
+        )
+
+    def _tract_panel_visible(self, name: str) -> bool:
+        cb = self.panel_checks.get(name)
+        return cb is not None and cb.isChecked()
+
+    def _underlay_fa_slice(self) -> np.ndarray:
+        """FA slice used as a dim anatomical reference under tract overlays."""
+        slice_idx = self.slice_slider.value()
+        metrics_key = (self.current_subject, self.plane, slice_idx)
+        cached = self.slice_metric_cache.get(metrics_key)
+        if cached is not None:
+            return cached["fa"]
+        # Fallback: compute on demand from the target tensor slice.
+        tensor6 = extract_tensor_slice(self.current_group["target_dti_6d"], self.plane, slice_idx)
+        return np.asarray(compute_fa_from_tensor6(tensor6), dtype=np.float32)
+
+    def _placeholder_panel(self, name: str, message: str) -> None:
+        panel = self.panels.get(name)
+        if panel is None:
+            return
+        panel.image_label.setPixmap(QPixmap())
+        panel.image_label.setText(message)
+        panel.caption_label.setText("")
+
+    def _update_tract_panels(self, slice_idx: int) -> None:
+        clean_visible = self._tract_panel_visible("Tracts (Clean)")
+        pred_visible = self._tract_panel_visible("Tracts (Predicted)") and self.model is not None
+        if not (clean_visible or pred_visible):
+            return
+
+        # ── Clean tracts: cached per subject; compute once
+        if clean_visible:
+            cached = self.clean_tract_cache.get(self.current_subject)
+            if cached is not None:
+                self._render_tract_panel("Tracts (Clean)", cached, slice_idx, kind="clean")
+            elif self.current_subject not in self._pending_clean_tracts:
+                self._pending_clean_tracts.add(self.current_subject)
+                self._placeholder_panel("Tracts (Clean)", "Tracking…")
+                tensor6_volume = np.asarray(
+                    self.current_group["target_dti_6d"][:], dtype=np.float32
+                )
+                self.thread_pool.start(
+                    CleanTractWorker(
+                        self.current_subject, tensor6_volume,
+                        self.current_brain_mask, self.worker_signals,
+                    )
+                )
+            else:
+                self._placeholder_panel("Tracts (Clean)", "Tracking…")
+
+        # ── Predicted tracts: cached per (subject, keep, noise) and require model
+        if pred_visible:
+            key = self._pred_tract_key()
+            cached = self.pred_tract_cache.get(key)
+            if cached is not None:
+                self._render_tract_panel("Tracts (Predicted)", cached, slice_idx, kind="pred")
+            elif self._degradation_slider_active():
+                self._placeholder_panel("Tracts (Predicted)", "Release slider to update")
+            elif key not in self._pending_pred_tracts:
+                self._pending_pred_tracts.add(key)
+                self._placeholder_panel("Tracts (Predicted)", "Predicting volume + tracking…")
+                target_volume = np.asarray(
+                    self.current_group["target_dwi"][:], dtype=np.float32
+                )
+                seed = stable_degrade_seed(
+                    self.current_subject, "Volume", -1,
+                    self.keep_slider.value(), self.noise_slider.value(),
+                )
+                self.thread_pool.start(
+                    PredTractWorker(
+                        key, target_volume, self.current_brain_mask,
+                        self.current_bvals.copy(), self.current_bvecs.copy(),
+                        self.keep_fraction, self.noise_level, seed,
+                        self.model, self.device,
+                        self.dti_scale, self.max_bval, cfg.B0_THRESHOLD,
+                        self.model_lock, self.worker_signals,
+                    )
+                )
+            else:
+                self._placeholder_panel("Tracts (Predicted)", "Predicting volume + tracking…")
+
+    def _render_tract_panel(self, name: str, streamlines: list[np.ndarray],
+                            slice_idx: int, kind: str) -> None:
+        panel = self.panels.get(name)
+        if panel is None:
+            return
+        try:
+            underlay = self._underlay_fa_slice()
+        except Exception as exc:
+            print(f"[tract underlay] {exc}", file=sys.stderr)
+            self._placeholder_panel(name, "Underlay unavailable")
+            return
+        overlay = render_tract_overlay(streamlines, self.plane, slice_idx, underlay)
+        kind_label = "ground-truth" if kind == "clean" else "predicted"
+        panel.set_pixmap(
+            make_pixmap(overlay, width=TRACT_DISPLAY_WIDTH),
+            f"{len(streamlines)} streamlines from {kind_label} tensors",
         )
 
     def _apply_noisy_metrics(self, metrics: dict) -> None:
@@ -1072,6 +1516,27 @@ class DatasetViewer(QMainWindow):
         if (pred_key == self._prediction_key(self.slice_slider.value())
                 and self.plane == "Axial"):
             self._apply_predictions(result)
+
+    @pyqtSlot(str, object)
+    def _on_clean_tracts_ready(self, subject: str, streamlines: list) -> None:
+        self._pending_clean_tracts.discard(subject)
+        self.clean_tract_cache[subject] = list(streamlines)
+        if subject == self.current_subject and self._tract_panel_visible("Tracts (Clean)"):
+            self._render_tract_panel(
+                "Tracts (Clean)", self.clean_tract_cache[subject],
+                self.slice_slider.value(), kind="clean",
+            )
+
+    @pyqtSlot(object, object)
+    def _on_pred_tracts_ready(self, pred_tract_key: tuple, streamlines: list) -> None:
+        self._pending_pred_tracts.discard(pred_tract_key)
+        self.pred_tract_cache[pred_tract_key] = list(streamlines)
+        if (pred_tract_key == self._pred_tract_key()
+                and self._tract_panel_visible("Tracts (Predicted)")):
+            self._render_tract_panel(
+                "Tracts (Predicted)", self.pred_tract_cache[pred_tract_key],
+                self.slice_slider.value(), kind="pred",
+            )
 
 
 def main() -> None:
