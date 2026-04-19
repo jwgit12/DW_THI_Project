@@ -294,49 +294,76 @@ def masked_stats(arr: np.ndarray, mask: np.ndarray | None = None) -> tuple[float
 # Tractography (deterministic Euler integration of principal eigvec field)
 # ---------------------------------------------------------------------------
 
+def _fa_from_evals(evals: np.ndarray) -> np.ndarray:
+    md = np.mean(evals, axis=-1, keepdims=True)
+    num = np.sqrt(((evals - md) ** 2).sum(axis=-1))
+    den = np.sqrt((evals ** 2).sum(axis=-1) + 1e-12)
+    return (np.sqrt(1.5) * num / den).astype(np.float32)
+
+
 def compute_principal_evec_field(tensor6_volume: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Return ``(pev (X, Y, Z, 3), fa (X, Y, Z))`` from a 6D tensor volume."""
     full = tensor6_to_full(tensor6_volume)
     evals, evecs = tensor_to_eig(full)
     pev = np.ascontiguousarray(evecs[..., :, 0], dtype=np.float32)
-    fa = np.asarray(compute_fa_from_tensor6(tensor6_volume), dtype=np.float32)
+    fa = _fa_from_evals(evals)
     return pev, fa
+
+
+def compute_dti_metrics(tensor6: np.ndarray) -> dict:
+    """Single eigendecomposition → ``{fa, md, color_fa}``. Replaces three
+    separate ``compute_*_from_tensor6`` calls (each of which does its own
+    eigendecomp) on a hot path."""
+    full = tensor6_to_full(tensor6)
+    evals, evecs = tensor_to_eig(full)
+    md_vec = np.mean(evals, axis=-1, keepdims=True)
+    md = np.squeeze(md_vec, axis=-1).astype(np.float32)
+    num = np.sqrt(((evals - md_vec) ** 2).sum(axis=-1))
+    den = np.sqrt((evals ** 2).sum(axis=-1) + 1e-12)
+    fa = (np.sqrt(1.5) * num / den).astype(np.float32)
+    color_fa = (np.abs(evecs[..., :, 0]) * fa[..., None]).astype(np.float32)
+    return {"fa": fa, "md": md, "color_fa": color_fa}
 
 
 def _trace_streamline(
     seed: np.ndarray,
     pev: np.ndarray,
-    fa: np.ndarray,
-    mask: np.ndarray,
+    valid: np.ndarray,
     sign: int,
-    fa_thresh: float,
     step_size: float,
     max_angle_cos: float,
     max_steps: int,
 ) -> np.ndarray:
-    shape = np.array(fa.shape, dtype=np.int64)
-    pts = [seed.astype(np.float32).copy()]
-    p = seed.astype(np.float32).copy()
-    prev_dir: np.ndarray | None = None
+    sx, sy, sz = valid.shape
+    pts = [(float(seed[0]), float(seed[1]), float(seed[2]))]
+    px, py, pz = pts[0]
+    pdx = pdy = pdz = 0.0
+    have_prev = False
     for _ in range(max_steps):
-        ip = p.astype(np.int64)
-        if (ip < 0).any() or (ip >= shape).any():
+        ix = int(px); iy = int(py); iz = int(pz)
+        if ix < 0 or iy < 0 or iz < 0 or ix >= sx or iy >= sy or iz >= sz:
             break
-        if not mask[ip[0], ip[1], ip[2]]:
+        if not valid[ix, iy, iz]:
             break
-        if fa[ip[0], ip[1], ip[2]] < fa_thresh:
-            break
-        v = pev[ip[0], ip[1], ip[2]].astype(np.float32).copy()
-        if prev_dir is None:
-            v = sign * v
+        vx = float(pev[ix, iy, iz, 0])
+        vy = float(pev[ix, iy, iz, 1])
+        vz = float(pev[ix, iy, iz, 2])
+        if not have_prev:
+            if sign < 0:
+                vx = -vx; vy = -vy; vz = -vz
         else:
-            if float(np.dot(v, prev_dir)) < 0.0:
-                v = -v
-            if float(np.dot(v, prev_dir)) < max_angle_cos:
+            dot = vx * pdx + vy * pdy + vz * pdz
+            if dot < 0.0:
+                vx = -vx; vy = -vy; vz = -vz
+                dot = -dot
+            if dot < max_angle_cos:
                 break
-        p = p + step_size * v
-        pts.append(p.copy())
-        prev_dir = v
+        px += step_size * vx
+        py += step_size * vy
+        pz += step_size * vz
+        pts.append((px, py, pz))
+        pdx, pdy, pdz = vx, vy, vz
+        have_prev = True
     return np.asarray(pts, dtype=np.float32)
 
 
@@ -357,7 +384,7 @@ def deterministic_track(
     fa = np.ascontiguousarray(fa, dtype=np.float32)
     mask = np.ascontiguousarray(mask, dtype=bool)
 
-    valid = (fa > fa_thresh) & mask
+    valid = np.ascontiguousarray((fa > fa_thresh) & mask)
     seed_idx = np.argwhere(valid)
     if seed_idx.size == 0:
         return []
@@ -371,10 +398,10 @@ def deterministic_track(
     streamlines: list[np.ndarray] = []
     for ijk in seed_idx:
         seed = ijk.astype(np.float32) + 0.5
-        forward = _trace_streamline(seed, pev, fa, mask, +1,
-                                    fa_thresh, step_size, max_angle_cos, max_steps)
-        backward = _trace_streamline(seed, pev, fa, mask, -1,
-                                     fa_thresh, step_size, max_angle_cos, max_steps)
+        forward = _trace_streamline(seed, pev, valid, +1,
+                                    step_size, max_angle_cos, max_steps)
+        backward = _trace_streamline(seed, pev, valid, -1,
+                                     step_size, max_angle_cos, max_steps)
         if len(backward) > 1:
             full = np.concatenate([backward[:0:-1], forward], axis=0)
         else:
@@ -439,10 +466,6 @@ def render_tract_overlay(
             ys = pts[:, other_axes[0]]
             line = np.column_stack([xs, ys])
             seg_pairs = np.stack([line[:-1], line[1:]], axis=1)  # (K-1, 2, 2)
-            tangents = line[1:] - line[:-1]
-            mags = np.linalg.norm(tangents, axis=1, keepdims=True)
-            mags = np.where(mags < 1e-6, 1.0, mags)
-            unit = tangents / mags
             # Color each segment by the *local* fiber direction (RGB = |dx,dy,dz|).
             tangent3 = pts[1:] - pts[:-1]
             t3_mags = np.linalg.norm(tangent3, axis=1, keepdims=True)
@@ -560,11 +583,7 @@ class MetricsWorker(QRunnable):
     def run(self) -> None:
         try:
             tensor6 = extract_tensor_slice(self.zarr_group["target_dti_6d"], self.plane, self.slice_idx)
-            result = {
-                "fa": np.asarray(compute_fa_from_tensor6(tensor6), dtype=np.float32),
-                "md": np.asarray(compute_md_from_tensor6(tensor6), dtype=np.float32),
-                "color_fa": np.asarray(compute_color_fa_from_tensor6(tensor6), dtype=np.float32),
-            }
+            result = compute_dti_metrics(tensor6)
             self.signals.metrics_ready.emit(self.subject, self.plane, self.slice_idx, result)
         except Exception as exc:
             print(f"[MetricsWorker] {exc}", file=sys.stderr)
@@ -597,11 +616,7 @@ class NoisyMetricsWorker(QRunnable):
                 b0_threshold=self.b0_threshold,
             )
             tensor6 = sanitize_dti6d(tensor6, max_eigenvalue=cfg.MAX_DIFFUSIVITY)
-            result = {
-                "fa": np.asarray(compute_fa_from_tensor6(tensor6), dtype=np.float32),
-                "md": np.asarray(compute_md_from_tensor6(tensor6), dtype=np.float32),
-                "color_fa": np.asarray(compute_color_fa_from_tensor6(tensor6), dtype=np.float32),
-            }
+            result = compute_dti_metrics(tensor6)
             self.signals.noisy_metrics_ready.emit(self.noisy_key, result)
         except Exception as exc:
             print(f"[NoisyMetricsWorker] {exc}", file=sys.stderr)
@@ -671,11 +686,7 @@ class PredictionWorker(QRunnable):
                     pred = self.model(signal_t, bvals_t, bvecs_t, vol_mask_t)
 
             pred_tensor6 = pred[0].permute(1, 2, 0).cpu().numpy() / self.dti_scale
-            result = {
-                "fa": np.asarray(compute_fa_from_tensor6(pred_tensor6), dtype=np.float32),
-                "md": np.asarray(compute_md_from_tensor6(pred_tensor6), dtype=np.float32),
-                "color_fa": np.asarray(compute_color_fa_from_tensor6(pred_tensor6), dtype=np.float32),
-            }
+            result = compute_dti_metrics(pred_tensor6)
             self.signals.prediction_ready.emit(self.pred_key, result)
         except Exception as exc:
             print(f"[PredictionWorker] {exc}", file=sys.stderr)
@@ -1238,7 +1249,12 @@ class DatasetViewer(QMainWindow):
         self.slice_label.setText(f"{slice_idx} / {self.slice_slider.maximum()}")
 
         # ── Noisy input DTI fit: degrade the clean slice using the slider values
-        input_nhw = self._get_degraded_slice_nhw(self.plane, slice_idx)
+        # Skip the (cache-miss-expensive) degradation while the keep/noise slider
+        # is being dragged — the worker is gated below and would discard it anyway.
+        if self._degradation_slider_active():
+            input_nhw = None
+        else:
+            input_nhw = self._get_degraded_slice_nhw(self.plane, slice_idx)
         mask_slice = self._current_mask_slice()
         self.selection_info_label.setText(
             f"Plane: {self.plane}\n"
