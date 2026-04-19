@@ -2,16 +2,20 @@
 
 Produces a CSV with DTI-level metrics (tensor RMSE, FA, ADC).
 
-When --run_baselines is set (default), Patch2Self and MP-PCA are also
-run on the same subjects, and comparison plots + metric tables are saved.
+By default each subject is evaluated multiple times with independent
+k-space cutouts and noise realisations. Patch2Self and MP-PCA are also
+run unless disabled, and comparison plots + metric tables are saved.
 
 Usage:
-    python -m research.evaluate --checkpoint research/runs/run_full/best_model.pt
+    python -m research.evaluate
     python -m research.evaluate --checkpoint research/runs/run_01/best_model.pt --subjects sub-10 sub-11
     python -m research.evaluate --checkpoint research/runs/run_01/best_model.pt --skip_baselines
+    python -m research.evaluate --checkpoint research/runs/run_01/best_model.pt --eval_repeats 5 --skip_mppca
+    python -m research.evaluate --sweep_patch2self --eval_repeats 3
 """
 
 import argparse
+import itertools
 import logging
 import sys
 import time
@@ -38,8 +42,30 @@ from research.utils import (
     _symmetric_limits,
 )
 from functions import compute_b0_norm, compute_brain_mask_from_dwi
+from research.augment import degrade_dwi_volume
 from research.model import QSpaceUNet
 import config as cfg
+
+
+def _load_input_dwi(
+    grp,
+    target_dwi: np.ndarray | None = None,
+    keep_fraction: float = cfg.EVAL_KEEP_FRACTION,
+    noise_level: float = cfg.EVAL_NOISE_LEVEL,
+    seed: int = cfg.EVAL_DEGRADE_SEED,
+) -> np.ndarray:
+    """Return the degraded DWI for eval.
+
+    Uses the stored ``input_dwi`` array when present (back-compat with v1
+    Zarr stores) and otherwise synthesises a reproducible degraded volume
+    from ``target_dwi`` using the on-the-fly helpers.
+    """
+    if "input_dwi" in grp.array_keys():
+        return np.asarray(grp["input_dwi"][:], dtype=np.float32)
+    clean = target_dwi if target_dwi is not None else np.asarray(grp["target_dwi"][:], dtype=np.float32)
+    return degrade_dwi_volume(
+        clean, keep_fraction=keep_fraction, rel_noise_level=noise_level, seed=seed,
+    )
 
 logging.basicConfig(
     level=logging.INFO,
@@ -78,6 +104,7 @@ def predict_subject(
     b0_threshold: float = cfg.B0_THRESHOLD,
     dti_scale: float = 1.0,
     max_bval: float = 1000.0,
+    input_dwi: np.ndarray | None = None,
 ) -> np.ndarray:
     """Run inference on a full 3D subject, slice by slice.
 
@@ -86,7 +113,10 @@ def predict_subject(
     store = zarr.open_group(zarr_path, mode="r")
     grp = store[subject_key]
 
-    input_dwi = np.asarray(grp["input_dwi"][:], dtype=np.float32)  # (X, Y, Z, N)
+    if input_dwi is None:
+        input_dwi = _load_input_dwi(grp)  # (X, Y, Z, N)
+    else:
+        input_dwi = np.asarray(input_dwi, dtype=np.float32)
     bvals = np.asarray(grp["bvals"][:], dtype=np.float32)
     bvecs = np.asarray(grp["bvecs"][:], dtype=np.float32)  # (3, N)
 
@@ -145,16 +175,21 @@ def predict_subject(
 # ─────────────────────────────────────────────────────────────────────────────
 # Baseline runners
 # ─────────────────────────────────────────────────────────────────────────────
-def _run_patch2self(noisy: np.ndarray, bvals: np.ndarray) -> np.ndarray:
+def _run_patch2self(
+    noisy: np.ndarray,
+    bvals: np.ndarray,
+    p2s_cfg: dict | None = None,
+) -> np.ndarray:
     from dipy.denoise.patch2self import patch2self
+    p2s_cfg = P2S_CFG if p2s_cfg is None else p2s_cfg
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         return patch2self(
-            noisy, bvals, model=P2S_CFG["model"], alpha=P2S_CFG["alpha"],
-            b0_threshold=P2S_CFG["b0_threshold"],
-            shift_intensity=P2S_CFG["shift_intensity"],
-            clip_negative_vals=P2S_CFG["clip_negative"],
-            b0_denoising=P2S_CFG["b0_denoising"], verbose=False,
+            noisy, bvals, model=p2s_cfg["model"], alpha=p2s_cfg["alpha"],
+            b0_threshold=p2s_cfg["b0_threshold"],
+            shift_intensity=p2s_cfg["shift_intensity"],
+            clip_negative_vals=p2s_cfg["clip_negative"],
+            b0_denoising=p2s_cfg["b0_denoising"], verbose=False,
         ).astype(np.float32)
 
 
@@ -233,7 +268,7 @@ def _baseline_dti_metrics(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Evaluate a single subject (all methods)
+# Evaluate a single subject/repeat (all enabled methods)
 # ─────────────────────────────────────────────────────────────────────────────
 def evaluate_subject(
     model: QSpaceUNet,
@@ -243,15 +278,21 @@ def evaluate_subject(
     b0_threshold: float = cfg.B0_THRESHOLD,
     dti_scale: float = 1.0,
     max_bval: float = 1000.0,
-    run_baselines: bool = True,
+    repeat_idx: int = 0,
+    keep_fraction: float = cfg.EVAL_KEEP_FRACTION,
+    noise_level: float = cfg.EVAL_NOISE_LEVEL,
+    degrade_seed: int = cfg.EVAL_DEGRADE_SEED,
+    run_patch2self: bool = True,
+    run_mppca: bool = True,
+    p2s_cfg: dict | None = None,
 ) -> tuple[dict, dict]:
-    """Full evaluation pipeline for one subject.
+    """Full evaluation pipeline for one subject and one degradation repeat.
 
     Returns
     -------
     metrics : dict
         Keys: 'research', and optionally 'patch2self', 'mppca'.
-        Each value is a dict of scalar metrics.
+        Each value is a dict of scalar metrics plus degradation metadata.
     arrays : dict
         Raw arrays needed for visualization.
     """
@@ -261,7 +302,12 @@ def evaluate_subject(
     grp = store[subject_key]
     target_dti6d = np.asarray(grp["target_dti_6d"][:], dtype=np.float32)
     target_dwi = np.asarray(grp["target_dwi"][:], dtype=np.float32)
-    input_dwi = np.asarray(grp["input_dwi"][:], dtype=np.float32)
+    input_dwi = degrade_dwi_volume(
+        target_dwi,
+        keep_fraction=keep_fraction,
+        rel_noise_level=noise_level,
+        seed=degrade_seed,
+    )
     bvals = np.asarray(grp["bvals"][:], dtype=np.float32)
     bvecs = np.asarray(grp["bvecs"][:], dtype=np.float32)
 
@@ -269,11 +315,24 @@ def evaluate_subject(
     mask_3d = compute_brain_mask_from_dwi(target_dwi, bvals, b0_threshold)
 
     # ── Research model ────────────────────────────────────────────────────
-    pred_dti6d = predict_subject(model, zarr_path, subject_key, device, b0_threshold, dti_scale, max_bval)
+    pred_dti6d = predict_subject(
+        model, zarr_path, subject_key, device,
+        b0_threshold=b0_threshold,
+        dti_scale=dti_scale,
+        max_bval=max_bval,
+        input_dwi=input_dwi,
+    )
 
     research_elapsed = time.time() - t0
+    row_meta = {
+        "subject": subject_key,
+        "repeat": int(repeat_idx),
+        "keep_fraction": round(float(keep_fraction), 6),
+        "noise_level": round(float(noise_level), 6),
+        "degrade_seed": int(degrade_seed),
+    }
     research_metrics = _compute_dti_metrics(pred_dti6d, target_dti6d, mask=mask_3d)
-    research_metrics["subject"] = subject_key
+    research_metrics.update(row_meta)
     research_metrics["elapsed_s"] = round(research_elapsed, 2)
 
     all_metrics = {"research": research_metrics}
@@ -285,30 +344,44 @@ def evaluate_subject(
         "bvecs": bvecs,
         "research_dti6d": pred_dti6d,
         "brain_mask_3d": mask_3d,
+        "repeat": int(repeat_idx),
+        "keep_fraction": float(keep_fraction),
+        "noise_level": float(noise_level),
+        "degrade_seed": int(degrade_seed),
     }
 
     # ── Baselines ─────────────────────────────────────────────────────────
-    if run_baselines:
-        # Patch2Self
+    if run_patch2self:
+        p2s_cfg = P2S_CFG if p2s_cfg is None else p2s_cfg
         t1 = time.time()
-        p2s_denoised = _run_patch2self(input_dwi, bvals)
+        p2s_denoised = _run_patch2self(input_dwi, bvals, p2s_cfg=p2s_cfg)
         p2s_metrics, p2s_dti6d = _baseline_dti_metrics(
             p2s_denoised, target_dti6d, bvals, bvecs, b0_threshold,
-            mask=mask_3d,
+            dti_fit_method=p2s_cfg["dti_fit_method"], mask=mask_3d,
         )
-        p2s_metrics["subject"] = subject_key
+        p2s_metrics.update(row_meta)
+        p2s_metrics.update(
+            {
+                "p2s_model": p2s_cfg["model"],
+                "p2s_alpha": p2s_cfg["alpha"],
+                "p2s_b0_denoising": p2s_cfg["b0_denoising"],
+                "p2s_clip_negative": p2s_cfg["clip_negative"],
+                "p2s_shift_intensity": p2s_cfg["shift_intensity"],
+                "p2s_dti_fit_method": p2s_cfg["dti_fit_method"],
+            }
+        )
         p2s_metrics["elapsed_s"] = round(time.time() - t1, 2)
         all_metrics["patch2self"] = p2s_metrics
         arrays["patch2self_dti6d"] = p2s_dti6d
 
-        # MP-PCA
+    if run_mppca:
         t2 = time.time()
         mppca_denoised = _run_mppca(input_dwi)
         mppca_metrics, mppca_dti6d = _baseline_dti_metrics(
             mppca_denoised, target_dti6d, bvals, bvecs, b0_threshold,
             mask=mask_3d,
         )
-        mppca_metrics["subject"] = subject_key
+        mppca_metrics.update(row_meta)
         mppca_metrics["elapsed_s"] = round(time.time() - t2, 2)
         all_metrics["mppca"] = mppca_metrics
         arrays["mppca_dti6d"] = mppca_dti6d
@@ -446,7 +519,17 @@ def save_comparison_plot(
     ax.axis("off")
     fig.colorbar(im_adc, ax=ax, fraction=0.046, pad=0.04)
 
-    fig.suptitle(f"Method Comparison  |  {subject_key}  |  z={slice_idx}", fontsize=13)
+    degrade_info = ""
+    if "repeat" in arrays:
+        degrade_info = (
+            f"  |  repeat={arrays['repeat']}  "
+            f"keep={arrays.get('keep_fraction', float('nan')):.3f}  "
+            f"noise={arrays.get('noise_level', float('nan')):.3f}"
+        )
+    fig.suptitle(
+        f"Method Comparison  |  {subject_key}  |  z={slice_idx}{degrade_info}",
+        fontsize=13,
+    )
     fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.95))
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -535,7 +618,7 @@ def save_metric_comparison(
     for j in range(n_metrics, len(axes)):
         axes[j].set_visible(False)
 
-    fig.suptitle("Metric Comparison (mean over test subjects)", fontsize=14, fontweight="bold")
+    fig.suptitle("Metric Comparison (mean over evaluation repeats)", fontsize=14, fontweight="bold")
     fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.95))
     plot_path = out_dir / "comparison_metrics.png"
     fig.savefig(plot_path, dpi=150, bbox_inches="tight")
@@ -545,13 +628,348 @@ def save_metric_comparison(
     return plot_path
 
 
+def _validate_eval_args(args) -> None:
+    if args.eval_repeats < 1:
+        raise ValueError("--eval_repeats must be >= 1")
+    if args.plot_repeat < 0:
+        raise ValueError("--plot_repeat must be >= 0")
+    if args.plot_repeat >= args.eval_repeats:
+        raise ValueError("--plot_repeat must be less than --eval_repeats")
+    if not (0.0 < args.eval_keep_fraction_min <= args.eval_keep_fraction_max <= 1.0):
+        raise ValueError(
+            "--eval_keep_fraction_min/max must satisfy 0 < min <= max <= 1"
+        )
+    if not (0.0 <= args.eval_noise_min <= args.eval_noise_max):
+        raise ValueError("--eval_noise_min/max must satisfy 0 <= min <= max")
+    if args.p2s_alpha < 0:
+        raise ValueError("--p2s_alpha must be >= 0")
+    if any(alpha < 0 for alpha in args.p2s_sweep_alphas):
+        raise ValueError("--p2s_sweep_alphas values must be >= 0")
+
+
+def _next_degradation_trial(
+    rng: np.random.Generator,
+    repeat_idx: int,
+    keep_fraction_range: tuple[float, float],
+    noise_range: tuple[float, float],
+) -> dict:
+    keep_min, keep_max = keep_fraction_range
+    noise_min, noise_max = noise_range
+    if keep_min == keep_max:
+        keep_fraction = float(keep_min)
+    else:
+        keep_fraction = float(rng.uniform(keep_min, keep_max))
+    if noise_min == noise_max:
+        noise_level = float(noise_min)
+    else:
+        noise_level = float(rng.uniform(noise_min, noise_max))
+    return {
+        "repeat_idx": repeat_idx,
+        "keep_fraction": keep_fraction,
+        "noise_level": noise_level,
+        "degrade_seed": int(rng.integers(0, np.iinfo(np.int32).max)),
+    }
+
+
+def _bool_choices(values: list[str]) -> list[bool]:
+    return [value.lower() == "true" for value in values]
+
+
+def _p2s_cfg_from_args(args, overrides: dict | None = None) -> dict:
+    p2s_cfg = dict(P2S_CFG)
+    p2s_cfg.update(
+        model=args.p2s_model,
+        alpha=float(args.p2s_alpha),
+        b0_threshold=float(args.b0_threshold),
+        shift_intensity=bool(args.p2s_shift_intensity),
+        clip_negative=bool(args.p2s_clip_negative),
+        b0_denoising=bool(args.p2s_b0_denoising),
+        dti_fit_method=args.p2s_dti_fit_method,
+    )
+    if overrides:
+        p2s_cfg.update(overrides)
+    return p2s_cfg
+
+
+def _iter_p2s_sweep_configs(args) -> list[dict]:
+    configs = []
+    b0_values = _bool_choices(args.p2s_sweep_b0_denoising)
+    clip_values = _bool_choices(args.p2s_sweep_clip_negative)
+    shift_values = _bool_choices(args.p2s_sweep_shift_intensity)
+    for model in args.p2s_sweep_models:
+        alpha_values = args.p2s_sweep_alphas if model != "ols" else [args.p2s_alpha]
+        for alpha, b0_denoising, clip_negative, shift_intensity in itertools.product(
+            alpha_values, b0_values, clip_values, shift_values,
+        ):
+            configs.append(
+                _p2s_cfg_from_args(
+                    args,
+                    overrides={
+                        "model": model,
+                        "alpha": float(alpha),
+                        "b0_denoising": b0_denoising,
+                        "clip_negative": clip_negative,
+                        "shift_intensity": shift_intensity,
+                    },
+                )
+            )
+    # Deduplicate configs after OLS alpha collapsing while preserving order.
+    unique = []
+    seen = set()
+    for p2s_cfg in configs:
+        key = (
+            p2s_cfg["model"],
+            p2s_cfg["alpha"],
+            p2s_cfg["b0_denoising"],
+            p2s_cfg["clip_negative"],
+            p2s_cfg["shift_intensity"],
+            p2s_cfg["dti_fit_method"],
+        )
+        if key not in seen:
+            seen.add(key)
+            unique.append(p2s_cfg)
+    return unique
+
+
+def _expand_subjects(subject_ids: list[str] | None, all_keys: list[str]) -> list[str]:
+    if not subject_ids:
+        return []
+    subjects = []
+    seen = set()
+    for subject_id in subject_ids:
+        if subject_id in all_keys:
+            matches = [subject_id]
+        else:
+            matches = [k for k in all_keys if k.rsplit("_ses-", 1)[0] == subject_id]
+        for match in matches:
+            if match not in seen:
+                seen.add(match)
+                subjects.append(match)
+    return subjects
+
+
+def _select_eval_subjects(
+    all_keys: list[str],
+    args,
+    checkpoint_subjects: list[str] | None = None,
+    default_subjects: list[str] | None = None,
+) -> list[str]:
+    if args.eval_all:
+        return all_keys
+    if args.subjects:
+        return _expand_subjects(args.subjects, all_keys)
+    if default_subjects:
+        subjects = _expand_subjects(default_subjects, all_keys)
+        if subjects:
+            return subjects
+    if checkpoint_subjects:
+        subjects = _expand_subjects(checkpoint_subjects, all_keys)
+        if subjects:
+            return subjects
+    return all_keys
+
+
+def _matches_plot_subject(subject_key: str, requested: str | None) -> bool:
+    if requested is None:
+        return True
+    return subject_key == requested or subject_key.rsplit("_ses-", 1)[0] == requested
+
+
+def _plot_key(subject_key: str, repeat_idx: int, eval_repeats: int) -> str:
+    if eval_repeats <= 1:
+        return subject_key
+    return f"{subject_key}_repeat-{repeat_idx:02d}"
+
+
+def run_patch2self_sweep(
+    args,
+    subjects: list[str],
+    out_dir: Path,
+) -> pd.DataFrame | None:
+    """Evaluate a Patch2Self hyperparameter grid on shared degraded inputs."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    p2s_configs = _iter_p2s_sweep_configs(args)
+    if not p2s_configs:
+        log.error("No Patch2Self sweep configurations were generated.")
+        return None
+
+    metric_cols = [
+        "tensor_rmse",
+        "fa_rmse", "fa_mae", "fa_nrmse", "fa_r2",
+        "adc_rmse", "adc_mae", "adc_nrmse", "adc_r2",
+    ]
+    higher_is_better = {"fa_r2", "adc_r2"}
+    sort_ascending = args.p2s_sweep_metric not in higher_is_better
+
+    log.info(
+        "Running Patch2Self sweep: %d configs x %d subjects x %d repeats",
+        len(p2s_configs), len(subjects), args.eval_repeats,
+    )
+
+    store = zarr.open_group(args.zarr_path, mode="r")
+    eval_rng = np.random.default_rng(args.eval_seed)
+    rows = []
+
+    for subject_key in subjects:
+        grp = store[subject_key]
+        target_dti6d = np.asarray(grp["target_dti_6d"][:], dtype=np.float32)
+        target_dwi = np.asarray(grp["target_dwi"][:], dtype=np.float32)
+        bvals = np.asarray(grp["bvals"][:], dtype=np.float32)
+        bvecs = np.asarray(grp["bvecs"][:], dtype=np.float32)
+        mask_3d = compute_brain_mask_from_dwi(target_dwi, bvals, args.b0_threshold)
+
+        for repeat_idx in range(args.eval_repeats):
+            trial = _next_degradation_trial(
+                eval_rng,
+                repeat_idx=repeat_idx,
+                keep_fraction_range=(
+                    args.eval_keep_fraction_min,
+                    args.eval_keep_fraction_max,
+                ),
+                noise_range=(args.eval_noise_min, args.eval_noise_max),
+            )
+            input_dwi = degrade_dwi_volume(
+                target_dwi,
+                keep_fraction=trial["keep_fraction"],
+                rel_noise_level=trial["noise_level"],
+                seed=trial["degrade_seed"],
+            )
+
+            for config_idx, p2s_cfg in enumerate(p2s_configs):
+                t0 = time.time()
+                try:
+                    p2s_denoised = _run_patch2self(input_dwi, bvals, p2s_cfg=p2s_cfg)
+                    metrics, _ = _baseline_dti_metrics(
+                        p2s_denoised,
+                        target_dti6d,
+                        bvals,
+                        bvecs,
+                        args.b0_threshold,
+                        dti_fit_method=p2s_cfg["dti_fit_method"],
+                        mask=mask_3d,
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "Patch2Self sweep failed subject=%s repeat=%d config=%d: %s",
+                        subject_key, repeat_idx, config_idx, exc,
+                    )
+                    continue
+
+                row = {
+                    "subject": subject_key,
+                    "repeat": repeat_idx,
+                    "keep_fraction": round(float(trial["keep_fraction"]), 6),
+                    "noise_level": round(float(trial["noise_level"]), 6),
+                    "degrade_seed": int(trial["degrade_seed"]),
+                    "config_idx": config_idx,
+                    "p2s_model": p2s_cfg["model"],
+                    "p2s_alpha": p2s_cfg["alpha"],
+                    "p2s_b0_denoising": p2s_cfg["b0_denoising"],
+                    "p2s_clip_negative": p2s_cfg["clip_negative"],
+                    "p2s_shift_intensity": p2s_cfg["shift_intensity"],
+                    "p2s_dti_fit_method": p2s_cfg["dti_fit_method"],
+                    "elapsed_s": round(time.time() - t0, 2),
+                }
+                row.update(metrics)
+                rows.append(row)
+
+                log.info(
+                    "%-14s r=%02d cfg=%02d model=%s alpha=%.3g b0=%s clip=%s "
+                    "%s=%.6f",
+                    subject_key, repeat_idx, config_idx,
+                    p2s_cfg["model"], p2s_cfg["alpha"],
+                    p2s_cfg["b0_denoising"], p2s_cfg["clip_negative"],
+                    args.p2s_sweep_metric, metrics[args.p2s_sweep_metric],
+                )
+
+    if not rows:
+        log.error("Patch2Self sweep produced no successful rows.")
+        return None
+
+    raw_df = pd.DataFrame(rows)
+    raw_path = out_dir / "patch2self_sweep.csv"
+    raw_df.to_csv(raw_path, index=False)
+    log.info("Saved Patch2Self sweep rows -> %s", raw_path)
+
+    group_cols = [
+        "config_idx",
+        "p2s_model",
+        "p2s_alpha",
+        "p2s_b0_denoising",
+        "p2s_clip_negative",
+        "p2s_shift_intensity",
+        "p2s_dti_fit_method",
+    ]
+    available_metrics = [c for c in metric_cols if c in raw_df.columns]
+    summary = raw_df.groupby(group_cols, dropna=False)[available_metrics].agg(["mean", "std"])
+    summary.columns = [f"{metric}_{stat}" for metric, stat in summary.columns]
+    summary = summary.reset_index()
+    summary = summary.sort_values(
+        f"{args.p2s_sweep_metric}_mean",
+        ascending=sort_ascending,
+    ).reset_index(drop=True)
+
+    summary_path = out_dir / "patch2self_sweep_summary.csv"
+    summary.to_csv(summary_path, index=False)
+    log.info("Saved Patch2Self sweep summary -> %s", summary_path)
+
+    best = summary.iloc[0]
+    print(f"\n{'=' * 72}")
+    print("  Patch2Self Sweep Best Config")
+    print(f"{'=' * 72}")
+    print(
+        "model={model}  alpha={alpha:.6g}  b0_denoising={b0}  "
+        "clip_negative={clip}  shift_intensity={shift}  "
+        "{metric}_mean={score:.6f}".format(
+            model=best["p2s_model"],
+            alpha=best["p2s_alpha"],
+            b0=best["p2s_b0_denoising"],
+            clip=best["p2s_clip_negative"],
+            shift=best["p2s_shift_intensity"],
+            metric=args.p2s_sweep_metric,
+            score=best[f"{args.p2s_sweep_metric}_mean"],
+        )
+    )
+    print("\nTop configs:")
+    top_cols = [
+        "p2s_model",
+        "p2s_alpha",
+        "p2s_b0_denoising",
+        "p2s_clip_negative",
+        "p2s_shift_intensity",
+        f"{args.p2s_sweep_metric}_mean",
+        f"{args.p2s_sweep_metric}_std",
+    ]
+    print(summary[top_cols].head(8).to_string(index=False))
+
+    return summary
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main(args):
+    _validate_eval_args(args)
+
     device = get_device()
     log.info("Device: %s", device)
+
+    store = zarr.open_group(args.zarr_path, mode="r")
+    all_keys = sorted(store.keys())
+
+    if args.sweep_patch2self:
+        subjects = _select_eval_subjects(
+            all_keys,
+            args,
+            default_subjects=cfg.VAL_SUBJECTS,
+        )
+        if not subjects:
+            log.error("No subjects selected for Patch2Self sweep.")
+            return
+        log.info("Patch2Self sweep subjects: %s", subjects)
+        run_patch2self_sweep(args, subjects, Path(args.out_dir))
+        return
 
     # Load checkpoint
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
@@ -569,70 +987,97 @@ def main(args):
     log.info("Loaded checkpoint from epoch %d (val_loss=%.6f)", ckpt["epoch"], ckpt["val_loss"])
 
     # Determine subjects to evaluate
-    store = zarr.open_group(args.zarr_path, mode="r")
-    all_keys = sorted(store.keys())
+    subjects = _select_eval_subjects(
+        all_keys,
+        args,
+        checkpoint_subjects=ckpt.get("test_subjects", []),
+    )
+    if not subjects:
+        log.error("No subjects selected for evaluation.")
+        return
 
-    if args.eval_all:
-        subjects = all_keys
-    elif args.subjects:
-        # Expand biological subject IDs to matching Zarr keys
-        subjects = []
-        for s in args.subjects:
-            if s in all_keys:
-                subjects.append(s)
-            else:
-                matches = [k for k in all_keys if k.rsplit("_ses-", 1)[0] == s]
-                subjects.extend(matches)
-    else:
-        subjects = ckpt.get("test_subjects", [])
-        if not subjects:
-            subjects = all_keys
-
-    run_baselines = not args.skip_baselines
-    log.info("Evaluating %d subjects  (baselines=%s)", len(subjects), run_baselines)
+    run_patch2self = (not args.skip_baselines) and args.patch2self
+    run_mppca = (not args.skip_baselines) and args.mppca
+    p2s_cfg = _p2s_cfg_from_args(args)
+    log.info(
+        "Evaluating %d subjects x %d repeats  (Patch2Self=%s, MP-PCA=%s)",
+        len(subjects), args.eval_repeats, run_patch2self, run_mppca,
+    )
+    log.info(
+        "Eval degradation: keep_fraction=[%.3f, %.3f], noise=[%.3f, %.3f], seed=%d",
+        args.eval_keep_fraction_min, args.eval_keep_fraction_max,
+        args.eval_noise_min, args.eval_noise_max,
+        args.eval_seed,
+    )
 
     # Run evaluation
     research_rows = []
     p2s_rows = []
     mppca_rows = []
     plot_arrays = {}
+    eval_rng = np.random.default_rng(args.eval_seed)
 
     for subj in subjects:
-        try:
-            all_metrics, arrays = evaluate_subject(
-                model, args.zarr_path, subj, device,
-                b0_threshold=args.b0_threshold,
-                dti_scale=dti_scale,
-                max_bval=max_bval,
-                run_baselines=run_baselines,
+        for repeat_idx in range(args.eval_repeats):
+            trial = _next_degradation_trial(
+                eval_rng,
+                repeat_idx=repeat_idx,
+                keep_fraction_range=(
+                    args.eval_keep_fraction_min,
+                    args.eval_keep_fraction_max,
+                ),
+                noise_range=(args.eval_noise_min, args.eval_noise_max),
             )
-            rm = all_metrics["research"]
-            log.info(
-                "%-14s  tensor_rmse=%.5f  FA[rmse=%.4f r2=%.3f]  ADC[rmse=%.2e r2=%.3f]  (%.1fs)",
-                rm["subject"], rm["tensor_rmse"],
-                rm["fa_rmse"], rm["fa_r2"],
-                rm["adc_rmse"], rm["adc_r2"],
-                rm["elapsed_s"],
-            )
-            research_rows.append(rm)
-            if "patch2self" in all_metrics:
-                p2s_rows.append(all_metrics["patch2self"])
-                log.info("  Patch2Self    tensor_rmse=%.5f  FA[rmse=%.4f r2=%.3f]  (%.1fs)",
-                         all_metrics["patch2self"]["tensor_rmse"],
-                         all_metrics["patch2self"]["fa_rmse"],
-                         all_metrics["patch2self"]["fa_r2"],
-                         all_metrics["patch2self"]["elapsed_s"])
-            if "mppca" in all_metrics:
-                mppca_rows.append(all_metrics["mppca"])
-                log.info("  MP-PCA       tensor_rmse=%.5f  FA[rmse=%.4f r2=%.3f]  (%.1fs)",
-                         all_metrics["mppca"]["tensor_rmse"],
-                         all_metrics["mppca"]["fa_rmse"],
-                         all_metrics["mppca"]["fa_r2"],
-                         all_metrics["mppca"]["elapsed_s"])
+            try:
+                all_metrics, arrays = evaluate_subject(
+                    model, args.zarr_path, subj, device,
+                    b0_threshold=args.b0_threshold,
+                    dti_scale=dti_scale,
+                    max_bval=max_bval,
+                    repeat_idx=trial["repeat_idx"],
+                    keep_fraction=trial["keep_fraction"],
+                    noise_level=trial["noise_level"],
+                    degrade_seed=trial["degrade_seed"],
+                    run_patch2self=run_patch2self,
+                    run_mppca=run_mppca,
+                    p2s_cfg=p2s_cfg,
+                )
+                rm = all_metrics["research"]
+                log.info(
+                    "%-14s  r=%02d  keep=%.3f noise=%.3f  tensor_rmse=%.5f  "
+                    "FA[rmse=%.4f r2=%.3f]  ADC[rmse=%.2e r2=%.3f]  (%.1fs)",
+                    rm["subject"], rm["repeat"], rm["keep_fraction"], rm["noise_level"],
+                    rm["tensor_rmse"], rm["fa_rmse"], rm["fa_r2"],
+                    rm["adc_rmse"], rm["adc_r2"], rm["elapsed_s"],
+                )
+                research_rows.append(rm)
+                if "patch2self" in all_metrics:
+                    p2s_rows.append(all_metrics["patch2self"])
+                    log.info(
+                        "  Patch2Self   tensor_rmse=%.5f  FA[rmse=%.4f r2=%.3f]  (%.1fs)",
+                        all_metrics["patch2self"]["tensor_rmse"],
+                        all_metrics["patch2self"]["fa_rmse"],
+                        all_metrics["patch2self"]["fa_r2"],
+                        all_metrics["patch2self"]["elapsed_s"],
+                    )
+                if "mppca" in all_metrics:
+                    mppca_rows.append(all_metrics["mppca"])
+                    log.info(
+                        "  MP-PCA       tensor_rmse=%.5f  FA[rmse=%.4f r2=%.3f]  (%.1fs)",
+                        all_metrics["mppca"]["tensor_rmse"],
+                        all_metrics["mppca"]["fa_rmse"],
+                        all_metrics["mppca"]["fa_r2"],
+                        all_metrics["mppca"]["elapsed_s"],
+                    )
 
-            plot_arrays[subj] = arrays
-        except Exception as exc:
-            log.warning("FAIL  %s  —  %s", subj, exc)
+                if (
+                    not args.skip_plot
+                    and repeat_idx == args.plot_repeat
+                    and _matches_plot_subject(subj, args.plot_subject)
+                ):
+                    plot_arrays[_plot_key(subj, repeat_idx, args.eval_repeats)] = arrays
+            except Exception as exc:
+                log.warning("FAIL  %s repeat=%d  —  %s", subj, repeat_idx, exc)
 
     if not research_rows:
         log.error("No subjects evaluated successfully.")
@@ -649,7 +1094,8 @@ def main(args):
     ]
 
     def _save_method_csv(rows: list[dict], name: str) -> pd.DataFrame:
-        df = pd.DataFrame(rows).sort_values("subject").reset_index(drop=True)
+        sort_cols = [c for c in ("subject", "repeat") if c in rows[0]]
+        df = pd.DataFrame(rows).sort_values(sort_cols).reset_index(drop=True)
         cols = [c for c in metric_cols if c in df.columns]
         summary = df[cols].agg(["mean", "std"]).round(6).reset_index()
         summary.columns = ["subject"] + cols
@@ -667,7 +1113,8 @@ def main(args):
         _save_method_csv(mppca_rows, "mppca")
 
     # Also save the research-only CSV for backward compatibility
-    df_compat = pd.DataFrame(research_rows).sort_values("subject").reset_index(drop=True)
+    compat_sort_cols = [c for c in ("subject", "repeat") if c in research_rows[0]]
+    df_compat = pd.DataFrame(research_rows).sort_values(compat_sort_cols).reset_index(drop=True)
     cols = [c for c in metric_cols if c in df_compat.columns]
     summary = df_compat[cols].agg(["mean", "std"]).round(6).reset_index()
     summary.columns = ["subject"] + cols
@@ -677,8 +1124,12 @@ def main(args):
     )
 
     # ── Metric comparison ─────────────────────────────────────────────────
-    if run_baselines and p2s_rows and mppca_rows:
-        comparison_rows = {"research": research_rows, "patch2self": p2s_rows, "mppca": mppca_rows}
+    comparison_rows = {"research": research_rows}
+    if p2s_rows:
+        comparison_rows["patch2self"] = p2s_rows
+    if mppca_rows:
+        comparison_rows["mppca"] = mppca_rows
+    if len(comparison_rows) > 1:
         save_metric_comparison(comparison_rows, out_dir)
 
     # ── Visualization ─────────────────────────────────────────────────────
@@ -706,7 +1157,7 @@ def main(args):
                 log.warning("Could not save prediction plot for %s: %s", plot_subject, exc)
 
             # All-methods comparison plot
-            if run_baselines and "patch2self_dti6d" in arrs:
+            if "patch2self_dti6d" in arrs or "mppca_dti6d" in arrs:
                 comp_path = out_dir / f"comparison_{plot_subject}.png"
                 try:
                     comp_meta = save_comparison_plot(
@@ -724,18 +1175,26 @@ def main(args):
 
     # ── Console summary ───────────────────────────────────────────────────
     print(f"\n{'=' * 72}")
-    print(f"  QSpaceUNet  (test subjects)")
+    print(f"  QSpaceUNet  (evaluation repeats)")
     print(f"{'=' * 72}")
-    print(df_research[["subject", "tensor_rmse",
-              "fa_rmse", "fa_mae", "fa_nrmse", "fa_r2",
-              "adc_rmse", "adc_mae", "adc_nrmse", "adc_r2"]].to_string(index=False))
+    display_cols = [
+        "subject", "repeat", "keep_fraction", "noise_level",
+        "tensor_rmse", "fa_rmse", "fa_mae", "fa_nrmse", "fa_r2",
+        "adc_rmse", "adc_mae", "adc_nrmse", "adc_r2",
+    ]
+    display_cols = [c for c in display_cols if c in df_research.columns]
+    print(df_research[display_cols].to_string(index=False))
     print(f"\n  MEAN  " + "  ".join(f"{c}={df_research[c].mean():.4f}" for c in metric_cols))
 
-    if run_baselines and p2s_rows and mppca_rows:
+    if len(comparison_rows) > 1:
         print(f"\n{'─' * 72}")
-        print("  Method Comparison (mean over test subjects)")
+        print("  Method Comparison (mean over evaluation repeats)")
         print(f"{'─' * 72}")
-        comp = {"QSpaceUNet": df_research, "Patch2Self": pd.DataFrame(p2s_rows), "MP-PCA": pd.DataFrame(mppca_rows)}
+        comp = {"QSpaceUNet": df_research}
+        if p2s_rows:
+            comp["Patch2Self"] = pd.DataFrame(p2s_rows)
+        if mppca_rows:
+            comp["MP-PCA"] = pd.DataFrame(mppca_rows)
         header = f"{'metric':<16}"
         for name in comp:
             header += f"  {name:>12}"
@@ -764,7 +1223,8 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate QSpaceUNet on test subjects")
-    parser.add_argument("--checkpoint", required=True, help="Path to model checkpoint")
+    parser.add_argument("--checkpoint", default=cfg.EVAL_DEFAULT_CHECKPOINT,
+                        help="Path to model checkpoint")
     parser.add_argument("--zarr_path", default="dataset/default_dataset.zarr")
     parser.add_argument("--out_dir", default="research/results")
     parser.add_argument("--subjects", nargs="*", default=None,
@@ -772,12 +1232,103 @@ if __name__ == "__main__":
     parser.add_argument("--eval_all", action="store_true",
                         help="Evaluate all subjects in the zarr store")
     parser.add_argument("--b0_threshold", type=float, default=cfg.B0_THRESHOLD)
+    parser.add_argument("--eval_repeats", "--eval-repeats", type=int, default=cfg.EVAL_REPEATS,
+                        help="Number of independent degraded inputs to evaluate per subject")
+    parser.add_argument("--eval_seed", "--eval-seed", type=int, default=cfg.EVAL_DEGRADE_SEED,
+                        help="Base seed for repeat degradation sampling")
+    parser.add_argument("--eval_keep_fraction_min", "--eval-keep-fraction-min", type=float,
+                        default=cfg.EVAL_KEEP_FRACTION_MIN,
+                        help="Minimum central k-space keep fraction sampled during evaluation")
+    parser.add_argument("--eval_keep_fraction_max", "--eval-keep-fraction-max", type=float,
+                        default=cfg.EVAL_KEEP_FRACTION_MAX,
+                        help="Maximum central k-space keep fraction sampled during evaluation")
+    parser.add_argument("--eval_noise_min", "--eval-noise-min", type=float,
+                        default=cfg.EVAL_NOISE_MIN,
+                        help="Minimum relative Gaussian noise level sampled during evaluation")
+    parser.add_argument("--eval_noise_max", "--eval-noise-max", type=float,
+                        default=cfg.EVAL_NOISE_MAX,
+                        help="Maximum relative Gaussian noise level sampled during evaluation")
     parser.add_argument("--skip_plot", action="store_true",
                         help="Disable saving plots")
     parser.add_argument("--skip_baselines", action="store_true",
                         help="Skip running Patch2Self and MP-PCA baselines")
+    p2s_group = parser.add_mutually_exclusive_group()
+    p2s_group.add_argument("--patch2self", "--run_patch2self", dest="patch2self",
+                           action="store_true", default=True,
+                           help="Enable the Patch2Self baseline (default)")
+    p2s_group.add_argument("--no-patch2self", "--skip_patch2self", dest="patch2self",
+                           action="store_false",
+                           help="Disable the Patch2Self baseline")
+    parser.add_argument("--p2s_model", "--p2s-model", choices=["ols", "ridge", "lasso"],
+                        default=cfg.P2S_MODEL,
+                        help="Patch2Self regression model")
+    parser.add_argument("--p2s_alpha", "--p2s-alpha", type=float, default=cfg.P2S_ALPHA,
+                        help="Patch2Self regularization alpha for ridge/lasso")
+    parser.add_argument("--p2s_dti_fit_method", "--p2s-dti-fit-method",
+                        choices=["WLS", "OLS", "NLLS"], default=cfg.DTI_FIT_METHOD,
+                        help="DTI fit method used after Patch2Self denoising")
+    p2s_shift_group = parser.add_mutually_exclusive_group()
+    p2s_shift_group.add_argument("--p2s_shift_intensity", "--p2s-shift-intensity",
+                                 dest="p2s_shift_intensity", action="store_true",
+                                 default=cfg.P2S_SHIFT_INTENSITY,
+                                 help="Enable Patch2Self intensity shifting")
+    p2s_shift_group.add_argument("--p2s_no_shift_intensity", "--p2s-no-shift-intensity",
+                                 dest="p2s_shift_intensity", action="store_false",
+                                 help="Disable Patch2Self intensity shifting")
+    p2s_clip_group = parser.add_mutually_exclusive_group()
+    p2s_clip_group.add_argument("--p2s_clip_negative", "--p2s-clip-negative",
+                                dest="p2s_clip_negative", action="store_true",
+                                default=cfg.P2S_CLIP_NEGATIVE,
+                                help="Enable Patch2Self negative-value clipping")
+    p2s_clip_group.add_argument("--p2s_no_clip_negative", "--p2s-no-clip-negative",
+                                dest="p2s_clip_negative", action="store_false",
+                                help="Disable Patch2Self negative-value clipping")
+    p2s_b0_group = parser.add_mutually_exclusive_group()
+    p2s_b0_group.add_argument("--p2s_b0_denoising", "--p2s-b0-denoising",
+                              dest="p2s_b0_denoising", action="store_true",
+                              default=cfg.P2S_B0_DENOISING,
+                              help="Enable Patch2Self b0 denoising")
+    p2s_b0_group.add_argument("--p2s_no_b0_denoising", "--p2s-no-b0-denoising",
+                              dest="p2s_b0_denoising", action="store_false",
+                              help="Disable Patch2Self b0 denoising")
+    parser.add_argument("--sweep_patch2self", "--sweep-patch2self",
+                        action="store_true",
+                        help="Run a validation Patch2Self hyperparameter sweep and exit")
+    parser.add_argument("--p2s_sweep_metric", "--p2s-sweep-metric",
+                        choices=["tensor_rmse", "fa_rmse", "fa_mae", "fa_nrmse", "fa_r2",
+                                 "adc_rmse", "adc_mae", "adc_nrmse", "adc_r2"],
+                        default="fa_rmse",
+                        help="Metric used to rank Patch2Self sweep configs")
+    parser.add_argument("--p2s_sweep_models", "--p2s-sweep-models",
+                        nargs="+", choices=["ols", "ridge", "lasso"],
+                        default=["ols", "ridge"],
+                        help="Patch2Self models to include in the sweep")
+    parser.add_argument("--p2s_sweep_alphas", "--p2s-sweep-alphas",
+                        nargs="+", type=float, default=[0.01, 0.1, 1.0],
+                        help="Alpha values to sweep for ridge/lasso")
+    parser.add_argument("--p2s_sweep_b0_denoising", "--p2s-sweep-b0-denoising",
+                        nargs="+", type=str.lower, choices=["true", "false"],
+                        default=["false", "true"],
+                        help="Patch2Self b0_denoising values to sweep")
+    parser.add_argument("--p2s_sweep_clip_negative", "--p2s-sweep-clip-negative",
+                        nargs="+", type=str.lower, choices=["true", "false"],
+                        default=["true"],
+                        help="Patch2Self clip_negative values to sweep")
+    parser.add_argument("--p2s_sweep_shift_intensity", "--p2s-sweep-shift-intensity",
+                        nargs="+", type=str.lower, choices=["true", "false"],
+                        default=["true"],
+                        help="Patch2Self shift_intensity values to sweep")
+    mppca_group = parser.add_mutually_exclusive_group()
+    mppca_group.add_argument("--mppca", "--mp-pca", "--run_mppca", "--run_mp_pca",
+                             dest="mppca", action="store_true", default=True,
+                             help="Enable the MP-PCA baseline (default)")
+    mppca_group.add_argument("--no-mppca", "--no-mp-pca", "--skip_mppca", "--skip_mp_pca",
+                             dest="mppca", action="store_false",
+                             help="Disable the MP-PCA baseline")
     parser.add_argument("--plot_subject", default=None,
-                        help="Subject key to visualize (default: first evaluated subject)")
+                        help="Subject key to visualize (default: all evaluated subjects)")
+    parser.add_argument("--plot_repeat", "--plot-repeat", type=int, default=0,
+                        help="Repeat index to visualize when eval_repeats > 1")
     parser.add_argument("--plot_slice_idx", type=int, default=None,
                         help="Axial slice index for visualization (default: auto)")
     parser.add_argument("--plot_volume_idx", type=int, default=None,

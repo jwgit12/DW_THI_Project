@@ -1,4 +1,17 @@
 #!/usr/bin/env python3
+"""Build the clean Zarr dataset.
+
+Only clean arrays (``target_dwi``, ``target_dti_6d``, ``bvals``, ``bvecs``)
+are written. Noise and k-space cutouts are applied on the fly by
+``DWISliceDataset`` at training time, so every epoch sees a different
+degradation for the same underlying slice. For evaluation, the same
+helpers in ``research/augment.py`` produce a reproducible degraded volume
+from the stored clean DWI.
+
+The QC plot still shows a representative noisy example alongside the
+clean target, produced on the fly with the midpoint of the default
+training ranges.
+"""
 import argparse
 from collections import defaultdict
 import json
@@ -12,18 +25,20 @@ import zarr
 from tqdm import tqdm
 
 import config
-from functions import compute_dti, find_dwi_datasets, load_dwi_dataset, lowres_noise, show_kspace, tensor_to_6d
+from functions import compute_dti, find_dwi_datasets, load_dwi_dataset, show_kspace, tensor_to_6d
+from research.augment import degrade_dwi_volume
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build a Zarr pretext dataset from DWI NIfTI files.")
+    parser = argparse.ArgumentParser(description="Build a clean Zarr pretext dataset from DWI NIfTI files.")
     parser.add_argument("--data_dir", type=str, required=True, help="Directory containing *_dwi.nii.gz + .bval/.bvec files")
     parser.add_argument("--output", type=str, required=True, help="Output Zarr path (e.g. dataset/pretext_dataset.zarr)")
-    parser.add_argument("--keep_fraction", type=float, default=config.KEEP_FRACTION, help="Central k-space keep fraction for low-res degradation")
-    parser.add_argument("--noise_min", type=float, default=config.NOISE_MIN, help="Minimum relative Gaussian noise level")
-    parser.add_argument("--noise_max", type=float, default=config.NOISE_MAX, help="Maximum relative Gaussian noise level")
     parser.add_argument("--plot_subjects", type=int, default=3, help="Number of first subjects to export QC plots for")
     parser.add_argument("--plot_dir", type=str, default="dataset/pretext_dataset_qc", help="Directory to store QC plot PNGs")
+    parser.add_argument("--plot_keep_fraction", type=float, default=config.EVAL_KEEP_FRACTION,
+                        help="k-space keep fraction used for the QC plot (not stored in Zarr)")
+    parser.add_argument("--plot_noise_level", type=float, default=config.EVAL_NOISE_LEVEL,
+                        help="Relative noise level used for the QC plot (not stored in Zarr)")
     parser.add_argument("--max_subjects", type=int, default=None, help="Optional cap for quick test runs")
     return parser.parse_args()
 
@@ -50,8 +65,7 @@ def save_qc_plot(
     bvals: np.ndarray,
     output_dir: Path,
     keep_fraction: float,
-    noise_min: float,
-    noise_max: float,
+    noise_level: float,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -81,7 +95,7 @@ def save_qc_plot(
     axes[0, 1].axis("off")
 
     axes[0, 2].imshow(np.rot90(degraded_slice, 1), cmap="gray")
-    axes[0, 2].set_title("Low-res + Noisy")
+    axes[0, 2].set_title(f"On-the-fly example (kf={keep_fraction}, n={noise_level})")
     axes[0, 2].axis("off")
 
     diff = np.rot90(clean_slice - degraded_slice, 1)
@@ -95,7 +109,7 @@ def save_qc_plot(
     axes[1, 1].axis("off")
 
     axes[1, 2].imshow(degraded_kspace, cmap="gray")
-    axes[1, 2].set_title("Low-res + Noisy k-space")
+    axes[1, 2].set_title("Degraded k-space")
     axes[1, 2].axis("off")
 
     k_im = axes[2, 0].imshow(diff_kspace, cmap="gray")
@@ -116,8 +130,10 @@ def save_qc_plot(
             f"subject: {subject_id}\n"
             f"shape: {clean_dwi.shape}\n"
             f"slice z={z}, volume b={b}\n"
-            f"keep_fraction={keep_fraction}\n"
-            f"noise=[{noise_min}, {noise_max}]\n"
+            f"preview keep_fraction={keep_fraction}\n"
+            f"preview noise_level={noise_level}\n"
+            f"(training uses stochastic kf ∈ [{config.KEEP_FRACTION_MIN}, {config.KEEP_FRACTION_MAX}]\n"
+            f"                    n ∈ [{config.NOISE_MIN}, {config.NOISE_MAX}])\n"
         ),
         va="top",
         fontsize=10,
@@ -130,23 +146,20 @@ def save_qc_plot(
 
 
 def validate_store(store: zarr.Group) -> None:
-    required_keys = {"input_dwi", "target_dwi", "target_dti_6d", "bvals", "bvecs"}
+    required_keys = {"target_dwi", "target_dti_6d", "bvals", "bvecs"}
     for subject_id in sorted(store.group_keys()):
         group = store[subject_id]
         missing = required_keys.difference(set(group.array_keys()))
         if missing:
             raise ValueError(f"{subject_id} missing arrays: {sorted(missing)}")
 
-        input_shape = group["input_dwi"].shape
         target_shape = group["target_dwi"].shape
         tensor_arr = group["target_dti_6d"]
         tensor_shape = tensor_arr.shape
 
-        if input_shape != target_shape:
-            raise ValueError(f"{subject_id} input/target shape mismatch: {input_shape} vs {target_shape}")
         if tensor_arr.ndim != 4:
             raise ValueError(f"{subject_id} invalid target_dti_6d shape: {tensor_shape}")
-        if tensor_shape[:3] != input_shape[:3] or tensor_shape[-1:] != (6,):
+        if tensor_shape[:3] != target_shape[:3] or tensor_shape[-1:] != (6,):
             raise ValueError(f"{subject_id} invalid target_dti_6d shape: {tensor_shape}")
 
         for key in required_keys:
@@ -186,25 +199,18 @@ def main() -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     store = zarr.open_group(str(output_path), mode="w")
-    store.attrs["format_version"] = 1
+    store.attrs["format_version"] = 2
     store.attrs["source_data_dir"] = str(Path(args.data_dir).resolve())
-    store.attrs["degradation"] = {
-        "keep_fraction": args.keep_fraction,
-        "noise_min": args.noise_min,
-        "noise_max": args.noise_max,
+    store.attrs["degradation"] = "on_the_fly"
+    store.attrs["degradation_ranges"] = {
+        "keep_fraction": [config.KEEP_FRACTION_MIN, config.KEEP_FRACTION_MAX],
+        "noise_level": [config.NOISE_MIN, config.NOISE_MAX],
     }
 
     print(f"Found {len(entries)} subject entries")
     for idx, entry in enumerate(tqdm(entries, desc="Building Zarr dataset")):
         sample = load_dwi_dataset(entry)
         clean_dwi = sample["data"].astype(np.float32)
-
-        degraded_dwi = lowres_noise(
-            clean_dwi,
-            keep_fraction=args.keep_fraction,
-            noise_min=args.noise_min,
-            noise_max=args.noise_max,
-        ).astype(np.float32)
 
         tensor_clean_6d = tensor_to_6d(compute_dti(clean_dwi, sample["gtab"])).astype(np.float32)
 
@@ -215,22 +221,26 @@ def main() -> None:
         group.attrs["original_session"] = entry["session"]
         group.attrs["original_run"] = entry["run"]
 
-        group.create_array("input_dwi", data=degraded_dwi)
         group.create_array("target_dwi", data=clean_dwi)
         group.create_array("target_dti_6d", data=tensor_clean_6d)
         group.create_array("bvals", data=sample["bvals"].astype(np.float32))
         group.create_array("bvecs", data=sample["bvecs"].astype(np.float32))
 
         if idx < args.plot_subjects:
+            degraded_preview = degrade_dwi_volume(
+                clean_dwi,
+                keep_fraction=args.plot_keep_fraction,
+                rel_noise_level=args.plot_noise_level,
+                seed=config.EVAL_DEGRADE_SEED,
+            )
             save_qc_plot(
                 subject_id=subject_id,
                 clean_dwi=clean_dwi,
-                degraded_dwi=degraded_dwi,
+                degraded_dwi=degraded_preview,
                 bvals=sample["bvals"],
                 output_dir=Path(args.plot_dir),
-                keep_fraction=args.keep_fraction,
-                noise_min=args.noise_min,
-                noise_max=args.noise_max,
+                keep_fraction=args.plot_keep_fraction,
+                noise_level=args.plot_noise_level,
             )
 
     validate_store(store)

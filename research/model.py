@@ -41,24 +41,35 @@ def cholesky_to_tensor6(chol6: torch.Tensor) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 class QSpaceEncoder(nn.Module):
-    """Compress N DWI volumes into C feature channels.
+    """Permutation-invariant q-space encoder.
 
-    1×1 conv collapses the diffusion dimension; a small MLP embeds the
-    gradient table (bvals/bvecs) into FiLM parameters (scale + shift)
-    that modulate the spatial features.
+    Each diffusion-weighted volume is aggregated into ``feat_dim`` feature
+    channels via a learned, gradient-conditioned weighted sum — output is
+    independent of volume ordering and of ``max_n`` padding:
+
+        features[b, f, h, w] = sum_n signal[b, n, h, w] * e[b, n, f]
+
+    where ``e = MLP(bval, bvec)`` is a per-volume embedding. A post 3x3
+    conv block mixes features spatially.
     """
 
-    def __init__(self, max_n: int, feat_dim: int = 64):
+    def __init__(self, feat_dim: int = 64, grad_hidden: int = 128):
         super().__init__()
-        self.signal_conv = nn.Sequential(
-            nn.Conv2d(max_n, feat_dim, 1, bias=False),
-            nn.GroupNorm(8, feat_dim),
-            nn.LeakyReLU(0.1, inplace=True),
-        )
+        self.feat_dim = feat_dim
         self.grad_mlp = nn.Sequential(
-            nn.Linear(4, feat_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(feat_dim, feat_dim * 2),
+            nn.Linear(4, grad_hidden),
+            nn.SiLU(inplace=True),
+            nn.Linear(grad_hidden, grad_hidden),
+            nn.SiLU(inplace=True),
+            nn.Linear(grad_hidden, feat_dim),
+        )
+        self.post = nn.Sequential(
+            nn.Conv2d(feat_dim, feat_dim, 3, padding=1, bias=False),
+            nn.GroupNorm(8, feat_dim),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(feat_dim, feat_dim, 3, padding=1, bias=False),
+            nn.GroupNorm(8, feat_dim),
+            nn.SiLU(inplace=True),
         )
 
     def forward(
@@ -68,20 +79,22 @@ class QSpaceEncoder(nn.Module):
         bvecs: torch.Tensor,
         vol_mask: torch.Tensor,
     ) -> torch.Tensor:
-        x = self.signal_conv(signal)  # (B, F, H, W)
-
+        # signal: (B, N, H, W), bvals: (B, N), bvecs: (B, 3, N), vol_mask: (B, N)
         grad_info = torch.cat(
             [bvals.unsqueeze(-1), bvecs.permute(0, 2, 1)], dim=-1
         )  # (B, N, 4)
-        grad_feat = self.grad_mlp(grad_info)  # (B, N, 2F)
+        e = self.grad_mlp(grad_info)  # (B, N, F)
+        e = e * vol_mask.unsqueeze(-1)  # zero padded / dropped volumes
 
-        m = vol_mask.unsqueeze(-1)
-        grad_feat = (grad_feat * m).sum(dim=1) / m.sum(dim=1).clamp(min=1)  # (B, 2F)
-        gamma, beta = grad_feat.chunk(2, dim=-1)
-        gamma = gamma.unsqueeze(-1).unsqueeze(-1)
-        beta = beta.unsqueeze(-1).unsqueeze(-1)
+        # Permutation-invariant aggregation across the N diffusion axis.
+        features = torch.einsum("bnhw,bnf->bfhw", signal, e)
 
-        return x * (1 + gamma) + beta
+        # Normalize by effective number of valid volumes to decouple feature
+        # magnitude from N (subjects have varying numbers of volumes).
+        n_eff = vol_mask.sum(dim=1).clamp(min=1.0).view(-1, 1, 1, 1)
+        features = features / n_eff
+
+        return self.post(features)
 
 
 # ---------------------------------------------------------------------------
@@ -94,11 +107,11 @@ class ConvBlock(nn.Module):
         self.block = nn.Sequential(
             nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
             nn.GroupNorm(8, out_ch),
-            nn.LeakyReLU(0.1, inplace=True),
+            nn.SiLU(inplace=True),
             nn.Dropout2d(dropout) if dropout > 0 else nn.Identity(),
             nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
             nn.GroupNorm(8, out_ch),
-            nn.LeakyReLU(0.1, inplace=True),
+            nn.SiLU(inplace=True),
             nn.Dropout2d(dropout) if dropout > 0 else nn.Identity(),
         )
 
@@ -189,9 +202,12 @@ class QSpaceUNet(nn.Module):
         dropout: float = cfg.DROPOUT,
     ):
         super().__init__()
+        # ``max_n`` is kept in the signature for checkpoint metadata and so
+        # the dataset/evaluator can continue to pad to a shared length. The
+        # encoder itself is now permutation-invariant and does not need it.
         self.max_n = max_n
         self.cholesky = cholesky
-        self.q_encoder = QSpaceEncoder(max_n, feat_dim)
+        self.q_encoder = QSpaceEncoder(feat_dim=feat_dim)
         self.unet = UNet2D(feat_dim, out_ch=6, channels=channels, dropout=dropout)
 
     def forward(

@@ -148,10 +148,11 @@ Training outputs in `--out_dir`:
 
 ```bash
 python3 -m research.evaluate \
-  --checkpoint research/runs/run_01/best_model.pt \
   --zarr_path dataset/default_dataset.zarr \
   --out_dir research/results
 ```
+
+The default checkpoint is `research/runs/run_new_data_2_aug/best_model.pt`.
 
 Subject selection:
 - Default: checkpoint `test_subjects`; falls back to all Zarr groups if the checkpoint has no test split metadata.
@@ -160,18 +161,50 @@ Subject selection:
 - `--eval_all` evaluates every group in the Zarr store.
 
 Evaluation controls:
+- `--eval_repeats 3` controls how many independent corruptions are sampled per subject.
+- `--eval_keep_fraction_min 0.5 --eval_keep_fraction_max 0.7` controls the sampled central k-space mask size.
+- `--eval_noise_min 0.01 --eval_noise_max 0.10` controls the sampled relative Gaussian noise range.
+- `--eval_seed 1234` controls reproducible repeat sampling.
 - `--skip_baselines` runs only QSpaceUNet.
+- `--skip_patch2self` / `--patch2self` disable or enable only Patch2Self.
+- `--skip_mppca` / `--mppca` disable or enable only MP-PCA.
+- `--p2s_model ridge --p2s_alpha 0.1` overrides Patch2Self model parameters.
+- `--p2s_b0_denoising` / `--p2s_no_b0_denoising` toggles b0 denoising for Patch2Self.
+- `--p2s_clip_negative` / `--p2s_no_clip_negative` toggles Patch2Self negative clipping.
+- `--p2s_shift_intensity` / `--p2s_no_shift_intensity` toggles Patch2Self intensity shifting.
+- `--sweep_patch2self` runs a validation-subject Patch2Self sweep and exits.
 - `--skip_plot` disables PNG plot generation.
 - `--b0_threshold 50` overrides the b0/DWI split threshold.
+- `--plot_repeat 0` selects which repeat is visualized when multiple repeats are used.
 - `--plot_slice_idx` and `--plot_volume_idx` force the axial slice and DWI volume used for saved plots; otherwise they are selected automatically.
 
+Patch2Self validation sweep:
+
+```bash
+python3 -m research.evaluate \
+  --sweep_patch2self \
+  --eval_repeats 3 \
+  --out_dir research/results/p2s_sweep
+```
+
+The sweep defaults to validation subjects from `config.py` unless `--subjects` is supplied. It writes `patch2self_sweep.csv` and `patch2self_sweep_summary.csv`; use the best row from the summary for a final test evaluation, for example:
+
+```bash
+python3 -m research.evaluate \
+  --p2s_model ridge \
+  --p2s_alpha 0.1 \
+  --p2s_no_b0_denoising \
+  --p2s_clip_negative
+```
+
 Evaluation outputs in `--out_dir`:
-- `metrics_research.csv`
-- `metrics_per_subject.csv` for backward-compatible research-model results
+- `metrics_research.csv` with one row per subject/repeat plus mean/std rows
+- `metrics_per_subject.csv` for backward-compatible research-model results with the same repeat rows
 - `metrics_patch2self.csv` and `metrics_mppca.csv` when baselines are enabled
-- `comparison_metrics.csv`, `comparison_per_subject.csv`, and `comparison_metrics.png` when all methods are available
-- `prediction_example_<subject>.png` for each evaluated subject unless `--skip_plot` is used
-- `comparison_<subject>.png` for each evaluated subject when baselines and plots are enabled
+- `comparison_metrics.csv`, `comparison_per_subject.csv`, and `comparison_metrics.png` when any baseline is enabled
+- `patch2self_sweep.csv` and `patch2self_sweep_summary.csv` when `--sweep_patch2self` is used
+- `prediction_example_<subject>_repeat-00.png` for the selected plot repeat unless `--skip_plot` is used
+- `comparison_<subject>_repeat-00.png` when any baseline and plots are enabled
 
 ## Shared configuration
 

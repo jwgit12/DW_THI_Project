@@ -279,14 +279,28 @@ def main(args):
 
     # ── Datasets & loaders ────────────────────────────────────────────────────
     use_brain_mask = not args.no_brain_mask
-    train_ds = DWISliceDataset(args.zarr_path, train_subjects, augment=True, use_brain_mask=use_brain_mask)
-    val_ds = DWISliceDataset(args.zarr_path, val_subjects, augment=False, use_brain_mask=use_brain_mask)
+    train_ds = DWISliceDataset(
+        args.zarr_path, train_subjects,
+        augment=True,
+        use_brain_mask=use_brain_mask,
+        random_axis=cfg.RANDOM_SLICE_AXIS,
+        slice_axes=cfg.SLICE_AXES,
+    )
+    # Validation uses axial-only slicing + deterministic degradation so the
+    # reported val loss is comparable across epochs.
+    val_ds = DWISliceDataset(
+        args.zarr_path, val_subjects,
+        augment=False,
+        use_brain_mask=use_brain_mask,
+        random_axis=False,
+        eval_mode=True,
+    )
 
     # Derive all normalisation constants from training data only to prevent
     # information leakage from val/test into training.
     # max_n must accommodate the largest subject across all splits (structural
-    # padding requirement), but max_bval and dti_scale are true normalisation
-    # scales and must come from training data exclusively.
+    # padding requirement), but max_bval, dti_scale and canonical_hw are true
+    # normalisation scales and must come from training data exclusively.
     global_max_n = max(train_ds.max_n, val_ds.max_n)
     train_ds.max_n = global_max_n
     val_ds.max_n = global_max_n
@@ -294,6 +308,12 @@ def main(args):
     # Keep explicit local names for logging and checkpoint metadata.
     global_max_bval = train_ds.max_bval
     global_dti_scale = train_ds.dti_scale
+    canonical_hw = (
+        max(train_ds.canonical_hw[0], val_ds.canonical_hw[0]),
+        max(train_ds.canonical_hw[1], val_ds.canonical_hw[1]),
+    )
+    train_ds.canonical_hw = canonical_hw
+    val_ds.canonical_hw = canonical_hw
 
     val_ds.max_bval = global_max_bval
     val_ds.dti_scale = global_dti_scale
@@ -335,7 +355,8 @@ def main(args):
         "channels": list(args.channels), "cholesky": args.cholesky,
         "batch_size": args.batch_size,
         "lr": args.lr, "weight_decay": args.weight_decay,
-        "lambda_scalar": args.lambda_scalar, "patience": args.patience,
+        "lambda_scalar": args.lambda_scalar, "lambda_edge": args.lambda_edge,
+        "warmup_epochs": args.warmup_epochs, "patience": args.patience,
         "use_brain_mask": use_brain_mask,
         "n_params": n_params,
         "train_subjects": train_subjects, "val_subjects": val_subjects,
@@ -343,9 +364,35 @@ def main(args):
     }, indent=2))
 
     # ── Optimiser & scheduler ─────────────────────────────────────────────────
-    criterion = DTILoss(lambda_scalar=args.lambda_scalar).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.lr * 0.01)
+    criterion = DTILoss(
+        lambda_scalar=args.lambda_scalar,
+        lambda_edge=args.lambda_edge,
+    ).to(device)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=args.lr, weight_decay=args.weight_decay,
+        betas=(0.9, 0.99),
+    )
+
+    # Linear warmup -> cosine annealing. Warmup stabilises early epochs when
+    # the encoder embeddings are still random and gradients can spike.
+    warmup_epochs = min(args.warmup_epochs, max(args.epochs - 1, 1))
+    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=max(args.epochs - warmup_epochs, 1),
+        eta_min=args.lr * 0.01,
+    )
+    if warmup_epochs > 0:
+        warmup = torch.optim.lr_scheduler.LinearLR(
+            optimizer,
+            start_factor=1e-3,
+            end_factor=1.0,
+            total_iters=warmup_epochs,
+        )
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer, schedulers=[warmup, cosine], milestones=[warmup_epochs],
+        )
+    else:
+        scheduler = cosine
 
     # ── Pick a fixed validation slice for visualisation ───────────────────────
     vis_slice_idx = -1
@@ -502,12 +549,17 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=cfg.LEARNING_RATE)
     parser.add_argument("--weight_decay", type=float, default=cfg.WEIGHT_DECAY)
     parser.add_argument("--lambda_scalar", type=float, default=cfg.LAMBDA_SCALAR,
-                        help="Weight for FA/MD auxiliary loss (0 = tensor MSE only)")
+                        help="Weight for FA/MD auxiliary loss (0 = tensor term only)")
+    parser.add_argument("--lambda_edge", type=float, default=cfg.LAMBDA_EDGE,
+                        help="Weight for FA spatial-gradient (edge) loss (0 disables)")
+    parser.add_argument("--warmup_epochs", type=int, default=cfg.WARMUP_EPOCHS,
+                        help="Linear LR warmup length before cosine annealing")
     parser.add_argument("--patience", type=int, default=cfg.PATIENCE)
-    parser.add_argument("--vis_every", type=int, default=10,
+    parser.add_argument("--vis_every", type=int, default=1,
                         help="Generate validation visualisation every N epochs (default: 10)")
-    parser.add_argument("--num_workers", type=int, default=0,
-                        help="DataLoader worker processes (0=main process; data is pre-loaded into RAM)")
+    parser.add_argument("--num_workers", type=int, default=4,
+                        help="DataLoader worker processes (>=1 recommended so on-the-fly "
+                             "FFT+noise runs parallel to model compute)")
     parser.add_argument("--no_brain_mask", action="store_true",
                         help="Train and validate losses over the full image instead of brain-mask voxels only")
 

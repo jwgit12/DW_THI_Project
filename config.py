@@ -5,11 +5,36 @@ the same constants.  CLI argument defaults should reference these too.
 """
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Data preparation (build_pretext_dataset.py, functions.py)
+# Degradation — applied on-the-fly in the training DataLoader so every epoch
+# sees different noise and k-space cutouts for the same clean slice. The
+# dataset build stores only the clean DWI; there is no pre-degraded array.
 # ─────────────────────────────────────────────────────────────────────────────
-KEEP_FRACTION = 0.6          # central k-space fraction kept during low-res degradation
-NOISE_MIN = 0.01             # minimum relative Gaussian noise level
-NOISE_MAX = 0.10             # maximum relative Gaussian noise level
+NOISE_MIN = 0.01              # minimum relative Gaussian noise level
+NOISE_MAX = 0.10              # maximum relative Gaussian noise level
+KEEP_FRACTION_MIN = 0.5       # min central k-space fraction kept
+KEEP_FRACTION_MAX = 0.7       # max central k-space fraction kept
+
+# Deterministic single-value defaults used at eval time (and as a back-compat
+# scalar when callers expect the legacy ``KEEP_FRACTION`` / Zarr attrs).
+KEEP_FRACTION = 0.6           # midpoint of training range
+EVAL_KEEP_FRACTION = 0.6
+EVAL_NOISE_LEVEL = 0.055      # midpoint of training range
+EVAL_REPEATS = 3              # number of independent corruptions per subject
+EVAL_KEEP_FRACTION_MIN = KEEP_FRACTION_MIN
+EVAL_KEEP_FRACTION_MAX = KEEP_FRACTION_MAX
+EVAL_NOISE_MIN = NOISE_MIN
+EVAL_NOISE_MAX = NOISE_MAX
+EVAL_DEGRADE_SEED = 1234      # fixed seed so evaluation is reproducible
+EVAL_DEFAULT_CHECKPOINT = "research/runs/run_new_data_2_aug/best_model.pt"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Training-time augmentation
+# ─────────────────────────────────────────────────────────────────────────────
+RANDOM_SLICE_AXIS = True      # randomly slice along X (sagittal), Y (coronal), or Z (axial)
+SLICE_AXES = (0, 1, 2)        # axes to sample from when RANDOM_SLICE_AXIS is True
+AUG_FLIP = True               # random physical-mirror flips: signal + tensor + bvecs transform together
+AUG_INTENSITY = 0.1           # uniform multiplicative jitter on the input (0 disables)
+AUG_VOLUME_DROPOUT = 0.1      # per-volume dropout probability on the input (0 disables)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DWI / DTI shared constants
@@ -21,16 +46,17 @@ MAX_DIFFUSIVITY = 0.01       # mm²/s, eigenvalue cap for physically plausible D
 # ─────────────────────────────────────────────────────────────────────────────
 # Subject split (biological subject IDs — all sessions stay together)
 # ─────────────────────────────────────────────────────────────────────────────
-TEST_SUBJECTS = ["sub-012", "sub-031"]
-VAL_SUBJECTS = ["sub-014", "sub-035"]
+TEST_SUBJECTS = ["sub-03", "sub-04"]
+VAL_SUBJECTS = ["sub-05", "sub-11"]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Model architecture
 # ─────────────────────────────────────────────────────────────────────────────
-FEAT_DIM = 128                # q-space encoder feature dimension
-UNET_CHANNELS = [32, 64, 128, 256]
+FEAT_DIM = 64                # q-space encoder feature dimension (matches channels[0])
+UNET_CHANNELS = [64, 128, 256, 512]  # 4 encoder levels; factor=16 fits (132, 130) easily
 DROPOUT = 0.1                # spatial dropout rate in U-Net conv blocks
 LAMBDA_SCALAR = 0.3          # weight for FA/MD auxiliary loss
+LAMBDA_EDGE = 0.1            # weight for FA spatial-gradient (edge) loss
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Training
@@ -41,6 +67,7 @@ LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 1e-4
 PATIENCE = 25                # early stopping patience (epochs)
 GRAD_CLIP = 1.0              # gradient norm clipping value
+WARMUP_EPOCHS = 5            # linear LR warmup before cosine annealing
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Patch2Self baseline

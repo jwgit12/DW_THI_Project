@@ -8,6 +8,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import sys
 import threading
 from pathlib import Path
@@ -16,8 +17,6 @@ import matplotlib
 import numpy as np
 import torch
 import zarr
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
-from matplotlib.figure import Figure
 from matplotlib import colormaps
 from PyQt6.QtCore import Qt, QRunnable, QThreadPool, pyqtSignal, QObject, pyqtSlot
 from PyQt6.QtGui import QImage, QPixmap
@@ -47,7 +46,47 @@ from functions import (
     compute_fa_from_tensor6,
     compute_md_from_tensor6,
 )
+from research.augment import degrade_dwi_slice
 from research.model import QSpaceUNet
+from research.utils import fit_dti_to_6d, sanitize_dti6d
+
+
+DEGRADE_SLIDER_STEPS = 1000
+
+
+def slider_to_float(value: int, low: float, high: float) -> float:
+    if high <= low:
+        return float(low)
+    return float(low + (high - low) * (value / DEGRADE_SLIDER_STEPS))
+
+
+def float_to_slider(value: float, low: float, high: float) -> int:
+    if high <= low:
+        return 0
+    clipped = min(max(float(value), low), high)
+    return int(round(DEGRADE_SLIDER_STEPS * (clipped - low) / (high - low)))
+
+
+def stable_degrade_seed(
+    subject: str,
+    plane: str,
+    slice_idx: int,
+    keep_slider_value: int,
+    noise_slider_value: int,
+) -> int:
+    payload = (
+        f"{cfg.EVAL_DEGRADE_SEED}|{subject}|{plane}|{slice_idx}|"
+        f"{keep_slider_value}|{noise_slider_value}"
+    )
+    digest = hashlib.blake2s(payload.encode("utf-8"), digest_size=4).digest()
+    return int.from_bytes(digest, byteorder="little", signed=False)
+
+
+def _group_shape(group) -> tuple[int, ...]:
+    """Return the `(X, Y, Z, N)` shape of a subject group without requiring
+    ``input_dwi`` to exist."""
+    key = "input_dwi" if "input_dwi" in group.array_keys() else "target_dwi"
+    return tuple(group[key].shape)
 
 matplotlib.rcParams["font.family"] = "DejaVu Sans"
 
@@ -59,12 +98,12 @@ PLANE_TO_AXIS = {
 }
 
 ROW_GROUPS: dict[str, tuple[str, ...]] = {
-    "dwi": ("Input DWI", "Target DWI", "Absolute Difference"),
+    "noisy": ("Noisy FA", "Noisy MD", "Noisy Color FA"),
     "dti": ("FA Map", "MD Map", "Color FA"),
     "pred": ("Predicted FA", "Predicted MD", "Predicted Color FA"),
 }
 ROW_LABELS: dict[str, str] = {
-    "dwi": "DWI Volumes",
+    "noisy": "Noisy Input DTI Fit",
     "dti": "DTI Maps (ground truth)",
     "pred": "NN Predictions",
 }
@@ -139,10 +178,6 @@ def format_float(value: float) -> str:
     return f"{value:.4f}"
 
 
-def shell_name(bval: float, b0_threshold: float = 50.0) -> str:
-    return "b0" if bval < b0_threshold else f"b={int(round(float(bval)))}"
-
-
 def summarize_shells(bvals: np.ndarray) -> str:
     rounded = np.rint(np.asarray(bvals, dtype=np.float32)).astype(int)
     values, counts = np.unique(rounded, return_counts=True)
@@ -153,7 +188,7 @@ def rotate_for_display(arr: np.ndarray) -> np.ndarray:
     return np.rot90(arr, 1)
 
 
-def make_pixmap(arr: np.ndarray, cmap: str = "gray", symmetric: bool = False, width: int = 280) -> QPixmap:
+def make_pixmap(arr: np.ndarray, cmap: str = "gray", symmetric: bool = False, width: int = 240) -> QPixmap:
     """Convert a 2D or HxWx3 float array to a display-ready QPixmap."""
     arr = np.asarray(arr, dtype=np.float32)
     if arr.ndim == 2:
@@ -190,12 +225,14 @@ def make_pixmap(arr: np.ndarray, cmap: str = "gray", symmetric: bool = False, wi
     return QPixmap.fromImage(image).scaledToWidth(width, Qt.TransformationMode.SmoothTransformation)
 
 
-def extract_volume_slice(array: zarr.Array, plane: str, slice_idx: int, volume_idx: int) -> np.ndarray:
+def extract_dwi_slice_nhw(array: zarr.Array, plane: str, slice_idx: int) -> np.ndarray:
     if plane == "Axial":
-        return np.asarray(array[:, :, slice_idx, volume_idx], dtype=np.float32)
-    if plane == "Coronal":
-        return np.asarray(array[:, slice_idx, :, volume_idx], dtype=np.float32)
-    return np.asarray(array[slice_idx, :, :, volume_idx], dtype=np.float32)
+        clean_hwn = np.asarray(array[:, :, slice_idx, :], dtype=np.float32)
+    elif plane == "Coronal":
+        clean_hwn = np.asarray(array[:, slice_idx, :, :], dtype=np.float32)
+    else:
+        clean_hwn = np.asarray(array[slice_idx, :, :, :], dtype=np.float32)
+    return np.ascontiguousarray(clean_hwn.transpose(2, 0, 1))
 
 
 def extract_tensor_slice(array: zarr.Array, plane: str, slice_idx: int) -> np.ndarray:
@@ -239,10 +276,12 @@ class ImagePanel(QGroupBox):
     def __init__(self, title: str):
         super().__init__(title)
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(4)
 
         self.image_label = QLabel("No data")
         self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.image_label.setMinimumSize(280, 220)
+        self.image_label.setMinimumSize(220, 145)
         self.image_label.setStyleSheet(
             "background: #111; color: #ddd; border: 1px solid #333; font-size: 12px;"
         )
@@ -252,33 +291,13 @@ class ImagePanel(QGroupBox):
         self.caption_label = QLabel("")
         self.caption_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.caption_label.setStyleSheet("color: #555; font-size: 11px;")
+        self.caption_label.setWordWrap(True)
+        self.caption_label.setMaximumHeight(34)
         layout.addWidget(self.caption_label)
 
     def set_pixmap(self, pixmap: QPixmap, caption: str) -> None:
         self.image_label.setPixmap(pixmap)
         self.caption_label.setText(caption)
-
-
-class BvalsCanvas(FigureCanvasQTAgg):
-    def __init__(self):
-        self.figure = Figure(figsize=(4.0, 2.3), tight_layout=True)
-        self.ax = self.figure.add_subplot(111)
-        super().__init__(self.figure)
-
-    def update_plot(self, bvals: np.ndarray, current_idx: int) -> None:
-        indices = np.arange(bvals.shape[0], dtype=int)
-        colors = np.where(bvals < 50, "#4C97FF", "#F4A261")
-
-        self.ax.clear()
-        self.ax.scatter(indices, bvals, c=colors, s=22, linewidths=0)
-        self.ax.axvline(current_idx, color="#C0392B", linewidth=1.5, alpha=0.95)
-        self.ax.scatter([current_idx], [float(bvals[current_idx])], c="#C0392B", s=48, zorder=3)
-        self.ax.set_title("b-values per volume")
-        self.ax.set_xlabel("Volume index")
-        self.ax.set_ylabel("b-value")
-        self.ax.grid(alpha=0.25)
-        self.ax.set_xlim(-1, max(1, len(indices)))
-        self.draw_idle()
 
 
 def dataset_summary(zarr_path: str) -> str:
@@ -290,7 +309,7 @@ def dataset_summary(zarr_path: str) -> str:
     spatial_shapes = []
     volume_counts = []
     for subject in subjects:
-        shape = tuple(store[subject]["input_dwi"].shape)
+        shape = _group_shape(store[subject])
         spatial_shapes.append(shape[:3])
         volume_counts.append(shape[3])
 
@@ -323,7 +342,8 @@ def get_device() -> torch.device:
 
 class WorkerSignals(QObject):
     metrics_ready = pyqtSignal(str, str, int, object)   # subject, plane, slice_idx, result
-    prediction_ready = pyqtSignal(str, int, object)      # subject, slice_idx, result
+    noisy_metrics_ready = pyqtSignal(object, object)    # noisy_key, result
+    prediction_ready = pyqtSignal(object, object)        # pred_key, result
 
 
 class MetricsWorker(QRunnable):
@@ -352,18 +372,56 @@ class MetricsWorker(QRunnable):
             print(f"[MetricsWorker] {exc}", file=sys.stderr)
 
 
+class NoisyMetricsWorker(QRunnable):
+    """Fits DTI from one degraded DWI slice and computes noisy FA/MD/ColorFA."""
+
+    def __init__(self, noisy_key: tuple, input_slice_nhw: np.ndarray,
+                 bvals: np.ndarray, bvecs: np.ndarray,
+                 b0_threshold: float, signals: WorkerSignals):
+        super().__init__()
+        self.noisy_key = noisy_key
+        self.input_slice_nhw = np.ascontiguousarray(input_slice_nhw, dtype=np.float32)
+        self.bvals = np.asarray(bvals, dtype=np.float32)
+        self.bvecs = np.asarray(bvecs, dtype=np.float32)
+        self.b0_threshold = b0_threshold
+        self.signals = signals
+        self.setAutoDelete(True)
+
+    def run(self) -> None:
+        try:
+            dwi_hwn = np.maximum(self.input_slice_nhw.transpose(1, 2, 0), 0.0)
+            bvecs_n3 = self.bvecs.T if self.bvecs.shape[0] == 3 else self.bvecs
+            tensor6 = fit_dti_to_6d(
+                dwi_hwn,
+                self.bvals,
+                bvecs_n3=bvecs_n3,
+                fit_method=cfg.DTI_FIT_METHOD,
+                b0_threshold=self.b0_threshold,
+            )
+            tensor6 = sanitize_dti6d(tensor6, max_eigenvalue=cfg.MAX_DIFFUSIVITY)
+            result = {
+                "fa": np.asarray(compute_fa_from_tensor6(tensor6), dtype=np.float32),
+                "md": np.asarray(compute_md_from_tensor6(tensor6), dtype=np.float32),
+                "color_fa": np.asarray(compute_color_fa_from_tensor6(tensor6), dtype=np.float32),
+            }
+            self.signals.noisy_metrics_ready.emit(self.noisy_key, result)
+        except Exception as exc:
+            print(f"[NoisyMetricsWorker] {exc}", file=sys.stderr)
+
+
 class PredictionWorker(QRunnable):
     """Runs QSpaceUNet inference for one axial slice off the main thread."""
 
-    def __init__(self, subject: str, slice_idx: int,
-                 zarr_group, bvals: np.ndarray, bvecs: np.ndarray,
+    def __init__(self, pred_key: tuple, subject: str, slice_idx: int,
+                 input_slice_nhw: np.ndarray, bvals: np.ndarray, bvecs: np.ndarray,
                  model: QSpaceUNet, device: torch.device,
                  dti_scale: float, max_bval: float, b0_threshold: float,
                  model_lock: threading.Lock, signals: WorkerSignals):
         super().__init__()
+        self.pred_key = pred_key
         self.subject = subject
         self.slice_idx = slice_idx
-        self.zarr_group = zarr_group
+        self.input_slice_nhw = np.ascontiguousarray(input_slice_nhw, dtype=np.float32)
         self.bvals = bvals
         self.bvecs = bvecs
         self.model = model
@@ -395,25 +453,20 @@ class PredictionWorker(QRunnable):
             bvecs_t = torch.from_numpy(bvecs.astype(np.float32)).unsqueeze(0).to(self.device)
             vol_mask_t = torch.from_numpy(vol_mask).unsqueeze(0).to(self.device)
 
-            signal_slice = np.asarray(
-                self.zarr_group["input_dwi"][:, :, self.slice_idx, :], dtype=np.float32
-            )
+            signal = self.input_slice_nhw
             if N < max_n:
-                signal_slice = np.pad(signal_slice, ((0, 0), (0, 0), (0, max_n - N)))
-            signal = signal_slice.transpose(2, 0, 1)  # (max_n, H, W)
+                signal = np.pad(signal, ((0, max_n - N), (0, 0), (0, 0)))
 
             b0_idx = self.bvals < self.b0_threshold
             if b0_idx.any():
-                b0_slice = np.asarray(
-                    self.zarr_group["input_dwi"][:, :, self.slice_idx, :], dtype=np.float32
-                )[..., b0_idx].mean(axis=-1)
+                b0_slice = self.input_slice_nhw[:N][b0_idx].mean(axis=0)
             else:
-                b0_slice = signal_slice[..., :N].mean(axis=-1)
+                b0_slice = self.input_slice_nhw[:N].mean(axis=0)
             b0_norm = compute_b0_norm(b0_slice)
             if b0_norm > 0:
                 signal = signal / b0_norm
 
-            signal_t = torch.from_numpy(signal).unsqueeze(0).to(self.device)
+            signal_t = torch.from_numpy(np.ascontiguousarray(signal)).unsqueeze(0).to(self.device)
 
             with self.model_lock:
                 with torch.no_grad():
@@ -425,7 +478,7 @@ class PredictionWorker(QRunnable):
                 "md": np.asarray(compute_md_from_tensor6(pred_tensor6), dtype=np.float32),
                 "color_fa": np.asarray(compute_color_fa_from_tensor6(pred_tensor6), dtype=np.float32),
             }
-            self.signals.prediction_ready.emit(self.subject, self.slice_idx, result)
+            self.signals.prediction_ready.emit(self.pred_key, result)
         except Exception as exc:
             print(f"[PredictionWorker] {exc}", file=sys.stderr)
 
@@ -458,8 +511,11 @@ class DatasetViewer(QMainWindow):
         self.current_bvecs = np.empty((3, 0), dtype=np.float32)
         self.current_brain_mask: np.ndarray | None = None
         self.brain_mask_cache: dict[str, np.ndarray] = {}
+        self.degraded_slice_cache: dict[tuple, np.ndarray] = {}
+        self.noisy_metric_cache: dict[tuple, dict] = {}
         self.slice_metric_cache: dict[tuple, dict] = {}
         self.pred_cache: dict[tuple, dict] = {}
+        self._pending_noisy_metrics: set[tuple] = set()
         self._pending_metrics: set[tuple] = set()
         self._pending_predictions: set[tuple] = set()
 
@@ -485,27 +541,50 @@ class DatasetViewer(QMainWindow):
 
         self.worker_signals = WorkerSignals()
         self.worker_signals.metrics_ready.connect(self._on_metrics_ready)
+        self.worker_signals.noisy_metrics_ready.connect(self._on_noisy_metrics_ready)
         self.worker_signals.prediction_ready.connect(self._on_prediction_ready)
         self.thread_pool = QThreadPool()
         self.thread_pool.setMaxThreadCount(4)
 
         self.setWindowTitle("DW_THI Dataset Viewer")
-        self.setMinimumSize(1550, 1200 if self.model is not None else 900)
+        self._set_compact_window_size()
         self._build_ui()
         self._load_subject_by_name(initial_subject or self.subjects[0])
+
+    def _set_compact_window_size(self) -> None:
+        screen = QApplication.primaryScreen()
+        if screen is None:
+            self.setMinimumSize(960, 680 if self.model is not None else 580)
+            self.resize(1180, 820 if self.model is not None else 720)
+            return
+
+        available = screen.availableGeometry()
+        min_width = min(960, max(760, int(available.width() * 0.70)))
+        min_height_target = 680 if self.model is not None else 580
+        min_height = min(min_height_target, max(520, int(available.height() * 0.72)))
+        self.setMinimumSize(min_width, min_height)
+
+        target_width = min(1220, int(available.width() * 0.94))
+        target_height = min(820 if self.model is not None else 700, int(available.height() * 0.90))
+        self.resize(max(min_width, target_width), max(min_height, target_height))
 
     def _build_ui(self) -> None:
         root = QWidget()
         self.setCentralWidget(root)
 
         page = QHBoxLayout(root)
+        page.setContentsMargins(6, 6, 6, 6)
+        page.setSpacing(6)
         left = QVBoxLayout()
         right = QVBoxLayout()
-        page.addLayout(left, stretch=4)
+        left.setSpacing(6)
+        right.setSpacing(6)
+        page.addLayout(left, stretch=5)
         page.addLayout(right, stretch=1)
 
         # ── Controls bar ──────────────────────────────────────────────────
         controls = QHBoxLayout()
+        controls.setSpacing(6)
         left.addLayout(controls)
 
         controls.addWidget(QLabel("Subject"))
@@ -527,15 +606,9 @@ class DatasetViewer(QMainWindow):
         self.slice_label = QLabel("0 / 0")
         controls.addWidget(self.slice_label)
 
-        controls.addWidget(QLabel("Volume"))
-        self.volume_slider = QSlider(Qt.Orientation.Horizontal)
-        self.volume_slider.valueChanged.connect(self._update_view)
-        controls.addWidget(self.volume_slider, stretch=2)
-        self.volume_label = QLabel("0 / 0")
-        controls.addWidget(self.volume_label)
-
         # ── Image rows (QVBoxLayout so hidden rows collapse) ──────────────
         rows_container = QVBoxLayout()
+        rows_container.setSpacing(4)
         left.addLayout(rows_container, stretch=1)
 
         self.panels: dict[str, ImagePanel] = {}
@@ -547,6 +620,7 @@ class DatasetViewer(QMainWindow):
             row_widget = QWidget()
             row_layout = QHBoxLayout(row_widget)
             row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(4)
             for name in panel_names:
                 panel = ImagePanel(name)
                 row_layout.addWidget(panel)
@@ -563,19 +637,61 @@ class DatasetViewer(QMainWindow):
         info_layout.addWidget(self.subject_info_label)
         right.addWidget(info_box)
 
-        volume_box = QGroupBox("Current Selection")
-        volume_layout = QVBoxLayout(volume_box)
-        self.volume_info_label = QLabel("")
-        self.volume_info_label.setWordWrap(True)
-        self.volume_info_label.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
-        volume_layout.addWidget(self.volume_info_label)
-        right.addWidget(volume_box)
+        selection_box = QGroupBox("Current Selection")
+        selection_layout = QVBoxLayout(selection_box)
+        self.selection_info_label = QLabel("")
+        self.selection_info_label.setWordWrap(True)
+        self.selection_info_label.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        selection_layout.addWidget(self.selection_info_label)
+        right.addWidget(selection_box)
 
-        bvals_box = QGroupBox("Acquisition")
-        bvals_layout = QVBoxLayout(bvals_box)
-        self.bvals_canvas = BvalsCanvas()
-        bvals_layout.addWidget(self.bvals_canvas)
-        right.addWidget(bvals_box, stretch=1)
+        degradation_box = QGroupBox("Input Degradation")
+        degradation_layout = QVBoxLayout(degradation_box)
+
+        keep_row = QHBoxLayout()
+        keep_row.addWidget(QLabel("K-space keep"))
+        self.keep_slider = QSlider(Qt.Orientation.Horizontal)
+        self.keep_slider.setRange(0, DEGRADE_SLIDER_STEPS)
+        self.keep_slider.setSingleStep(1)
+        self.keep_slider.setPageStep(50)
+        self.keep_slider.setToolTip(
+            f"Central k-space fraction kept during degradation "
+            f"({cfg.KEEP_FRACTION_MIN:.2f} to {cfg.KEEP_FRACTION_MAX:.2f})."
+        )
+        self.keep_label = QLabel("")
+        self.keep_label.setMinimumWidth(48)
+        keep_row.addWidget(self.keep_slider, stretch=1)
+        keep_row.addWidget(self.keep_label)
+        degradation_layout.addLayout(keep_row)
+
+        noise_row = QHBoxLayout()
+        noise_row.addWidget(QLabel("Noise"))
+        self.noise_slider = QSlider(Qt.Orientation.Horizontal)
+        self.noise_slider.setRange(0, DEGRADE_SLIDER_STEPS)
+        self.noise_slider.setSingleStep(1)
+        self.noise_slider.setPageStep(50)
+        self.noise_slider.setToolTip(
+            f"Relative Gaussian noise level from training "
+            f"({cfg.NOISE_MIN:.2f} to {cfg.NOISE_MAX:.2f})."
+        )
+        self.noise_label = QLabel("")
+        self.noise_label.setMinimumWidth(58)
+        noise_row.addWidget(self.noise_slider, stretch=1)
+        noise_row.addWidget(self.noise_label)
+        degradation_layout.addLayout(noise_row)
+
+        self.keep_slider.setValue(
+            float_to_slider(cfg.EVAL_KEEP_FRACTION, cfg.KEEP_FRACTION_MIN, cfg.KEEP_FRACTION_MAX)
+        )
+        self.noise_slider.setValue(
+            float_to_slider(cfg.EVAL_NOISE_LEVEL, cfg.NOISE_MIN, cfg.NOISE_MAX)
+        )
+        self.keep_slider.valueChanged.connect(self._handle_degradation_change)
+        self.noise_slider.valueChanged.connect(self._handle_degradation_change)
+        self.keep_slider.sliderReleased.connect(self._update_view)
+        self.noise_slider.sliderReleased.connect(self._update_view)
+        self._update_degradation_labels()
+        right.addWidget(degradation_box)
 
         # ── Visibility checkboxes ─────────────────────────────────────────
         vis_box = QGroupBox("Visible Panels")
@@ -600,13 +716,13 @@ class DatasetViewer(QMainWindow):
         help_box = QGroupBox("Viewer Notes")
         help_layout = QVBoxLayout(help_box)
         help_text = (
-            "Row 1: DWI volumes for the selected diffusion volume. "
+            "Row 1: FA/MD/ColorFA from the slider-degraded input slice. "
             "Row 2: DTI-derived maps computed from ground-truth tensors. "
         )
         if self.model is not None:
             help_text += "Row 3: live NN predictions (axial plane only). "
-        help_text += "DWI, DTI, and NN panels are masked to the target-side brain mask. "
-        help_text += "DTI and NN panels load in the background — the GUI stays responsive."
+        help_text += "Noisy, DTI, and NN panels are masked to the target-side brain mask. "
+        help_text += "Noisy DTI, ground-truth DTI, and NN panels load in the background — the GUI stays responsive."
         help_label = QLabel(help_text)
         help_label.setWordWrap(True)
         help_layout.addWidget(help_label)
@@ -623,6 +739,22 @@ class DatasetViewer(QMainWindow):
                 )
                 self.row_widgets[row_key].setVisible(row_visible)
 
+    def _update_degradation_labels(self) -> None:
+        self.keep_label.setText(f"{self.keep_fraction:.3f}")
+        self.noise_label.setText(f"{100.0 * self.noise_level:.1f}%")
+
+    def _handle_degradation_change(self) -> None:
+        self._update_degradation_labels()
+        self.degraded_slice_cache.clear()
+        self.noisy_metric_cache.clear()
+        self.pred_cache.clear()
+        self._pending_noisy_metrics.clear()
+        self._pending_predictions.clear()
+        self._update_view()
+
+    def _degradation_slider_active(self) -> bool:
+        return self.keep_slider.isSliderDown() or self.noise_slider.isSliderDown()
+
     @property
     def plane(self) -> str:
         return self.plane_combo.currentText()
@@ -633,12 +765,15 @@ class DatasetViewer(QMainWindow):
 
         self.current_subject = subject_name
         self.current_group = self.store[subject_name]
-        self.current_shape = tuple(self.current_group["input_dwi"].shape)
+        self.current_shape = _group_shape(self.current_group)
         self.current_bvals = np.asarray(self.current_group["bvals"][:], dtype=np.float32)
         self.current_bvecs = np.asarray(self.current_group["bvecs"][:], dtype=np.float32)
         self.current_brain_mask = self._get_brain_mask(subject_name)
+        self.degraded_slice_cache.clear()
+        self.noisy_metric_cache.clear()
         self.slice_metric_cache.clear()
         self.pred_cache.clear()
+        self._pending_noisy_metrics.clear()
         self._pending_metrics.clear()
         self._pending_predictions.clear()
 
@@ -649,7 +784,6 @@ class DatasetViewer(QMainWindow):
             self.subject_combo.blockSignals(False)
 
         self._reset_slice_slider()
-        self._reset_volume_slider()
         self._update_subject_summary()
         self._update_view()
 
@@ -668,6 +802,59 @@ class DatasetViewer(QMainWindow):
         self.brain_mask_cache[subject_name] = mask
         return mask
 
+    @property
+    def keep_fraction(self) -> float:
+        return slider_to_float(
+            self.keep_slider.value(),
+            cfg.KEEP_FRACTION_MIN,
+            cfg.KEEP_FRACTION_MAX,
+        )
+
+    @property
+    def noise_level(self) -> float:
+        return slider_to_float(
+            self.noise_slider.value(),
+            cfg.NOISE_MIN,
+            cfg.NOISE_MAX,
+        )
+
+    def _degradation_key(self, plane: str, slice_idx: int) -> tuple:
+        return (
+            self.current_subject,
+            plane,
+            int(slice_idx),
+            self.keep_slider.value(),
+            self.noise_slider.value(),
+        )
+
+    def _prediction_key(self, slice_idx: int) -> tuple:
+        return (
+            self.current_subject,
+            int(slice_idx),
+            self.keep_slider.value(),
+            self.noise_slider.value(),
+        )
+
+    def _get_degraded_slice_nhw(self, plane: str, slice_idx: int) -> np.ndarray:
+        key = self._degradation_key(plane, slice_idx)
+        cached = self.degraded_slice_cache.get(key)
+        if cached is not None:
+            return cached
+
+        clean_nhw = extract_dwi_slice_nhw(self.current_group["target_dwi"], plane, slice_idx)
+        rng = np.random.default_rng(
+            stable_degrade_seed(
+                self.current_subject,
+                plane,
+                slice_idx,
+                self.keep_slider.value(),
+                self.noise_slider.value(),
+            )
+        )
+        degraded = degrade_dwi_slice(clean_nhw, self.keep_fraction, self.noise_level, rng)
+        self.degraded_slice_cache[key] = degraded
+        return degraded
+
     def _current_mask_slice(self) -> np.ndarray | None:
         if self.current_brain_mask is None:
             return None
@@ -684,16 +871,6 @@ class DatasetViewer(QMainWindow):
         self.slice_slider.setRange(0, max_index)
         self.slice_slider.setValue(max_index // 2)
         self.slice_slider.blockSignals(False)
-
-    def _reset_volume_slider(self) -> None:
-        max_index = self.current_shape[3] - 1
-        non_b0 = np.flatnonzero(self.current_bvals >= 50)
-        initial_volume = int(non_b0[0]) if non_b0.size > 0 else 0
-
-        self.volume_slider.blockSignals(True)
-        self.volume_slider.setRange(0, max_index)
-        self.volume_slider.setValue(initial_volume)
-        self.volume_slider.blockSignals(False)
 
     def _update_subject_summary(self) -> None:
         source = self.current_group.attrs.get("source_dwi", "unknown")
@@ -715,46 +892,43 @@ class DatasetViewer(QMainWindow):
             return
 
         slice_idx = self.slice_slider.value()
-        volume_idx = self.volume_slider.value()
         self.slice_label.setText(f"{slice_idx} / {self.slice_slider.maximum()}")
-        self.volume_label.setText(f"{volume_idx} / {self.volume_slider.maximum()}")
 
-        # ── DWI panels: fast zarr slicing, runs synchronously ─────────────
-        input_slice = extract_volume_slice(self.current_group["input_dwi"], self.plane, slice_idx, volume_idx)
-        target_slice = extract_volume_slice(self.current_group["target_dwi"], self.plane, slice_idx, volume_idx)
-        diff_slice = np.abs(input_slice - target_slice)
+        # ── Noisy input DTI fit: degrade the clean slice using the slider values
+        input_nhw = self._get_degraded_slice_nhw(self.plane, slice_idx)
         mask_slice = self._current_mask_slice()
-        input_display = apply_display_mask(input_slice, mask_slice)
-        target_display = apply_display_mask(target_slice, mask_slice)
-        diff_display = apply_display_mask(diff_slice, mask_slice)
-        input_mean, input_max = masked_stats(input_slice, mask_slice)
-        target_mean, target_max = masked_stats(target_slice, mask_slice)
-        diff_mean, diff_max = masked_stats(diff_slice, mask_slice)
-
-        self.panels["Input DWI"].set_pixmap(
-            make_pixmap(input_display, cmap="gray"),
-            f"brain mean={format_float(input_mean)}  max={format_float(input_max)}",
-        )
-        self.panels["Target DWI"].set_pixmap(
-            make_pixmap(target_display, cmap="gray"),
-            f"brain mean={format_float(target_mean)}  max={format_float(target_max)}",
-        )
-        self.panels["Absolute Difference"].set_pixmap(
-            make_pixmap(diff_display, cmap="magma"),
-            f"brain mean={format_float(diff_mean)}  max={format_float(diff_max)}",
-        )
-
-        current_bval = float(self.current_bvals[volume_idx])
-        current_bvec = self.current_bvecs[:, volume_idx]
-        self.volume_info_label.setText(
+        self.selection_info_label.setText(
             f"Plane: {self.plane}\n"
             f"Slice: {slice_idx}\n"
-            f"Volume: {volume_idx}  ({shell_name(current_bval)})\n"
-            f"bvec: [{current_bvec[0]:.3f}, {current_bvec[1]:.3f}, {current_bvec[2]:.3f}]\n"
-            f"Brain-mask voxels in slice: {int(np.count_nonzero(mask_slice)) if mask_slice is not None else 0}\n"
-            f"Input-target abs diff brain mean: {format_float(diff_mean)}"
+            f"K-space keep: {self.keep_fraction:.3f}\n"
+            f"Noise level: {100.0 * self.noise_level:.1f}%\n"
+            f"Noisy DTI fit: {cfg.DTI_FIT_METHOD}\n"
+            f"Brain-mask voxels in slice: {int(np.count_nonzero(mask_slice)) if mask_slice is not None else 0}"
         )
-        self.bvals_canvas.update_plot(self.current_bvals, volume_idx)
+
+        noisy_key = self._degradation_key(self.plane, slice_idx)
+        if noisy_key in self.noisy_metric_cache:
+            self._apply_noisy_metrics(self.noisy_metric_cache[noisy_key])
+        elif self._degradation_slider_active():
+            for p in ("Noisy FA", "Noisy MD", "Noisy Color FA"):
+                self.panels[p].image_label.setPixmap(QPixmap())
+                self.panels[p].image_label.setText("Release slider to update")
+                self.panels[p].caption_label.setText("")
+        elif noisy_key not in self._pending_noisy_metrics:
+            self._pending_noisy_metrics.add(noisy_key)
+            for p in ("Noisy FA", "Noisy MD", "Noisy Color FA"):
+                self.panels[p].image_label.setPixmap(QPixmap())
+                self.panels[p].image_label.setText("Computing DTI fit…")
+                self.panels[p].caption_label.setText("")
+            self.thread_pool.start(
+                NoisyMetricsWorker(
+                    noisy_key,
+                    input_nhw,
+                    self.current_bvals.copy(), self.current_bvecs.copy(),
+                    cfg.B0_THRESHOLD,
+                    self.worker_signals,
+                )
+            )
 
         # ── DTI metrics: serve from cache or queue background worker ───────
         metrics_key = (self.current_subject, self.plane, slice_idx)
@@ -781,9 +955,14 @@ class DatasetViewer(QMainWindow):
                     self.panels[p].image_label.setText("Axial plane only")
                     self.panels[p].caption_label.setText("")
             else:
-                pred_key = (self.current_subject, slice_idx)
+                pred_key = self._prediction_key(slice_idx)
                 if pred_key in self.pred_cache:
                     self._apply_predictions(self.pred_cache[pred_key])
+                elif self._degradation_slider_active():
+                    for p in ("Predicted FA", "Predicted MD", "Predicted Color FA"):
+                        self.panels[p].image_label.setPixmap(QPixmap())
+                        self.panels[p].image_label.setText("Release slider to update")
+                        self.panels[p].caption_label.setText("")
                 elif pred_key not in self._pending_predictions:
                     self._pending_predictions.add(pred_key)
                     for p in ("Predicted FA", "Predicted MD", "Predicted Color FA"):
@@ -792,8 +971,9 @@ class DatasetViewer(QMainWindow):
                         self.panels[p].caption_label.setText("")
                     self.thread_pool.start(
                         PredictionWorker(
+                            pred_key,
                             self.current_subject, slice_idx,
-                            self.current_group,
+                            input_nhw,
                             self.current_bvals.copy(), self.current_bvecs.copy(),
                             self.model, self.device,
                             self.dti_scale, self.max_bval, cfg.B0_THRESHOLD,
@@ -802,7 +982,29 @@ class DatasetViewer(QMainWindow):
                     )
 
         self.statusBar().showMessage(
-            f"{self.current_subject} | {self.plane} slice {slice_idx} | volume {volume_idx} | {shell_name(current_bval)}"
+            f"{self.current_subject} | {self.plane} slice {slice_idx} | "
+            f"keep={self.keep_fraction:.3f} noise={100.0 * self.noise_level:.1f}%"
+        )
+
+    def _apply_noisy_metrics(self, metrics: dict) -> None:
+        mask_slice = self._current_mask_slice()
+        fa_display = apply_display_mask(metrics["fa"], mask_slice)
+        md_display = apply_display_mask(metrics["md"], mask_slice)
+        color_fa_display = apply_display_mask(metrics["color_fa"], mask_slice)
+        fa_mean, fa_max = masked_stats(metrics["fa"], mask_slice)
+        md_mean, md_max = masked_stats(metrics["md"], mask_slice)
+
+        self.panels["Noisy FA"].set_pixmap(
+            make_pixmap(fa_display, cmap="viridis"),
+            f"brain mean={format_float(fa_mean)}  max={format_float(fa_max)}",
+        )
+        self.panels["Noisy MD"].set_pixmap(
+            make_pixmap(md_display, cmap="plasma"),
+            f"brain mean={format_float(md_mean)}  max={format_float(md_max)}",
+        )
+        self.panels["Noisy Color FA"].set_pixmap(
+            make_pixmap(color_fa_display),
+            "masked noisy principal direction RGB weighted by FA",
         )
 
     def _apply_metrics(self, metrics: dict) -> None:
@@ -847,6 +1049,13 @@ class DatasetViewer(QMainWindow):
             "masked predicted principal direction RGB weighted by FA",
         )
 
+    @pyqtSlot(object, object)
+    def _on_noisy_metrics_ready(self, noisy_key: tuple, result: dict) -> None:
+        self._pending_noisy_metrics.discard(noisy_key)
+        self.noisy_metric_cache[noisy_key] = result
+        if noisy_key == self._degradation_key(self.plane, self.slice_slider.value()):
+            self._apply_noisy_metrics(result)
+
     @pyqtSlot(str, str, int, object)
     def _on_metrics_ready(self, subject: str, plane: str, slice_idx: int, result: dict) -> None:
         self._pending_metrics.discard((subject, plane, slice_idx))
@@ -856,12 +1065,11 @@ class DatasetViewer(QMainWindow):
                 and slice_idx == self.slice_slider.value()):
             self._apply_metrics(result)
 
-    @pyqtSlot(str, int, object)
-    def _on_prediction_ready(self, subject: str, slice_idx: int, result: dict) -> None:
-        self._pending_predictions.discard((subject, slice_idx))
-        self.pred_cache[(subject, slice_idx)] = result
-        if (subject == self.current_subject
-                and slice_idx == self.slice_slider.value()
+    @pyqtSlot(object, object)
+    def _on_prediction_ready(self, pred_key: tuple, result: dict) -> None:
+        self._pending_predictions.discard(pred_key)
+        self.pred_cache[pred_key] = result
+        if (pred_key == self._prediction_key(self.slice_slider.value())
                 and self.plane == "Axial"):
             self._apply_predictions(result)
 
