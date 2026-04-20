@@ -8,9 +8,9 @@ run unless disabled, and comparison plots + metric tables are saved.
 
 Usage:
     python -m research.evaluate
-    python -m research.evaluate --checkpoint research/runs/run_01/best_model.pt --subjects sub-10 sub-11
-    python -m research.evaluate --checkpoint research/runs/run_01/best_model.pt --skip_baselines
-    python -m research.evaluate --checkpoint research/runs/run_01/best_model.pt --eval_repeats 5 --skip_mppca
+    python -m research.evaluate --checkpoint research/runs/run_new_data_2_aug/best_model.pt --subjects sub-10 sub-11
+    python -m research.evaluate --checkpoint research/runs/run_new_data_2_aug/best_model.pt --skip_baselines
+    python -m research.evaluate --checkpoint research/runs/run_new_data_2_aug/best_model.pt --eval_repeats 5 --skip_mppca
     python -m research.evaluate --sweep_patch2self --eval_repeats 3
 """
 
@@ -194,12 +194,12 @@ def _run_patch2self(
 
 
 def _run_mppca(noisy: np.ndarray) -> np.ndarray:
-    from dipy.denoise.localpca import mppca
+    from baselines import mppca
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         return mppca(
             noisy, patch_radius=MPPCA_CFG["patch_radius"],
-            pca_method=MPPCA_CFG["pca_method"],
+            suppress_warning=True,
         ).astype(np.float32)
 
 
@@ -1225,7 +1225,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate QSpaceUNet on test subjects")
     parser.add_argument("--checkpoint", default=cfg.EVAL_DEFAULT_CHECKPOINT,
                         help="Path to model checkpoint")
-    parser.add_argument("--zarr_path", default="dataset/default_dataset.zarr")
+    parser.add_argument("--zarr_path", default="dataset/default_clean.zarr")
     parser.add_argument("--out_dir", default="research/results")
     parser.add_argument("--subjects", nargs="*", default=None,
                         help="Biological subject IDs or Zarr keys to evaluate (default: test subjects from checkpoint)")
