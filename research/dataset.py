@@ -85,6 +85,7 @@ class DWISliceDataset(Dataset):
         eval_keep_fraction: float = cfg.EVAL_KEEP_FRACTION,
         eval_noise_level: float = cfg.EVAL_NOISE_LEVEL,
         eval_seed: int = cfg.EVAL_DEGRADE_SEED,
+        return_clean_input: bool = False,
     ):
         self.zarr_path = zarr_path
         self.subject_keys = list(subject_keys)
@@ -103,6 +104,7 @@ class DWISliceDataset(Dataset):
         self.eval_keep_fraction = float(eval_keep_fraction)
         self.eval_noise_level = float(eval_noise_level)
         self.eval_seed = int(eval_seed)
+        self.return_clean_input = bool(return_clean_input)
 
         store = zarr.open_group(zarr_path, mode="r")
 
@@ -232,6 +234,17 @@ class DWISliceDataset(Dataset):
             if b0_norm > 0:
                 input_nhw = input_nhw / b0_norm
 
+        # ── Optional clean-DWI view for JEPA teacher (normalised by its own
+        # clean b0 so the teacher sees natural-scale clean signals).
+        clean_nhw_out: np.ndarray | None = None
+        if self.return_clean_input:
+            clean_nhw_out = clean_nhw.copy()
+            if b0_idx.any():
+                mean_b0_clean = clean_nhw_out[b0_idx].mean(axis=0)
+                cb0_norm = compute_b0_norm(mean_b0_clean)
+                if cb0_norm > 0:
+                    clean_nhw_out = clean_nhw_out / cb0_norm
+
         bvals_norm = bvals_n / self.max_bval
 
         # ── Spatial + intensity augmentations (training only) ────────────────
@@ -252,17 +265,23 @@ class DWISliceDataset(Dataset):
                     input_nhw = input_nhw[:, ::-1, :]
                     tgt_chw = tgt_chw[:, ::-1, :]
                     bmask_hw = bmask_hw[::-1, :]
+                    if clean_nhw_out is not None:
+                        clean_nhw_out = clean_nhw_out[:, ::-1, :]
                     tgt_chw = _flip_dti6d_sign(tgt_chw, world_axis=h_world)
                     bvecs_n = _flip_bvecs(bvecs_n, world_axis=h_world)
                 if random.random() > 0.5:
                     input_nhw = input_nhw[:, :, ::-1]
                     tgt_chw = tgt_chw[:, :, ::-1]
                     bmask_hw = bmask_hw[:, ::-1]
+                    if clean_nhw_out is not None:
+                        clean_nhw_out = clean_nhw_out[:, :, ::-1]
                     tgt_chw = _flip_dti6d_sign(tgt_chw, world_axis=w_world)
                     bvecs_n = _flip_bvecs(bvecs_n, world_axis=w_world)
                 input_nhw = np.ascontiguousarray(input_nhw)
                 tgt_chw = np.ascontiguousarray(tgt_chw)
                 bmask_hw = np.ascontiguousarray(bmask_hw)
+                if clean_nhw_out is not None:
+                    clean_nhw_out = np.ascontiguousarray(clean_nhw_out)
             if self.aug_intensity > 0.0:
                 scale = 1.0 + np.random.uniform(
                     -self.aug_intensity, self.aug_intensity,
@@ -287,6 +306,8 @@ class DWISliceDataset(Dataset):
             input_nhw = np.pad(input_nhw, ((0, pad), (0, 0), (0, 0)))
             bvals_norm = np.pad(bvals_norm, (0, pad))
             bvecs_n = np.pad(bvecs_n, ((0, 0), (0, pad)))
+            if clean_nhw_out is not None:
+                clean_nhw_out = np.pad(clean_nhw_out, ((0, pad), (0, 0), (0, 0)))
 
         vol_mask = np.zeros(self.max_n, dtype=np.float32)
         vol_mask[:N] = 1.0
@@ -302,8 +323,10 @@ class DWISliceDataset(Dataset):
             input_nhw = np.pad(input_nhw, ((0, 0), (0, ph), (0, pw)))
             tgt_chw = np.pad(tgt_chw, ((0, 0), (0, ph), (0, pw)))
             bmask_hw = np.pad(bmask_hw, ((0, ph), (0, pw)))
+            if clean_nhw_out is not None:
+                clean_nhw_out = np.pad(clean_nhw_out, ((0, 0), (0, ph), (0, pw)))
 
-        return {
+        sample = {
             "input": torch.from_numpy(np.ascontiguousarray(input_nhw)),
             "target": torch.from_numpy(np.ascontiguousarray(tgt_chw)),
             "bvals": torch.from_numpy(bvals_norm.astype(np.float32)),
@@ -311,3 +334,8 @@ class DWISliceDataset(Dataset):
             "vol_mask": torch.from_numpy(vol_mask),
             "brain_mask": torch.from_numpy(np.ascontiguousarray(bmask_hw)),
         }
+        if clean_nhw_out is not None:
+            sample["clean_input"] = torch.from_numpy(
+                np.ascontiguousarray(clean_nhw_out)
+            )
+        return sample

@@ -30,7 +30,7 @@ EVAL_DEFAULT_CHECKPOINT = "research/runs/run_new_data_2_aug/best_model.pt"
 # ─────────────────────────────────────────────────────────────────────────────
 # Training-time augmentation
 # ─────────────────────────────────────────────────────────────────────────────
-RANDOM_SLICE_AXIS = True      # randomly slice along X (sagittal), Y (coronal), or Z (axial)
+RANDOM_SLICE_AXIS = False      # randomly slice along X (sagittal), Y (coronal), or Z (axial)
 SLICE_AXES = (0, 1, 2)        # axes to sample from when RANDOM_SLICE_AXIS is True
 AUG_FLIP = True               # random physical-mirror flips: signal + tensor + bvecs transform together
 AUG_INTENSITY = 0.1           # uniform multiplicative jitter on the input (0 disables)
@@ -53,7 +53,7 @@ VAL_SUBJECTS = ["sub-05", "sub-11"]
 # Model architecture
 # ─────────────────────────────────────────────────────────────────────────────
 FEAT_DIM = 64                # q-space encoder feature dimension (matches channels[0])
-UNET_CHANNELS = [64, 128, 256, 512]  # 4 encoder levels; factor=16 fits (132, 130) easily
+UNET_CHANNELS = [64, 128, 256]  # 4 encoder levels; factor=16 fits (132, 130) easily
 DROPOUT = 0.1                # spatial dropout rate in U-Net conv blocks
 LAMBDA_SCALAR = 0.3          # weight for FA/MD auxiliary loss
 LAMBDA_EDGE = 0.1            # weight for FA spatial-gradient (edge) loss
@@ -68,6 +68,13 @@ WEIGHT_DECAY = 1e-4
 PATIENCE = 25                # early stopping patience (epochs)
 GRAD_CLIP = 1.0              # gradient norm clipping value
 WARMUP_EPOCHS = 5            # linear LR warmup before cosine annealing
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JEPA (self-distillation) auxiliary objective
+# ─────────────────────────────────────────────────────────────────────────────
+JEPA_LAMBDA = 0.5            # weight for predictor↔teacher feature loss
+JEPA_EMA = 0.996             # teacher EMA momentum (closer to 1 = slower update)
+JEPA_PRED_HIDDEN = 128       # hidden channels in the JEPA predictor
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Patch2Self baseline
