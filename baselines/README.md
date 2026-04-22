@@ -6,6 +6,7 @@ diffusion MRI denoising. Currently ships a single function:
 | Baseline | API | Backend |
 |----------|-----|---------|
 | **MP-PCA** (Marchenko–Pastur PCA, Veraart et al. 2016) | `baselines.mppca` | PyTorch — CUDA, Apple MPS, or CPU |
+| **Patch2Self eval** | `python -m baselines.patch2self_eval.run` | DIPY + shared project DTI metrics |
 
 The implementation is a drop-in replacement for
 [`dipy.denoise.localpca.mppca`](https://docs.dipy.org/stable/reference/dipy.denoise.html)
@@ -176,5 +177,6 @@ baselines/
 ├── README.md          ← you are here
 ├── __init__.py        ← re-exports `mppca`
 ├── mppca_torch.py     ← the implementation
-└── benchmark.py       ← `python -m baselines.benchmark`
+├── benchmark.py       ← `python -m baselines.benchmark`
+└── patch2self_eval/   ← tuned Patch2Self all-subject evaluation
 ```

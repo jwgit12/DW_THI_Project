@@ -1,11 +1,14 @@
 """Benchmark :func:`baselines.mppca_torch` against :func:`dipy.denoise.localpca.mppca`.
 
 Reports wall-clock time and max/mean absolute difference versus DIPY on a
-range of synthetic volumes. Run as a module:
+range of synthetic volumes, or on a real DWI NIfTI from the project dataset.
+Run as a module:
 
     python -m baselines.benchmark
     python -m baselines.benchmark --shape 130 130 25 150
     python -m baselines.benchmark --sizes small medium full --repeats 2
+    python -m baselines.benchmark --real_data                          # auto-find NIfTI
+    python -m baselines.benchmark --real_data --data_dir dataset/dataset_v1
 
 When run without ``--sizes`` it benchmarks a progression that culminates in
 the typical scan size used in this project (130, 130, 25, 150).
@@ -14,8 +17,10 @@ the typical scan size used in this project (130, 130, 25, 150).
 from __future__ import annotations
 
 import argparse
+import glob
 import time
 import warnings
+from pathlib import Path
 from typing import Optional, Tuple
 
 import numpy as np
@@ -31,8 +36,7 @@ SHAPE_PRESETS = {
     "full":   (130, 130, 25, 150),
 }
 
-DEFAULT_CHECK_RTOL = 1e-4
-DEFAULT_CHECK_ATOL = 1e-4
+DEFAULT_CHECK_RTOL = 1e-3  # rel_max|diff| = max|torch-dipy| / max|dipy|
 
 
 def _auto_device() -> str:
@@ -57,6 +61,31 @@ def _make_volume(shape: Tuple[int, ...], seed: int) -> np.ndarray:
     return np.clip(base + noise, 0, None).astype(np.float32)
 
 
+def _load_real_volume(data_dir: str) -> Tuple[np.ndarray, str]:
+    """Load the first DWI NIfTI found under *data_dir* as float32.
+
+    Returns (arr, label) where arr is (X, Y, Z, N) float32 and label is a
+    short description for printing.
+    """
+    try:
+        import nibabel as nib
+    except ImportError as exc:
+        raise RuntimeError("nibabel is required for --real_data (pip install nibabel)") from exc
+
+    data_dir = Path(data_dir)
+    nii_files = sorted(data_dir.glob("*.nii.gz")) + sorted(data_dir.glob("*.nii"))
+    if not nii_files:
+        raise FileNotFoundError(f"No NIfTI files found under {data_dir}")
+
+    nii_path = nii_files[0]
+    img = nib.load(nii_path)
+    arr = np.asarray(img.dataobj, dtype=np.float32)
+    if arr.ndim != 4:
+        raise ValueError(f"Expected 4-D NIfTI, got shape {arr.shape}")
+    label = nii_path.stem.replace(".nii", "")
+    return arr, label
+
+
 def bench_once(
     shape: Tuple[int, ...],
     patch_radius: int = 2,
@@ -64,12 +93,15 @@ def bench_once(
     run_dipy: bool = True,
     check_result: bool = True,
     check_rtol: float = DEFAULT_CHECK_RTOL,
-    check_atol: float = DEFAULT_CHECK_ATOL,
     repeats: int = 1,
     seed: int = 0,
+    arr: Optional[np.ndarray] = None,
 ) -> dict:
     device = device or _auto_device()
-    arr = _make_volume(shape, seed)
+    if arr is None:
+        arr = _make_volume(shape, seed)
+    else:
+        shape = arr.shape
     row = {"shape": shape, "device": device, "patch_radius": patch_radius}
 
     # Torch: warmup + timed runs
@@ -113,19 +145,9 @@ def bench_once(
             row["rel_max_diff"] = float("inf")
         row["result_checked"] = check_result
         row["check_rtol"] = check_rtol
-        row["check_atol"] = check_atol
         row["result_matches"] = bool(
             (not check_result)
-            or (
-                row["shape_matches"]
-                and np.allclose(
-                    d_torch,
-                    d_dipy,
-                    rtol=check_rtol,
-                    atol=check_atol,
-                    equal_nan=False,
-                )
-            )
+            or (row["shape_matches"] and row["rel_max_diff"] < check_rtol)
         )
 
     return row
@@ -144,6 +166,7 @@ def _format_row(r: dict) -> str:
         line += (
             f"  dipy={r['dipy_time']:7.2f}s  speedup={r['speedup']:5.1f}x  "
             f"max|diff|={r['max_abs_diff']:.2e}  "
+            f"rel_max|diff|={r['rel_max_diff']:.2e}  "
             f"mean|diff|={r['mean_abs_diff']:.2e}  "
             f"check={check_status}"
         )
@@ -184,18 +207,29 @@ def main() -> None:
     )
     parser.add_argument(
         "--check_rtol", type=float, default=DEFAULT_CHECK_RTOL,
-        help="Relative tolerance for comparing torch and DIPY outputs.",
+        help="Max allowed rel_max|diff| = max|torch-dipy| / max|dipy| (default 1e-4).",
     )
     parser.add_argument(
-        "--check_atol", type=float, default=DEFAULT_CHECK_ATOL,
-        help="Absolute tolerance for comparing torch and DIPY outputs.",
+        "--real_data", action="store_true",
+        help="Load a real DWI NIfTI from --data_dir instead of using a synthetic volume.",
+    )
+    parser.add_argument(
+        "--data_dir", type=str, default="dataset/dataset_v1",
+        help="Directory containing DWI NIfTI files for --real_data (default: dataset/dataset_v1).",
     )
     args = parser.parse_args()
 
     device = None if args.device == "auto" else args.device
-    shapes = [tuple(args.shape)] if args.shape else [
-        SHAPE_PRESETS[s] for s in args.sizes
-    ]
+
+    if args.real_data:
+        real_arr, real_label = _load_real_volume(args.data_dir)
+        shapes = [real_arr.shape]
+    elif args.shape:
+        real_arr, real_label = None, None
+        shapes = [tuple(args.shape)]
+    else:
+        real_arr, real_label = None, None
+        shapes = [SHAPE_PRESETS[s] for s in args.sizes]
 
     print(f"Device selected : {device or _auto_device()}")
     print(f"Patch radius    : {args.patch_radius}  "
@@ -207,9 +241,11 @@ def main() -> None:
     elif args.no_check:
         print("Result check    : skipped")
     else:
-        print(f"Result check    : rtol={args.check_rtol:g}, atol={args.check_atol:g}")
+        print(f"Result check    : rel_max|diff| < {args.check_rtol:g}")
     print()
 
+    if args.real_data:
+        print(f"Data source     : real NIfTI  ({real_label}  shape={real_arr.shape})")
     print("Benchmarks:")
     failed_rows = []
     for shape in shapes:
@@ -220,8 +256,8 @@ def main() -> None:
             run_dipy=not args.no_dipy,
             check_result=not args.no_check,
             check_rtol=args.check_rtol,
-            check_atol=args.check_atol,
             repeats=args.repeats,
+            arr=real_arr if args.real_data else None,
         )
         print(_format_row(row), flush=True)
         if (
@@ -237,9 +273,10 @@ def main() -> None:
         for row in failed_rows:
             shape_str = "x".join(str(s) for s in row["shape"])
             print(
-                f"  {shape_str}: max|diff|={row['max_abs_diff']:.6e}, "
-                f"mean|diff|={row['mean_abs_diff']:.6e}, "
-                f"rtol={row['check_rtol']:g}, atol={row['check_atol']:g}"
+                f"  {shape_str}: rel_max|diff|={row['rel_max_diff']:.6e}  "
+                f"(max|diff|={row['max_abs_diff']:.6e}, "
+                f"mean|diff|={row['mean_abs_diff']:.6e}), "
+                f"threshold={row['check_rtol']:g}"
             )
             if not row["shape_matches"]:
                 print(

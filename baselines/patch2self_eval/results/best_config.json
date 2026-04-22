@@ -1,0 +1,10 @@
+{
+  "name": "ols_project_default",
+  "model": "ols",
+  "alpha": 1.0,
+  "b0_denoising": true,
+  "clip_negative": false,
+  "shift_intensity": true,
+  "dti_fit_method": "WLS",
+  "b0_threshold": 50.0
+}
