@@ -38,22 +38,23 @@ from PyQt6.QtWidgets import (
 )
 
 ROOT_DIR = Path(__file__).resolve().parent
+SRC_DIR = ROOT_DIR / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 import config as cfg
 from functions import (
-    compute_b0_norm,
-    compute_brain_mask_from_dwi,
-    compute_color_fa_from_tensor6,
     compute_fa_from_tensor6,
-    compute_md_from_tensor6,
     tensor6_to_full,
     tensor_to_eig,
 )
-from research.augment import degrade_dwi_slice, degrade_dwi_volume
-from research.model import QSpaceUNet
-from research.utils import fit_dti_to_6d, sanitize_dti6d
+from dw_thi.augment import degrade_dwi_slice, degrade_dwi_volume
+from dw_thi.model import QSpaceUNet
+from dw_thi.preprocessing import compute_b0_norm, compute_brain_mask_from_dwi
+from dw_thi.runtime import get_device
+from dw_thi.utils import fit_dti_to_6d, sanitize_dti6d
 
 
 DEGRADE_SLIDER_STEPS = 1000
@@ -106,12 +107,14 @@ ROW_GROUPS: dict[str, tuple[str, ...]] = {
     "noisy": ("Noisy FA", "Noisy MD", "Noisy Color FA"),
     "dti": ("FA Map", "MD Map", "Color FA"),
     "pred": ("Predicted FA", "Predicted MD", "Predicted Color FA"),
+    "mask": ("Brain Mask",),
     "tracts": ("Tracts (Clean)", "Tracts (Predicted)"),
 }
 ROW_LABELS: dict[str, str] = {
     "noisy": "Noisy Input DTI Fit",
     "dti": "DTI Maps (ground truth)",
     "pred": "NN Predictions",
+    "mask": "Precomputed Brain Mask",
     "tracts": "Fiber Tracts",
 }
 
@@ -132,7 +135,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--zarr_path",
         type=str,
-        default="dataset/pretext_dataset_new.zarr",
+        default=cfg.DATASET_ZARR_PATH,
         help="Path to the Zarr store.",
     )
     parser.add_argument(
@@ -527,10 +530,14 @@ def dataset_summary(zarr_path: str) -> str:
 
     spatial_shapes = []
     volume_counts = []
+    mask_count = 0
     for subject in subjects:
-        shape = _group_shape(store[subject])
+        group = store[subject]
+        shape = _group_shape(group)
         spatial_shapes.append(shape[:3])
         volume_counts.append(shape[3])
+        if "brain_mask" in set(group.array_keys()):
+            mask_count += 1
 
     unique_shapes = sorted(set(spatial_shapes))
     unique_counts = sorted(set(volume_counts))
@@ -542,17 +549,10 @@ def dataset_summary(zarr_path: str) -> str:
         f"Subjects: {len(subjects)}",
         f"Spatial shapes: {unique_shapes}",
         f"Volumes per subject: {unique_counts} (min={min(volume_counts)}, max={max(volume_counts)})",
+        f"Stored brain masks: {mask_count}/{len(subjects)}",
         f"Example subject: {subjects[0]} -> source={source}",
     ]
     return "\n".join(lines)
-
-
-def get_device() -> torch.device:
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
 
 
 # ---------------------------------------------------------------------------
@@ -823,7 +823,9 @@ class DatasetViewer(QMainWindow):
         self.current_bvals = np.array([], dtype=np.float32)
         self.current_bvecs = np.empty((3, 0), dtype=np.float32)
         self.current_brain_mask: np.ndarray | None = None
+        self.current_brain_mask_source = ""
         self.brain_mask_cache: dict[str, np.ndarray] = {}
+        self.brain_mask_source_cache: dict[str, str] = {}
         self.degraded_slice_cache: dict[tuple, np.ndarray] = {}
         self.noisy_metric_cache: dict[tuple, dict] = {}
         self.slice_metric_cache: dict[tuple, dict] = {}
@@ -1056,6 +1058,7 @@ class DatasetViewer(QMainWindow):
             "absolute fiber direction). Computation runs once per subject "
             "(clean) or per (subject, keep, noise) (predicted). "
         )
+        help_text += "The Brain Mask panel shows the stored Zarr mask slice when present; otherwise the viewer falls back to DIPY median_otsu. "
         help_text += "Noisy, DTI, and NN panels are masked to the target-side brain mask. "
         help_text += "Noisy DTI, ground-truth DTI, and NN panels load in the background — the GUI stays responsive."
         help_label = QLabel(help_text)
@@ -1114,6 +1117,7 @@ class DatasetViewer(QMainWindow):
         self.current_bvals = np.asarray(self.current_group["bvals"][:], dtype=np.float32)
         self.current_bvecs = np.asarray(self.current_group["bvecs"][:], dtype=np.float32)
         self.current_brain_mask = self._get_brain_mask(subject_name)
+        self.current_brain_mask_source = self.brain_mask_source_cache.get(subject_name, "")
         self.degraded_slice_cache.clear()
         self.noisy_metric_cache.clear()
         self.slice_metric_cache.clear()
@@ -1139,14 +1143,35 @@ class DatasetViewer(QMainWindow):
             return self.brain_mask_cache[subject_name]
 
         group = self.store[subject_name]
-        if "brain_mask" in group:
+        array_keys = set(group.array_keys())
+        target_shape = tuple(group["target_dwi"].shape[:3])
+        if "brain_mask" in array_keys:
             mask = np.asarray(group["brain_mask"][:], dtype=bool)
+            if mask.shape == target_shape and mask.any():
+                source = "stored Zarr brain_mask"
+            else:
+                print(
+                    f"[visualizer] Ignoring invalid stored brain_mask for {subject_name}; "
+                    "recomputing with DIPY median_otsu.",
+                    file=sys.stderr,
+                )
+                target_dwi = np.asarray(group["target_dwi"][:], dtype=np.float32)
+                bvals = np.asarray(group["bvals"][:], dtype=np.float32)
+                mask = compute_brain_mask_from_dwi(target_dwi, bvals, cfg.B0_THRESHOLD)
+                source = "fallback DIPY median_otsu"
         else:
+            print(
+                f"[visualizer] {subject_name} has no stored brain_mask; "
+                "recomputing with DIPY median_otsu.",
+                file=sys.stderr,
+            )
             target_dwi = np.asarray(group["target_dwi"][:], dtype=np.float32)
             bvals = np.asarray(group["bvals"][:], dtype=np.float32)
             mask = compute_brain_mask_from_dwi(target_dwi, bvals, cfg.B0_THRESHOLD)
+            source = "fallback DIPY median_otsu"
 
         self.brain_mask_cache[subject_name] = mask
+        self.brain_mask_source_cache[subject_name] = source
         return mask
 
     @property
@@ -1237,6 +1262,7 @@ class DatasetViewer(QMainWindow):
             f"Source: {source}\n"
             f"Shape: {self.current_shape[:3]}  Volumes: {self.current_shape[3]}\n"
             f"Brain mask: {mask_voxels} voxels ({mask_fraction:.1f}%)\n"
+            f"Mask source: {self.current_brain_mask_source or 'unknown'}\n"
             f"Shell counts: {shells}"
         )
         self.subject_info_label.setText(summary)
@@ -1264,6 +1290,7 @@ class DatasetViewer(QMainWindow):
             f"Noisy DTI fit: {cfg.DTI_FIT_METHOD}\n"
             f"Brain-mask voxels in slice: {int(np.count_nonzero(mask_slice)) if mask_slice is not None else 0}"
         )
+        self._apply_brain_mask_panel(mask_slice)
 
         noisy_key = self._degradation_key(self.plane, slice_idx)
         if noisy_key in self.noisy_metric_cache:
@@ -1444,6 +1471,23 @@ class DatasetViewer(QMainWindow):
         panel.set_pixmap(
             make_pixmap(overlay, width=TRACT_DISPLAY_WIDTH),
             f"{len(streamlines)} streamlines from {kind_label} tensors",
+        )
+
+    def _apply_brain_mask_panel(self, mask_slice: np.ndarray | None) -> None:
+        panel = self.panels.get("Brain Mask")
+        if panel is None:
+            return
+        if mask_slice is None:
+            panel.image_label.setPixmap(QPixmap())
+            panel.image_label.setText("No mask")
+            panel.caption_label.setText("")
+            return
+        voxels = int(np.count_nonzero(mask_slice))
+        total = int(mask_slice.size)
+        fraction = 100.0 * voxels / total if total else 0.0
+        panel.set_pixmap(
+            make_pixmap(mask_slice.astype(np.float32), cmap="gray"),
+            f"{self.current_brain_mask_source}: {voxels}/{total} voxels ({fraction:.1f}%)",
         )
 
     def _apply_noisy_metrics(self, metrics: dict) -> None:
