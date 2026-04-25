@@ -12,6 +12,7 @@ cleanly with the default collate.
 
 from __future__ import annotations
 
+from os import PathLike
 import random
 
 import numpy as np
@@ -22,6 +23,7 @@ import zarr
 import config as cfg
 from functions import compute_b0_norm, compute_brain_mask_from_dwi
 from research.augment import degrade_dwi_slice
+from research.runtime import path_str
 
 
 # Order of channels in the stored 6D tensor: Dxx, Dxy, Dyy, Dxz, Dyz, Dzz.
@@ -64,7 +66,7 @@ class DWISliceDataset(Dataset):
 
     def __init__(
         self,
-        zarr_path: str,
+        zarr_path: str | PathLike[str],
         subject_keys: list[str],
         *,
         augment: bool = False,
@@ -86,7 +88,7 @@ class DWISliceDataset(Dataset):
         eval_noise_level: float = cfg.EVAL_NOISE_LEVEL,
         eval_seed: int = cfg.EVAL_DEGRADE_SEED,
     ):
-        self.zarr_path = zarr_path
+        self.zarr_path = path_str(zarr_path)
         self.subject_keys = list(subject_keys)
         self.augment = augment
         self.b0_threshold = b0_threshold
@@ -104,7 +106,7 @@ class DWISliceDataset(Dataset):
         self.eval_noise_level = float(eval_noise_level)
         self.eval_seed = int(eval_seed)
 
-        store = zarr.open_group(zarr_path, mode="r")
+        store = zarr.open_group(self.zarr_path, mode="r")
 
         # ── Pre-load all subject arrays into RAM (dominant memory cost) ─────
         self._data: dict[str, dict[str, np.ndarray]] = {}

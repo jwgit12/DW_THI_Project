@@ -8,8 +8,13 @@ Usage:
 import argparse
 import json
 import logging
+import sys
 import time
 from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 import matplotlib
 matplotlib.use("Agg")
@@ -24,6 +29,19 @@ from research.utils import dti6d_to_scalar_maps, scalar_map_metrics
 from research.dataset import DWISliceDataset
 from research.loss import DTILoss
 from research.model import QSpaceUNet
+from research.runtime import (
+    amp_dtype_from_name,
+    autocast_context,
+    configure_torch_runtime,
+    default_num_workers,
+    get_device,
+    make_grad_scaler,
+    maybe_channels_last,
+    maybe_compile_model,
+    path_str,
+    require_cuda_if_requested,
+    resolve_project_path,
+)
 import config as cfg
 
 logging.basicConfig(
@@ -38,14 +56,6 @@ log = logging.getLogger(__name__)
 # All sessions of a subject stay in the same split to prevent data leakage.
 DEFAULT_TEST_SUBJECTS = cfg.TEST_SUBJECTS
 DEFAULT_VAL_SUBJECTS = cfg.VAL_SUBJECTS
-
-
-def get_device() -> torch.device:
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
 
 
 def load_baseline_metrics(csv_paths: list[Path]) -> dict[str, dict[str, float]]:
@@ -84,23 +94,30 @@ def make_val_figure(
     device: torch.device,
     dti_scale: float,
     slice_idx: int | None = None,
+    amp_enabled: bool = False,
+    amp_dtype: torch.dtype | None = None,
+    channels_last: bool = False,
 ) -> plt.Figure:
     """Generate a prediction vs target figure for one validation slice."""
     if slice_idx is None:
         slice_idx = len(val_ds) // 2
 
     sample = val_ds[slice_idx]
-    signal = sample["input"].unsqueeze(0).to(device)
-    bvals = sample["bvals"].unsqueeze(0).to(device)
-    bvecs = sample["bvecs"].unsqueeze(0).to(device)
-    vol_mask = sample["vol_mask"].unsqueeze(0).to(device)
+    non_blocking = device.type == "cuda"
+    signal = sample["input"].unsqueeze(0).to(device, non_blocking=non_blocking)
+    signal = maybe_channels_last(signal, channels_last)
+    bvals = sample["bvals"].unsqueeze(0).to(device, non_blocking=non_blocking)
+    bvecs = sample["bvecs"].unsqueeze(0).to(device, non_blocking=non_blocking)
+    vol_mask = sample["vol_mask"].unsqueeze(0).to(device, non_blocking=non_blocking)
     target = sample["target"].numpy()  # (6, H, W)
     bmask = sample["brain_mask"].numpy()  # (H, W) float32
 
     model.eval()
-    with torch.no_grad():
+    with torch.inference_mode(), autocast_context(
+        device, enabled=amp_enabled, dtype=amp_dtype,
+    ):
         pred = model(signal, bvals, bvecs, vol_mask)  # (1, 6, H, W)
-    pred_np = pred[0].cpu().numpy()  # (6, H, W)
+    pred_np = pred[0].float().cpu().numpy()  # (6, H, W)
 
     # Unscale to physical units before computing FA / ADC
     pred_np = pred_np / dti_scale
@@ -179,63 +196,108 @@ def make_val_figure(
 
 
 def run_epoch(
-    model: QSpaceUNet,
+    model: torch.nn.Module,
     loader: DataLoader,
     criterion: DTILoss,
     device: torch.device,
     optimizer: torch.optim.Optimizer | None = None,
     use_brain_mask: bool = True,
+    *,
+    amp_enabled: bool = False,
+    amp_dtype: torch.dtype | None = None,
+    scaler=None,
+    channels_last: bool = False,
 ) -> dict[str, float]:
     """Run one train or validation epoch. Pass optimizer=None for val."""
     is_train = optimizer is not None
     model.train(is_train)
 
-    total_loss = 0.0
-    total_tensor = 0.0
-    total_fa = 0.0
-    total_md = 0.0
+    total_loss = torch.zeros((), device=device)
+    total_tensor = torch.zeros((), device=device)
+    total_fa = torch.zeros((), device=device)
+    total_md = torch.zeros((), device=device)
     n_batches = 0
+    non_blocking = device.type == "cuda"
+
+    def metric_tensor(metrics: dict, key: str) -> torch.Tensor:
+        value = metrics.get(key)
+        if value is None:
+            return torch.zeros((), device=device)
+        if isinstance(value, torch.Tensor):
+            return value
+        return torch.tensor(float(value), device=device)
 
     ctx = torch.no_grad() if not is_train else torch.enable_grad()
     with ctx:
         for batch in loader:
-            signal = batch["input"].to(device)
-            target = batch["target"].to(device)
-            bvals = batch["bvals"].to(device)
-            bvecs = batch["bvecs"].to(device)
-            vol_mask = batch["vol_mask"].to(device)
-            brain_mask = batch["brain_mask"].to(device) if use_brain_mask else None
+            signal = batch["input"].to(device, non_blocking=non_blocking)
+            signal = maybe_channels_last(signal, channels_last)
+            target = batch["target"].to(device, non_blocking=non_blocking)
+            target = maybe_channels_last(target, channels_last)
+            bvals = batch["bvals"].to(device, non_blocking=non_blocking)
+            bvecs = batch["bvecs"].to(device, non_blocking=non_blocking)
+            vol_mask = batch["vol_mask"].to(device, non_blocking=non_blocking)
+            brain_mask = (
+                batch["brain_mask"].to(device, non_blocking=non_blocking)
+                if use_brain_mask else None
+            )
 
-            pred = model(signal, bvals, bvecs, vol_mask)
-            loss, metrics = criterion(pred, target, mask=brain_mask)
+            with autocast_context(device, enabled=amp_enabled, dtype=amp_dtype):
+                pred = model(signal, bvals, bvecs, vol_mask)
+            loss, metrics = criterion(
+                pred.float(), target, mask=brain_mask, return_tensor_metrics=True,
+            )
 
             if is_train:
                 optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.GRAD_CLIP)
-                optimizer.step()
+                if scaler is not None:
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.GRAD_CLIP)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.GRAD_CLIP)
+                    optimizer.step()
 
-            total_loss += loss.item()
-            total_tensor += metrics.get("tensor_mse", 0.0)
-            total_fa += metrics.get("fa_mae", 0.0)
-            total_md += metrics.get("md_mae", 0.0)
+            total_loss += loss.detach()
+            total_tensor += metric_tensor(metrics, "tensor_mse")
+            total_fa += metric_tensor(metrics, "fa_mae")
+            total_md += metric_tensor(metrics, "md_mae")
             n_batches += 1
 
     n = max(n_batches, 1)
+    def mean_float(value: torch.Tensor) -> float:
+        return float((value / n).detach().cpu())
+
     return {
-        "loss": total_loss / n,
-        "tensor_mse": total_tensor / n,
-        "fa_mae": total_fa / n,
-        "md_mae": total_md / n,
+        "loss": mean_float(total_loss),
+        "tensor_mse": mean_float(total_tensor),
+        "fa_mae": mean_float(total_fa),
+        "md_mae": mean_float(total_md),
     }
 
 
 def main(args):
-    out_dir = Path(args.out_dir)
+    out_dir = resolve_project_path(args.out_dir)
+    zarr_path = path_str(args.zarr_path)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     device = get_device()
     log.info("Device: %s", device)
+    require_cuda_if_requested(device, args.require_cuda)
+    configure_torch_runtime(device, deterministic=args.deterministic)
+    amp_dtype = amp_dtype_from_name(device, args.amp_dtype)
+    amp_enabled = bool(args.amp and amp_dtype is not None)
+    channels_last = bool(args.channels_last and device.type == "cuda")
+    num_workers = default_num_workers(args.num_workers)
+    if amp_enabled:
+        log.info("AMP: enabled (%s)", str(amp_dtype).replace("torch.", ""))
+    else:
+        log.info("AMP: disabled")
+    if channels_last:
+        log.info("Memory format: channels_last")
 
     # ── TensorBoard ──────────────────────────────────────────────────────────
     writer = SummaryWriter(log_dir=str(out_dir / "tb"))
@@ -253,9 +315,9 @@ def main(args):
     # ── Subject split (by biological subject to prevent leakage) ────────────
     import zarr
 
-    store = zarr.open_group(args.zarr_path, mode="r")
+    store = zarr.open_group(zarr_path, mode="r")
     all_keys = sorted(store.keys())
-    log.info("Found %d entries in %s", len(all_keys), args.zarr_path)
+    log.info("Found %d entries in %s", len(all_keys), zarr_path)
 
     test_bio = args.test_subjects or DEFAULT_TEST_SUBJECTS
     val_bio = args.val_subjects or DEFAULT_VAL_SUBJECTS
@@ -280,7 +342,7 @@ def main(args):
     # ── Datasets & loaders ────────────────────────────────────────────────────
     use_brain_mask = not args.no_brain_mask
     train_ds = DWISliceDataset(
-        args.zarr_path, train_subjects,
+        zarr_path, train_subjects,
         augment=True,
         use_brain_mask=use_brain_mask,
         random_axis=cfg.RANDOM_SLICE_AXIS,
@@ -289,7 +351,7 @@ def main(args):
     # Validation uses axial-only slicing + deterministic degradation so the
     # reported val loss is comparable across epochs.
     val_ds = DWISliceDataset(
-        args.zarr_path, val_subjects,
+        zarr_path, val_subjects,
         augment=False,
         use_brain_mask=use_brain_mask,
         random_axis=False,
@@ -318,35 +380,57 @@ def main(args):
     val_ds.max_bval = global_max_bval
     val_ds.dti_scale = global_dti_scale
 
+    loader_kwargs = {
+        "num_workers": num_workers,
+        "pin_memory": device.type == "cuda",
+        "persistent_workers": num_workers > 0,
+    }
+    if num_workers > 0:
+        loader_kwargs["prefetch_factor"] = args.prefetch_factor
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=(device.type == "cuda"),
-        persistent_workers=args.num_workers > 0,
+        **loader_kwargs,
     )
     val_loader = DataLoader(
         val_ds,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=(device.type == "cuda"),
-        persistent_workers=args.num_workers > 0,
+        **loader_kwargs,
+    )
+    log.info(
+        "DataLoader: batch_size=%d workers=%d prefetch=%s pin_memory=%s",
+        args.batch_size,
+        num_workers,
+        args.prefetch_factor if num_workers > 0 else "off",
+        device.type == "cuda",
     )
 
     log.info("Train slices: %d  Val slices: %d  max_n: %d  max_bval: %.0f  dti_scale: %.4f",
              len(train_ds), len(val_ds), global_max_n, global_max_bval, global_dti_scale)
 
     # ── Model ─────────────────────────────────────────────────────────────────
-    model = QSpaceUNet(
+    raw_model = QSpaceUNet(
         max_n=global_max_n,
         feat_dim=args.feat_dim,
         channels=tuple(args.channels),
         cholesky=args.cholesky,
     ).to(device)
+    if channels_last:
+        raw_model = raw_model.to(memory_format=torch.channels_last)
+    model, is_compiled = maybe_compile_model(
+        raw_model,
+        setting=args.compile,
+        device=device,
+        mode=args.compile_mode,
+    )
+    if is_compiled:
+        log.info("torch.compile: enabled (mode=%s)", args.compile_mode)
+    else:
+        log.info("torch.compile: disabled")
 
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    n_params = sum(p.numel() for p in raw_model.parameters() if p.requires_grad)
     log.info("Model parameters: %s", f"{n_params:,}")
 
     # Log hyperparameters to TensorBoard
@@ -358,6 +442,14 @@ def main(args):
         "lambda_scalar": args.lambda_scalar, "lambda_edge": args.lambda_edge,
         "warmup_epochs": args.warmup_epochs, "patience": args.patience,
         "use_brain_mask": use_brain_mask,
+        "amp": amp_enabled,
+        "amp_dtype": str(amp_dtype).replace("torch.", "") if amp_dtype else None,
+        "channels_last": channels_last,
+        "compile": args.compile,
+        "compile_mode": args.compile_mode,
+        "num_workers": num_workers,
+        "prefetch_factor": args.prefetch_factor if num_workers > 0 else None,
+        "fused_adamw": args.fused_adamw and device.type == "cuda",
         "n_params": n_params,
         "train_subjects": train_subjects, "val_subjects": val_subjects,
         "test_subjects": test_subjects,
@@ -368,10 +460,27 @@ def main(args):
         lambda_scalar=args.lambda_scalar,
         lambda_edge=args.lambda_edge,
     ).to(device)
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=args.lr, weight_decay=args.weight_decay,
-        betas=(0.9, 0.99),
-    )
+    fused_adamw = args.fused_adamw and device.type == "cuda"
+    try:
+        optimizer = torch.optim.AdamW(
+            raw_model.parameters(),
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            betas=(0.9, 0.99),
+            fused=fused_adamw,
+        )
+    except TypeError:
+        if fused_adamw:
+            log.warning("Fused AdamW is unavailable in this PyTorch build; using regular AdamW")
+        fused_adamw = False
+        optimizer = torch.optim.AdamW(
+            raw_model.parameters(),
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            betas=(0.9, 0.99),
+        )
+    log.info("Optimizer: AdamW%s", " (fused)" if fused_adamw else "")
+    scaler = make_grad_scaler(device, enabled=amp_enabled, dtype=amp_dtype)
 
     # Linear warmup -> cosine annealing. Warmup stabilises early epochs when
     # the encoder embeddings are still random and gradients can spike.
@@ -407,8 +516,29 @@ def main(args):
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
 
-        train_metrics = run_epoch(model, train_loader, criterion, device, optimizer, use_brain_mask=use_brain_mask)
-        val_metrics = run_epoch(model, val_loader, criterion, device, optimizer=None, use_brain_mask=use_brain_mask)
+        train_metrics = run_epoch(
+            model,
+            train_loader,
+            criterion,
+            device,
+            optimizer,
+            use_brain_mask=use_brain_mask,
+            amp_enabled=amp_enabled,
+            amp_dtype=amp_dtype,
+            scaler=scaler,
+            channels_last=channels_last,
+        )
+        val_metrics = run_epoch(
+            model,
+            val_loader,
+            criterion,
+            device,
+            optimizer=None,
+            use_brain_mask=use_brain_mask,
+            amp_enabled=amp_enabled,
+            amp_dtype=amp_dtype,
+            channels_last=channels_last,
+        )
         scheduler.step()
 
         lr = optimizer.param_groups[0]["lr"]
@@ -445,7 +575,16 @@ def main(args):
 
         # ── TensorBoard: validation visualisation ────────────────────────────
         if epoch % args.vis_every == 0 or epoch == 1:
-            fig = make_val_figure(model, val_ds, device, dti_scale=train_ds.dti_scale, slice_idx=vis_slice_idx)
+            fig = make_val_figure(
+                model,
+                val_ds,
+                device,
+                dti_scale=train_ds.dti_scale,
+                slice_idx=vis_slice_idx,
+                amp_enabled=amp_enabled,
+                amp_dtype=amp_dtype,
+                channels_last=channels_last,
+            )
             writer.add_figure("val_prediction", fig, epoch)
             plt.close(fig)
 
@@ -457,7 +596,7 @@ def main(args):
             torch.save(
                 {
                     "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
+                    "model_state_dict": raw_model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "val_loss": best_val_loss,
                     "max_n": global_max_n,
@@ -470,6 +609,8 @@ def main(args):
                     "val_subjects": val_subjects,
                     "test_subjects": test_subjects,
                     "use_brain_mask": use_brain_mask,
+                    "amp_dtype": args.amp_dtype,
+                    "channels_last": channels_last,
                 },
                 out_dir / "best_model.pt",
             )
@@ -498,14 +639,14 @@ def main(args):
             break
 
     # ── Save training history ─────────────────────────────────────────────────
-    with open(out_dir / "history.json", "w") as f:
+    with (out_dir / "history.json").open("w", encoding="utf-8") as f:
         json.dump(history, f, indent=2)
 
     # Save final model
     torch.save(
         {
             "epoch": epoch,
-            "model_state_dict": model.state_dict(),
+            "model_state_dict": raw_model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "val_loss": val_metrics["loss"],
             "max_n": global_max_n,
@@ -518,6 +659,8 @@ def main(args):
             "val_subjects": val_subjects,
             "test_subjects": test_subjects,
             "use_brain_mask": use_brain_mask,
+            "amp_dtype": args.amp_dtype,
+            "channels_last": channels_last,
         },
         out_dir / "last_model.pt",
     )
@@ -557,9 +700,43 @@ if __name__ == "__main__":
     parser.add_argument("--patience", type=int, default=cfg.PATIENCE)
     parser.add_argument("--vis_every", type=int, default=1,
                         help="Generate validation visualisation every N epochs (default: 10)")
-    parser.add_argument("--num_workers", type=int, default=4,
-                        help="DataLoader worker processes (>=1 recommended so on-the-fly "
-                             "FFT+noise runs parallel to model compute)")
+    parser.add_argument("--num_workers", type=int, default=-1,
+                        help="DataLoader worker processes (-1 = OS-aware auto)")
+    parser.add_argument("--prefetch_factor", type=int, default=4,
+                        help="Batches prefetched per DataLoader worker")
+    amp_group = parser.add_mutually_exclusive_group()
+    amp_group.add_argument("--amp", dest="amp", action="store_true", default=True,
+                           help="Enable CUDA automatic mixed precision (default)")
+    amp_group.add_argument("--no_amp", "--no-amp", dest="amp", action="store_false",
+                           help="Disable CUDA automatic mixed precision")
+    parser.add_argument("--amp_dtype", choices=["auto", "bf16", "fp16"], default="auto",
+                        help="AMP dtype; auto prefers bf16 on RTX 40-series")
+    parser.add_argument("--bf16", dest="amp_dtype", action="store_const", const="bf16",
+                        help="Shortcut for --amp --amp_dtype bf16")
+    parser.add_argument("--fp16", dest="amp_dtype", action="store_const", const="fp16",
+                        help="Shortcut for --amp --amp_dtype fp16")
+    channels_group = parser.add_mutually_exclusive_group()
+    channels_group.add_argument("--channels_last", "--channels-last",
+                                dest="channels_last", action="store_true", default=True,
+                                help="Use channels-last convolution layout on CUDA (default)")
+    channels_group.add_argument("--no_channels_last", "--no-channels-last",
+                                dest="channels_last", action="store_false",
+                                help="Disable channels-last memory format")
+    parser.add_argument("--compile", choices=["off", "auto", "on"], default="auto",
+                        help="Use torch.compile; auto enables it on CUDA/Linux")
+    parser.add_argument("--compile_mode", choices=["default", "reduce-overhead", "max-autotune"],
+                        default="max-autotune", help="torch.compile mode")
+    parser.add_argument("--deterministic", action="store_true",
+                        help="Prefer deterministic CUDA kernels over fastest cuDNN autotuning")
+    fused_group = parser.add_mutually_exclusive_group()
+    fused_group.add_argument("--fused_adamw", "--fused-adamw",
+                             dest="fused_adamw", action="store_true", default=True,
+                             help="Use fused CUDA AdamW when available (default)")
+    fused_group.add_argument("--no_fused_adamw", "--no-fused-adamw",
+                             dest="fused_adamw", action="store_false",
+                             help="Disable fused CUDA AdamW")
+    parser.add_argument("--require_cuda", "--require-cuda", action="store_true",
+                        help="Fail fast when a CUDA PyTorch build/GPU is not available")
     parser.add_argument("--no_brain_mask", action="store_true",
                         help="Train and validate losses over the full image instead of brain-mask voxels only")
 

@@ -44,6 +44,17 @@ from research.utils import (
 from functions import compute_b0_norm, compute_brain_mask_from_dwi
 from research.augment import degrade_dwi_volume
 from research.model import QSpaceUNet
+from research.runtime import (
+    amp_dtype_from_name,
+    autocast_context,
+    configure_torch_runtime,
+    get_device,
+    maybe_channels_last,
+    maybe_compile_model,
+    path_str,
+    require_cuda_if_requested,
+    resolve_project_path,
+)
 import config as cfg
 
 
@@ -88,29 +99,25 @@ MPPCA_CFG = dict(
 )
 
 
-def get_device() -> torch.device:
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
-
-
 def predict_subject(
-    model: QSpaceUNet,
-    zarr_path: str,
+    model: torch.nn.Module,
+    zarr_path: str | Path,
     subject_key: str,
     device: torch.device,
     b0_threshold: float = cfg.B0_THRESHOLD,
     dti_scale: float = 1.0,
     max_bval: float = 1000.0,
     input_dwi: np.ndarray | None = None,
+    batch_size: int = 16,
+    amp_enabled: bool = False,
+    amp_dtype: torch.dtype | None = None,
+    channels_last: bool = False,
 ) -> np.ndarray:
     """Run inference on a full 3D subject, slice by slice.
 
     Returns predicted DTI tensor (X, Y, Z, 6) as float32 numpy array.
     """
-    store = zarr.open_group(zarr_path, mode="r")
+    store = zarr.open_group(path_str(zarr_path), mode="r")
     grp = store[subject_key]
 
     if input_dwi is None:
@@ -121,7 +128,7 @@ def predict_subject(
     bvecs = np.asarray(grp["bvecs"][:], dtype=np.float32)  # (3, N)
 
     X, Y, Z, N = input_dwi.shape
-    max_n = model.max_n
+    max_n = getattr(model, "max_n", getattr(model, "_orig_mod", model).max_n)
 
     # Normalise bvals using the same max_bval as training
     bvals_norm = bvals / max_bval
@@ -137,9 +144,10 @@ def predict_subject(
     vol_mask[:N] = 1.0
 
     # Prepare gradient tensors (shared across slices)
-    bvals_t = torch.from_numpy(bvals_norm).unsqueeze(0).to(device)
-    bvecs_t = torch.from_numpy(bvecs).unsqueeze(0).to(device)
-    vol_mask_t = torch.from_numpy(vol_mask).unsqueeze(0).to(device)
+    non_blocking = device.type == "cuda"
+    bvals_t = torch.from_numpy(bvals_norm).unsqueeze(0).to(device, non_blocking=non_blocking)
+    bvecs_t = torch.from_numpy(bvecs).unsqueeze(0).to(device, non_blocking=non_blocking)
+    vol_mask_t = torch.from_numpy(vol_mask).unsqueeze(0).to(device, non_blocking=non_blocking)
 
     # Compute normalisation factor from mean b0
     b0_idx = bvals[:N] < b0_threshold
@@ -150,21 +158,33 @@ def predict_subject(
 
     pred_dti = np.zeros((X, Y, Z, 6), dtype=np.float32)
 
+    signals = np.ascontiguousarray(input_dwi.transpose(2, 3, 0, 1), dtype=np.float32)
+    for z in range(Z):
+        b0_norm = compute_b0_norm(mean_b0_vol[:, :, z])
+        if b0_norm > 0:
+            signals[z] /= np.float32(b0_norm)
+
     model.eval()
-    with torch.no_grad():
-        for z in range(Z):
-            # Extract and normalise slice
-            signal = input_dwi[:, :, z, :].transpose(2, 0, 1).astype(np.float32)  # (max_n, H, W)
-
-            b0_slice = mean_b0_vol[:, :, z]
-            b0_norm = compute_b0_norm(b0_slice)
-            if b0_norm > 0:
-                signal = signal / b0_norm
-
-            signal_t = torch.from_numpy(signal).unsqueeze(0).to(device)
-
-            pred = model(signal_t, bvals_t, bvecs_t, vol_mask_t)  # (1, 6, H, W)
-            pred_dti[:, :, z, :] = pred[0].permute(1, 2, 0).cpu().numpy()
+    batch_size = max(1, int(batch_size))
+    with torch.inference_mode(), autocast_context(
+        device, enabled=amp_enabled, dtype=amp_dtype,
+    ):
+        for start in range(0, Z, batch_size):
+            end = min(start + batch_size, Z)
+            signal_t = torch.from_numpy(signals[start:end]).to(
+                device, non_blocking=non_blocking,
+            )
+            signal_t = maybe_channels_last(signal_t, channels_last)
+            n_batch = end - start
+            pred = model(
+                signal_t,
+                bvals_t.expand(n_batch, -1),
+                bvecs_t.expand(n_batch, -1, -1),
+                vol_mask_t.expand(n_batch, -1),
+            )  # (B, 6, H, W)
+            pred_dti[:, :, start:end, :] = (
+                pred.permute(2, 3, 0, 1).float().cpu().numpy()
+            )
 
     # Unscale from training range back to physical units
     pred_dti = pred_dti / dti_scale
@@ -271,8 +291,8 @@ def _baseline_dti_metrics(
 # Evaluate a single subject/repeat (all enabled methods)
 # ─────────────────────────────────────────────────────────────────────────────
 def evaluate_subject(
-    model: QSpaceUNet,
-    zarr_path: str,
+    model: torch.nn.Module,
+    zarr_path: str | Path,
     subject_key: str,
     device: torch.device,
     b0_threshold: float = cfg.B0_THRESHOLD,
@@ -285,6 +305,10 @@ def evaluate_subject(
     run_patch2self: bool = True,
     run_mppca: bool = True,
     p2s_cfg: dict | None = None,
+    infer_batch_size: int = 16,
+    amp_enabled: bool = False,
+    amp_dtype: torch.dtype | None = None,
+    channels_last: bool = False,
 ) -> tuple[dict, dict]:
     """Full evaluation pipeline for one subject and one degradation repeat.
 
@@ -298,7 +322,7 @@ def evaluate_subject(
     """
     t0 = time.time()
 
-    store = zarr.open_group(zarr_path, mode="r")
+    store = zarr.open_group(path_str(zarr_path), mode="r")
     grp = store[subject_key]
     target_dti6d = np.asarray(grp["target_dti_6d"][:], dtype=np.float32)
     target_dwi = np.asarray(grp["target_dwi"][:], dtype=np.float32)
@@ -321,6 +345,10 @@ def evaluate_subject(
         dti_scale=dti_scale,
         max_bval=max_bval,
         input_dwi=input_dwi,
+        batch_size=infer_batch_size,
+        amp_enabled=amp_enabled,
+        amp_dtype=amp_dtype,
+        channels_last=channels_last,
     )
 
     research_elapsed = time.time() - t0
@@ -806,7 +834,7 @@ def run_patch2self_sweep(
         len(p2s_configs), len(subjects), args.eval_repeats,
     )
 
-    store = zarr.open_group(args.zarr_path, mode="r")
+    store = zarr.open_group(path_str(args.zarr_path), mode="r")
     eval_rng = np.random.default_rng(args.eval_seed)
     rows = []
 
@@ -952,10 +980,25 @@ def run_patch2self_sweep(
 def main(args):
     _validate_eval_args(args)
 
+    zarr_path = path_str(args.zarr_path)
+    out_dir = resolve_project_path(args.out_dir)
+    checkpoint_path = resolve_project_path(args.checkpoint)
+    args.zarr_path = zarr_path
+    args.out_dir = str(out_dir)
+
     device = get_device()
     log.info("Device: %s", device)
+    require_cuda_if_requested(device, args.require_cuda)
+    configure_torch_runtime(device, deterministic=args.deterministic)
+    amp_dtype = amp_dtype_from_name(device, args.amp_dtype)
+    amp_enabled = bool(args.amp and amp_dtype is not None)
+    channels_last = bool(args.channels_last and device.type == "cuda")
+    if amp_enabled:
+        log.info("AMP: enabled (%s)", str(amp_dtype).replace("torch.", ""))
+    else:
+        log.info("AMP: disabled")
 
-    store = zarr.open_group(args.zarr_path, mode="r")
+    store = zarr.open_group(zarr_path, mode="r")
     all_keys = sorted(store.keys())
 
     if args.sweep_patch2self:
@@ -968,11 +1011,11 @@ def main(args):
             log.error("No subjects selected for Patch2Self sweep.")
             return
         log.info("Patch2Self sweep subjects: %s", subjects)
-        run_patch2self_sweep(args, subjects, Path(args.out_dir))
+        run_patch2self_sweep(args, subjects, out_dir)
         return
 
     # Load checkpoint
-    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     max_n = ckpt["max_n"]
     feat_dim = ckpt.get("feat_dim", 64)
     channels = tuple(ckpt.get("channels", [64, 128, 256, 512]))
@@ -981,9 +1024,18 @@ def main(args):
     max_bval = ckpt.get("max_bval", 1000.0)
     log.info("DTI scale factor: %.4f, max_bval: %.1f, cholesky: %s", dti_scale, max_bval, cholesky)
 
-    model = QSpaceUNet(max_n=max_n, feat_dim=feat_dim, channels=channels, cholesky=cholesky).to(device)
-    model.load_state_dict(ckpt["model_state_dict"])
+    raw_model = QSpaceUNet(max_n=max_n, feat_dim=feat_dim, channels=channels, cholesky=cholesky).to(device)
+    raw_model.load_state_dict(ckpt["model_state_dict"])
+    if channels_last:
+        raw_model = raw_model.to(memory_format=torch.channels_last)
+    model, is_compiled = maybe_compile_model(
+        raw_model,
+        setting=args.compile,
+        device=device,
+        mode=args.compile_mode,
+    )
     model.eval()
+    log.info("torch.compile: %s", f"enabled (mode={args.compile_mode})" if is_compiled else "disabled")
     log.info("Loaded checkpoint from epoch %d (val_loss=%.6f)", ckpt["epoch"], ckpt["val_loss"])
 
     # Determine subjects to evaluate
@@ -1030,7 +1082,7 @@ def main(args):
             )
             try:
                 all_metrics, arrays = evaluate_subject(
-                    model, args.zarr_path, subj, device,
+                    model, zarr_path, subj, device,
                     b0_threshold=args.b0_threshold,
                     dti_scale=dti_scale,
                     max_bval=max_bval,
@@ -1041,6 +1093,10 @@ def main(args):
                     run_patch2self=run_patch2self,
                     run_mppca=run_mppca,
                     p2s_cfg=p2s_cfg,
+                    infer_batch_size=args.infer_batch_size,
+                    amp_enabled=amp_enabled,
+                    amp_dtype=amp_dtype,
+                    channels_last=channels_last,
                 )
                 rm = all_metrics["research"]
                 log.info(
@@ -1084,7 +1140,6 @@ def main(args):
         return
 
     # ── Save CSVs ─────────────────────────────────────────────────────────
-    out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     metric_cols = [
@@ -1248,6 +1303,34 @@ if __name__ == "__main__":
     parser.add_argument("--eval_noise_max", "--eval-noise-max", type=float,
                         default=cfg.EVAL_NOISE_MAX,
                         help="Maximum relative Gaussian noise level sampled during evaluation")
+    parser.add_argument("--infer_batch_size", "--infer-batch-size", type=int, default=16,
+                        help="Number of axial slices evaluated per GPU forward pass")
+    amp_group = parser.add_mutually_exclusive_group()
+    amp_group.add_argument("--amp", dest="amp", action="store_true", default=True,
+                           help="Enable CUDA automatic mixed precision (default)")
+    amp_group.add_argument("--no_amp", "--no-amp", dest="amp", action="store_false",
+                           help="Disable CUDA automatic mixed precision")
+    parser.add_argument("--amp_dtype", choices=["auto", "bf16", "fp16"], default="auto",
+                        help="AMP dtype; auto prefers bf16 on RTX 40-series")
+    parser.add_argument("--bf16", dest="amp_dtype", action="store_const", const="bf16",
+                        help="Shortcut for --amp --amp_dtype bf16")
+    parser.add_argument("--fp16", dest="amp_dtype", action="store_const", const="fp16",
+                        help="Shortcut for --amp --amp_dtype fp16")
+    channels_group = parser.add_mutually_exclusive_group()
+    channels_group.add_argument("--channels_last", "--channels-last",
+                                dest="channels_last", action="store_true", default=True,
+                                help="Use channels-last convolution layout on CUDA (default)")
+    channels_group.add_argument("--no_channels_last", "--no-channels-last",
+                                dest="channels_last", action="store_false",
+                                help="Disable channels-last memory format")
+    parser.add_argument("--compile", choices=["off", "auto", "on"], default="auto",
+                        help="Use torch.compile; auto enables it on CUDA/Linux")
+    parser.add_argument("--compile_mode", choices=["default", "reduce-overhead", "max-autotune"],
+                        default="max-autotune", help="torch.compile mode")
+    parser.add_argument("--deterministic", action="store_true",
+                        help="Prefer deterministic CUDA kernels over fastest cuDNN autotuning")
+    parser.add_argument("--require_cuda", "--require-cuda", action="store_true",
+                        help="Fail fast when a CUDA PyTorch build/GPU is not available")
     parser.add_argument("--skip_plot", action="store_true",
                         help="Disable saving plots")
     parser.add_argument("--skip_baselines", action="store_true",

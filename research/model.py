@@ -93,6 +93,8 @@ class QSpaceEncoder(nn.Module):
         # magnitude from N (subjects have varying numbers of volumes).
         n_eff = vol_mask.sum(dim=1).clamp(min=1.0).view(-1, 1, 1, 1)
         features = features / n_eff
+        if signal.is_contiguous(memory_format=torch.channels_last):
+            features = features.contiguous(memory_format=torch.channels_last)
 
         return self.post(features)
 

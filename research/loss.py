@@ -83,7 +83,8 @@ class DTILoss(nn.Module):
         pred: torch.Tensor,
         target: torch.Tensor,
         mask: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, dict[str, float]]:
+        return_tensor_metrics: bool = False,
+    ) -> tuple[torch.Tensor, dict[str, float | torch.Tensor]]:
         residual = pred - target
         charb = _charbonnier(residual, self.charbonnier_eps)
 
@@ -98,9 +99,13 @@ class DTILoss(nn.Module):
             with torch.no_grad():
                 tensor_mse_val = (residual ** 2).mean()
 
+        def metric_value(value: torch.Tensor) -> float | torch.Tensor:
+            value = value.detach()
+            return value if return_tensor_metrics else value.item()
+
         metrics = {
-            "tensor_loss": tensor_loss.item(),
-            "tensor_mse": tensor_mse_val.item(),
+            "tensor_loss": metric_value(tensor_loss),
+            "tensor_mse": metric_value(tensor_mse_val),
         }
 
         total = tensor_loss
@@ -116,8 +121,8 @@ class DTILoss(nn.Module):
             else:
                 fa_loss = F.l1_loss(pred_fa, tgt_fa)
                 md_loss = F.l1_loss(pred_md, tgt_md)
-            metrics["fa_mae"] = fa_loss.item()
-            metrics["md_mae"] = md_loss.item()
+            metrics["fa_mae"] = metric_value(fa_loss)
+            metrics["md_mae"] = metric_value(md_loss)
 
             if self.lambda_scalar > 0:
                 total = total + self.lambda_scalar * (fa_loss + md_loss)
@@ -130,7 +135,7 @@ class DTILoss(nn.Module):
                     edge_loss = (torch.abs(pred_edges - tgt_edges) * mask).sum() / n_spatial
                 else:
                     edge_loss = F.l1_loss(pred_edges, tgt_edges)
-                metrics["fa_edge"] = edge_loss.item()
+                metrics["fa_edge"] = metric_value(edge_loss)
                 total = total + self.lambda_edge * edge_loss
 
         return total, metrics
