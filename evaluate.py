@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""Build the clean production Zarr dataset.
-
-This entry point writes target_dwi, target_dti_6d, bvals, bvecs, and the
-precomputed brain_mask. The brain mask is computed in src/dw_thi/preprocessing.py
-with DIPY's median_otsu on the mean b0 volume.
-"""
+"""Production evaluation entry point."""
 
 from __future__ import annotations
 
@@ -18,8 +13,8 @@ if str(SRC_ROOT) not in sys.path:
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from dw_thi.preprocessing import main
+from dw_thi.evaluate import build_arg_parser, main
 
 
 if __name__ == "__main__":
-    main()
+    main(build_arg_parser().parse_args())

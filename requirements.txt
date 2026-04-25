@@ -11,7 +11,5 @@ joblib
 zarr
 torch
 torchvision
-wandb
+tensorboard
 tqdm
-
-triton

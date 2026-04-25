@@ -7,11 +7,11 @@ k-space cutouts and noise realisations. Patch2Self and MP-PCA are also
 run unless disabled, and comparison plots + metric tables are saved.
 
 Usage:
-    python -m research.evaluate
-    python -m research.evaluate --checkpoint research/runs/run_new_data_2_aug/best_model.pt --subjects sub-10 sub-11
-    python -m research.evaluate --checkpoint research/runs/run_new_data_2_aug/best_model.pt --skip_baselines
-    python -m research.evaluate --checkpoint research/runs/run_new_data_2_aug/best_model.pt --eval_repeats 5 --skip_mppca
-    python -m research.evaluate --sweep_patch2self --eval_repeats 3
+    python evaluate.py
+    python evaluate.py --checkpoint research/runs/production/best_model.pt --subjects sub-10 sub-11
+    python evaluate.py --checkpoint research/runs/production/best_model.pt --skip_baselines
+    python evaluate.py --checkpoint research/runs/production/best_model.pt --eval_repeats 5 --skip_mppca
+    python evaluate.py --sweep_patch2self --eval_repeats 3
 """
 
 import argparse
@@ -27,11 +27,11 @@ import pandas as pd
 import torch
 import zarr
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from research.utils import (
+from .utils import (
     dti6d_to_scalar_maps,
     fit_dti_to_6d,
     sanitize_dti6d,
@@ -41,10 +41,10 @@ from research.utils import (
     _robust_limits,
     _symmetric_limits,
 )
-from functions import compute_b0_norm, compute_brain_mask_from_dwi
-from research.augment import degrade_dwi_volume
-from research.model import QSpaceUNet
-from research.runtime import (
+from .preprocessing import compute_b0_norm, compute_brain_mask_from_dwi
+from .augment import degrade_dwi_volume
+from .model import QSpaceUNet
+from .runtime import (
     amp_dtype_from_name,
     autocast_context,
     configure_torch_runtime,
@@ -336,8 +336,12 @@ def evaluate_subject(
     bvals = np.asarray(grp["bvals"][:], dtype=np.float32)
     bvecs = np.asarray(grp["bvecs"][:], dtype=np.float32)
 
-    # ── Brain mask (shared across all methods) ─────────────────────────
-    mask_3d = compute_brain_mask_from_dwi(target_dwi, bvals, b0_threshold)
+    # Brain mask is part of the production Zarr contract. Older stores without
+    # it still run via the same DIPY median_otsu fallback used by the builder.
+    if "brain_mask" in set(grp.array_keys()):
+        mask_3d = np.asarray(grp["brain_mask"][:], dtype=bool)
+    else:
+        mask_3d = compute_brain_mask_from_dwi(target_dwi, bvals, b0_threshold)
 
     # ── Research model ────────────────────────────────────────────────────
     pred_dti6d = predict_subject(
@@ -1277,12 +1281,12 @@ def main(args):
             print(line)
 
 
-if __name__ == "__main__":
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Evaluate QSpaceUNet on test subjects")
     parser.add_argument("--checkpoint", default=cfg.EVAL_DEFAULT_CHECKPOINT,
                         help="Path to model checkpoint")
-    parser.add_argument("--zarr_path", default="dataset/default_clean.zarr")
-    parser.add_argument("--out_dir", default="research/results")
+    parser.add_argument("--zarr_path", default=cfg.DATASET_ZARR_PATH)
+    parser.add_argument("--out_dir", default=cfg.EVAL_OUT_DIR)
     parser.add_argument("--subjects", nargs="*", default=None,
                         help="Biological subject IDs or Zarr keys to evaluate (default: test subjects from checkpoint)")
     parser.add_argument("--eval_all", action="store_true",
@@ -1304,14 +1308,14 @@ if __name__ == "__main__":
     parser.add_argument("--eval_noise_max", "--eval-noise-max", type=float,
                         default=cfg.EVAL_NOISE_MAX,
                         help="Maximum relative Gaussian noise level sampled during evaluation")
-    parser.add_argument("--infer_batch_size", "--infer-batch-size", type=int, default=16,
+    parser.add_argument("--infer_batch_size", "--infer-batch-size", type=int, default=cfg.EVAL_INFER_BATCH_SIZE,
                         help="Number of axial slices evaluated per GPU forward pass")
     amp_group = parser.add_mutually_exclusive_group()
-    amp_group.add_argument("--amp", dest="amp", action="store_true", default=True,
+    amp_group.add_argument("--amp", dest="amp", action="store_true", default=cfg.AMP,
                            help="Enable CUDA automatic mixed precision (default)")
     amp_group.add_argument("--no_amp", "--no-amp", dest="amp", action="store_false",
                            help="Disable CUDA automatic mixed precision")
-    parser.add_argument("--amp_dtype", choices=["auto", "bf16", "fp16"], default="auto",
+    parser.add_argument("--amp_dtype", choices=["auto", "bf16", "fp16"], default=cfg.AMP_DTYPE,
                         help="AMP dtype; auto prefers bf16 on RTX 40-series")
     parser.add_argument("--bf16", dest="amp_dtype", action="store_const", const="bf16",
                         help="Shortcut for --amp --amp_dtype bf16")
@@ -1319,15 +1323,15 @@ if __name__ == "__main__":
                         help="Shortcut for --amp --amp_dtype fp16")
     channels_group = parser.add_mutually_exclusive_group()
     channels_group.add_argument("--channels_last", "--channels-last",
-                                dest="channels_last", action="store_true", default=True,
+                                dest="channels_last", action="store_true", default=cfg.CHANNELS_LAST,
                                 help="Use channels-last convolution layout on CUDA (default)")
     channels_group.add_argument("--no_channels_last", "--no-channels-last",
                                 dest="channels_last", action="store_false",
                                 help="Disable channels-last memory format")
-    parser.add_argument("--compile", choices=["off", "auto", "on"], default="auto",
+    parser.add_argument("--compile", choices=["off", "auto", "on"], default=cfg.COMPILE,
                         help="Use torch.compile; auto enables it on CUDA/Linux")
     parser.add_argument("--compile_mode", choices=["default", "reduce-overhead", "max-autotune"],
-                        default="max-autotune", help="torch.compile mode")
+                        default=cfg.COMPILE_MODE, help="torch.compile mode")
     parser.add_argument("--deterministic", action="store_true",
                         help="Prefer deterministic CUDA kernels over fastest cuDNN autotuning")
     parser.add_argument("--require_cuda", "--require-cuda", action="store_true",
@@ -1418,4 +1422,8 @@ if __name__ == "__main__":
     parser.add_argument("--plot_volume_idx", type=int, default=None,
                         help="DWI volume index for visualization (default: auto)")
 
-    main(parser.parse_args())
+    return parser
+
+
+if __name__ == "__main__":
+    main(build_arg_parser().parse_args())
