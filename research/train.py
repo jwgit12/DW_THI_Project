@@ -23,7 +23,10 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 from research.utils import dti6d_to_scalar_maps, scalar_map_metrics
 from research.dataset import DWISliceDataset, dwi_worker_init
@@ -84,11 +87,134 @@ def load_baseline_metrics(csv_paths: list[Path]) -> dict[str, dict[str, float]]:
     return baselines
 
 
-def log_baseline_references(writer: SummaryWriter, baselines: dict, epoch: int):
-    """Log baseline metric values as flat reference lines in TensorBoard."""
+def flatten_baseline_metrics(baselines: dict[str, dict[str, float]]) -> dict[str, float]:
+    """Flatten baseline metrics into W&B-safe metric names."""
+    flat_metrics = {}
     for name, metrics in baselines.items():
+        safe_name = name.replace("-", "_")
         for metric, value in metrics.items():
-            writer.add_scalar(f"baselines/{metric}/{name}", value, epoch)
+            flat_metrics[f"baseline_{safe_name}_{metric}"] = value
+    return flat_metrics
+
+
+def build_wandb_config(
+    args: argparse.Namespace,
+    *,
+    out_dir: Path,
+    zarr_path: str,
+    device: torch.device,
+    global_max_n: int,
+    global_max_bval: float,
+    global_dti_scale: float,
+    train_subjects: list[str],
+    val_subjects: list[str],
+    test_subjects: list[str],
+    train_slices: int,
+    val_slices: int,
+    use_brain_mask: bool,
+    amp_enabled: bool,
+    amp_dtype: torch.dtype | None,
+    channels_last: bool,
+    num_workers: int,
+    fused_adamw: bool,
+    n_params: int,
+    is_compiled: bool,
+) -> dict[str, object]:
+    return {
+        "out_dir": str(out_dir),
+        "zarr_path": zarr_path,
+        "device": str(device),
+        "max_n": global_max_n,
+        "max_bval": global_max_bval,
+        "dti_scale": global_dti_scale,
+        "feat_dim": args.feat_dim,
+        "channels": list(args.channels),
+        "cholesky": args.cholesky,
+        "batch_size": args.batch_size,
+        "epochs": args.epochs,
+        "lr": args.lr,
+        "weight_decay": args.weight_decay,
+        "lambda_scalar": args.lambda_scalar,
+        "lambda_edge": args.lambda_edge,
+        "warmup_epochs": args.warmup_epochs,
+        "patience": args.patience,
+        "vis_every": args.vis_every,
+        "use_brain_mask": use_brain_mask,
+        "amp": amp_enabled,
+        "amp_dtype": str(amp_dtype).replace("torch.", "") if amp_dtype else None,
+        "channels_last": channels_last,
+        "compile": args.compile,
+        "compile_mode": args.compile_mode,
+        "compile_enabled": is_compiled,
+        "num_workers": num_workers,
+        "prefetch_factor": args.prefetch_factor if num_workers > 0 else None,
+        "fused_adamw": fused_adamw,
+        "n_params": n_params,
+        "train_slices": train_slices,
+        "val_slices": val_slices,
+        "train_subjects": train_subjects,
+        "val_subjects": val_subjects,
+        "test_subjects": test_subjects,
+    }
+
+
+def init_wandb_run(
+    args: argparse.Namespace,
+    *,
+    out_dir: Path,
+    config: dict[str, object],
+    baseline_metrics: dict[str, float],
+):
+    if wandb is None:
+        raise RuntimeError(
+            "wandb is required for training tracking but is not installed. "
+            "Install dependencies from requirements.txt before running research.train."
+        )
+
+    init_kwargs = {
+        "project": args.wandb_project,
+        "entity": args.wandb_entity,
+        "name": args.wandb_name or out_dir.name,
+        "job_type": "train",
+        "dir": str(out_dir),
+        "config": config,
+        "mode": args.wandb_mode,
+    }
+    try:
+        run = wandb.init(**init_kwargs)
+    except wandb.errors.UsageError as exc:
+        if args.wandb_mode != "online":
+            raise
+        log.warning(
+            "wandb online init failed (%s). Falling back to offline mode; run `wandb login` "
+            "to enable cloud sync.",
+            exc,
+        )
+        fallback_kwargs = dict(init_kwargs)
+        fallback_kwargs["mode"] = "offline"
+        run = wandb.init(**fallback_kwargs)
+
+    run.define_metric("epoch")
+    tracked_metrics = [
+        "train_loss",
+        "val_loss",
+        "train_tensor_mse",
+        "val_tensor_mse",
+        "train_fa_mae",
+        "val_fa_mae",
+        "train_md_mae",
+        "val_md_mae",
+        "learning_rate",
+        "epoch_time_s",
+        *baseline_metrics.keys(),
+    ]
+    for metric_name in tracked_metrics:
+        run.define_metric(metric_name, step_metric="epoch")
+    run.define_metric("val_loss", step_metric="epoch", summary="min")
+    run.define_metric("val_tensor_mse", step_metric="epoch", summary="min")
+    run.define_metric("val_fa_mae", step_metric="epoch", summary="min")
+    run.define_metric("val_md_mae", step_metric="epoch", summary="min")
+    return run
 
 
 def make_val_figure(
@@ -294,400 +420,430 @@ def run_epoch(
 
 
 def main(args):
-    out_dir = resolve_project_path(args.out_dir)
-    zarr_path = path_str(args.zarr_path)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    wandb_run = None
+    completed = False
 
-    device = get_device()
-    log.info("Device: %s", device)
-    require_cuda_if_requested(device, args.require_cuda)
-    configure_torch_runtime(device, deterministic=args.deterministic)
-    amp_dtype = amp_dtype_from_name(device, args.amp_dtype)
-    amp_enabled = bool(args.amp and amp_dtype is not None)
-    channels_last = bool(args.channels_last and device.type == "cuda")
-    num_workers = default_num_workers(args.num_workers)
-    if amp_enabled:
-        log.info("AMP: enabled (%s)", str(amp_dtype).replace("torch.", ""))
-    else:
-        log.info("AMP: disabled")
-    if channels_last:
-        log.info("Memory format: channels_last")
-
-    # ── TensorBoard ──────────────────────────────────────────────────────────
-    writer = SummaryWriter(log_dir=str(out_dir / "tb"))
-
-    # ── Load baseline metrics for reference lines ────────────────────────────
-    # Look for baseline CSVs produced by research.evaluate in the output dir
-    baseline_csvs = [
-        out_dir / "metrics_patch2self.csv",
-        out_dir / "metrics_mppca.csv",
-    ]
-    baselines = load_baseline_metrics(baseline_csvs)
-    if baselines:
-        log.info("Loaded baseline references: %s", list(baselines.keys()))
-
-    # ── Subject split (by biological subject to prevent leakage) ────────────
-    import zarr
-
-    store = zarr.open_group(zarr_path, mode="r")
-    all_keys = sorted(store.keys())
-    log.info("Found %d entries in %s", len(all_keys), zarr_path)
-
-    test_bio = args.test_subjects or DEFAULT_TEST_SUBJECTS
-    val_bio = args.val_subjects or DEFAULT_VAL_SUBJECTS
-    held_out = set(test_bio) | set(val_bio)
-
-    train_subjects, val_subjects, test_subjects = [], [], []
-    for key in all_keys:
-        bio_subject = key.rsplit("_ses-", 1)[0]
-        if bio_subject in test_bio:
-            test_subjects.append(key)
-        elif bio_subject in val_bio:
-            val_subjects.append(key)
-        else:
-            train_subjects.append(key)
-
-    log.info("Train: %d  Val: %d  Test: %d (from %d/%d/%d biological subjects)",
-             len(train_subjects), len(val_subjects), len(test_subjects),
-             len({k.rsplit("_ses-", 1)[0] for k in train_subjects}),
-             len({k.rsplit("_ses-", 1)[0] for k in val_subjects}),
-             len({k.rsplit("_ses-", 1)[0] for k in test_subjects}))
-
-    # ── Datasets & loaders ────────────────────────────────────────────────────
-    use_brain_mask = not args.no_brain_mask
-    train_ds = DWISliceDataset(
-        zarr_path, train_subjects,
-        augment=True,
-        use_brain_mask=use_brain_mask,
-        random_axis=cfg.RANDOM_SLICE_AXIS,
-        slice_axes=cfg.SLICE_AXES,
-        gpu_degrade=device.type == "cuda",
-    )
-    # Validation uses axial-only slicing + deterministic degradation so the
-    # reported val loss is comparable across epochs.
-    val_ds = DWISliceDataset(
-        zarr_path, val_subjects,
-        augment=False,
-        use_brain_mask=use_brain_mask,
-        random_axis=False,
-        eval_mode=True,
-    )
-
-    # Derive all normalisation constants from training data only to prevent
-    # information leakage from val/test into training.
-    # max_n must accommodate the largest subject across all splits (structural
-    # padding requirement), but max_bval, dti_scale and canonical_hw are true
-    # normalisation scales and must come from training data exclusively.
-    global_max_n = max(train_ds.max_n, val_ds.max_n)
-    train_ds.max_n = global_max_n
-    val_ds.max_n = global_max_n
-
-    # Keep explicit local names for logging and checkpoint metadata.
-    global_max_bval = train_ds.max_bval
-    global_dti_scale = train_ds.dti_scale
-    canonical_hw = (
-        max(train_ds.canonical_hw[0], val_ds.canonical_hw[0]),
-        max(train_ds.canonical_hw[1], val_ds.canonical_hw[1]),
-    )
-    train_ds.canonical_hw = canonical_hw
-    val_ds.canonical_hw = canonical_hw
-
-    val_ds.max_bval = global_max_bval
-    val_ds.dti_scale = global_dti_scale
-
-    loader_kwargs = {
-        "num_workers": num_workers,
-        "pin_memory": device.type == "cuda",
-        "persistent_workers": num_workers > 0,
-        # Each worker preloads all subject data into its own RAM on startup,
-        # eliminating zarr I/O overhead during training (~25x faster per sample).
-        "worker_init_fn": dwi_worker_init if num_workers > 0 else None,
-    }
-    if num_workers > 0:
-        loader_kwargs["prefetch_factor"] = args.prefetch_factor
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=args.batch_size,
-        shuffle=True,
-        **loader_kwargs,
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=args.batch_size,
-        shuffle=False,
-        **loader_kwargs,
-    )
-    log.info(
-        "DataLoader: batch_size=%d workers=%d prefetch=%s pin_memory=%s "
-        "preload_in_workers=%s gpu_degrade=%s",
-        args.batch_size,
-        num_workers,
-        args.prefetch_factor if num_workers > 0 else "off",
-        device.type == "cuda",
-        num_workers > 0,
-        train_ds.gpu_degrade,
-    )
-
-    log.info("Train slices: %d  Val slices: %d  max_n: %d  max_bval: %.0f  dti_scale: %.4f",
-             len(train_ds), len(val_ds), global_max_n, global_max_bval, global_dti_scale)
-
-    # ── Model ─────────────────────────────────────────────────────────────────
-    raw_model = QSpaceUNet(
-        max_n=global_max_n,
-        feat_dim=args.feat_dim,
-        channels=tuple(args.channels),
-        cholesky=args.cholesky,
-    ).to(device)
-    if channels_last:
-        raw_model = raw_model.to(memory_format=torch.channels_last)
-    model, is_compiled = maybe_compile_model(
-        raw_model,
-        setting=args.compile,
-        device=device,
-        mode=args.compile_mode,
-    )
-    if is_compiled:
-        log.info("torch.compile: enabled (mode=%s)", args.compile_mode)
-    else:
-        log.info("torch.compile: disabled")
-
-    n_params = sum(p.numel() for p in raw_model.parameters() if p.requires_grad)
-    log.info("Model parameters: %s", f"{n_params:,}")
-
-    # Log hyperparameters to TensorBoard
-    writer.add_text("hparams", json.dumps({
-        "max_n": global_max_n, "feat_dim": args.feat_dim,
-        "channels": list(args.channels), "cholesky": args.cholesky,
-        "batch_size": args.batch_size,
-        "lr": args.lr, "weight_decay": args.weight_decay,
-        "lambda_scalar": args.lambda_scalar, "lambda_edge": args.lambda_edge,
-        "warmup_epochs": args.warmup_epochs, "patience": args.patience,
-        "use_brain_mask": use_brain_mask,
-        "amp": amp_enabled,
-        "amp_dtype": str(amp_dtype).replace("torch.", "") if amp_dtype else None,
-        "channels_last": channels_last,
-        "compile": args.compile,
-        "compile_mode": args.compile_mode,
-        "num_workers": num_workers,
-        "prefetch_factor": args.prefetch_factor if num_workers > 0 else None,
-        "fused_adamw": args.fused_adamw and device.type == "cuda",
-        "n_params": n_params,
-        "train_subjects": train_subjects, "val_subjects": val_subjects,
-        "test_subjects": test_subjects,
-    }, indent=2))
-
-    # ── Optimiser & scheduler ─────────────────────────────────────────────────
-    criterion = DTILoss(
-        lambda_scalar=args.lambda_scalar,
-        lambda_edge=args.lambda_edge,
-    ).to(device)
-    fused_adamw = args.fused_adamw and device.type == "cuda"
     try:
-        optimizer = torch.optim.AdamW(
-            raw_model.parameters(),
-            lr=args.lr,
-            weight_decay=args.weight_decay,
-            betas=(0.9, 0.99),
-            fused=fused_adamw,
-        )
-    except TypeError:
-        if fused_adamw:
-            log.warning("Fused AdamW is unavailable in this PyTorch build; using regular AdamW")
-        fused_adamw = False
-        optimizer = torch.optim.AdamW(
-            raw_model.parameters(),
-            lr=args.lr,
-            weight_decay=args.weight_decay,
-            betas=(0.9, 0.99),
-        )
-    log.info("Optimizer: AdamW%s", " (fused)" if fused_adamw else "")
-    scaler = make_grad_scaler(device, enabled=amp_enabled, dtype=amp_dtype)
+        out_dir = resolve_project_path(args.out_dir)
+        zarr_path = path_str(args.zarr_path)
+        out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Linear warmup -> cosine annealing. Warmup stabilises early epochs when
-    # the encoder embeddings are still random and gradients can spike.
-    warmup_epochs = min(args.warmup_epochs, max(args.epochs - 1, 1))
-    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=max(args.epochs - warmup_epochs, 1),
-        eta_min=args.lr * 0.01,
-    )
-    if warmup_epochs > 0:
-        warmup = torch.optim.lr_scheduler.LinearLR(
-            optimizer,
-            start_factor=1e-3,
-            end_factor=1.0,
-            total_iters=warmup_epochs,
-        )
-        scheduler = torch.optim.lr_scheduler.SequentialLR(
-            optimizer, schedulers=[warmup, cosine], milestones=[warmup_epochs],
-        )
-    else:
-        scheduler = cosine
+        device = get_device()
+        log.info("Device: %s", device)
+        require_cuda_if_requested(device, args.require_cuda)
+        configure_torch_runtime(device, deterministic=args.deterministic)
+        amp_dtype = amp_dtype_from_name(device, args.amp_dtype)
+        amp_enabled = bool(args.amp and amp_dtype is not None)
+        channels_last = bool(args.channels_last and device.type == "cuda")
+        num_workers = default_num_workers(args.num_workers)
+        if amp_enabled:
+            log.info("AMP: enabled (%s)", str(amp_dtype).replace("torch.", ""))
+        else:
+            log.info("AMP: disabled")
+        if channels_last:
+            log.info("Memory format: channels_last")
 
-    # ── Pick a fixed validation slice for visualisation ───────────────────────
-    vis_slice_idx = -1
+        # ── Load baseline metrics for flat reference lines ──────────────────────
+        # Look for baseline CSVs produced by research.evaluate in the output dir.
+        baseline_csvs = [
+            out_dir / "metrics_patch2self.csv",
+            out_dir / "metrics_mppca.csv",
+        ]
+        baselines = load_baseline_metrics(baseline_csvs)
+        baseline_log_metrics = flatten_baseline_metrics(baselines)
+        if baselines:
+            log.info("Loaded baseline references: %s", list(baselines.keys()))
 
-    # ── Training loop ─────────────────────────────────────────────────────────
-    best_val_loss = float("inf")
-    patience_counter = 0
-    history: list[dict] = []
+        # ── Subject split (by biological subject to prevent leakage) ────────────
+        import zarr
 
-    log.info("Starting training for %d epochs (patience=%d)", args.epochs, args.patience)
+        store = zarr.open_group(zarr_path, mode="r")
+        all_keys = sorted(store.keys())
+        log.info("Found %d entries in %s", len(all_keys), zarr_path)
 
-    for epoch in range(1, args.epochs + 1):
-        t0 = time.time()
+        test_bio = args.test_subjects or DEFAULT_TEST_SUBJECTS
+        val_bio = args.val_subjects or DEFAULT_VAL_SUBJECTS
 
-        train_metrics = run_epoch(
-            model,
-            train_loader,
-            criterion,
-            device,
-            optimizer,
+        train_subjects, val_subjects, test_subjects = [], [], []
+        for key in all_keys:
+            bio_subject = key.rsplit("_ses-", 1)[0]
+            if bio_subject in test_bio:
+                test_subjects.append(key)
+            elif bio_subject in val_bio:
+                val_subjects.append(key)
+            else:
+                train_subjects.append(key)
+
+        log.info("Train: %d  Val: %d  Test: %d (from %d/%d/%d biological subjects)",
+                 len(train_subjects), len(val_subjects), len(test_subjects),
+                 len({k.rsplit("_ses-", 1)[0] for k in train_subjects}),
+                 len({k.rsplit("_ses-", 1)[0] for k in val_subjects}),
+                 len({k.rsplit("_ses-", 1)[0] for k in test_subjects}))
+
+        # ── Datasets & loaders ──────────────────────────────────────────────────
+        use_brain_mask = not args.no_brain_mask
+        train_ds = DWISliceDataset(
+            zarr_path, train_subjects,
+            augment=True,
             use_brain_mask=use_brain_mask,
-            amp_enabled=amp_enabled,
-            amp_dtype=amp_dtype,
-            scaler=scaler,
-            channels_last=channels_last,
+            random_axis=cfg.RANDOM_SLICE_AXIS,
+            slice_axes=cfg.SLICE_AXES,
+            gpu_degrade=device.type == "cuda",
         )
-        val_metrics = run_epoch(
-            model,
-            val_loader,
-            criterion,
-            device,
-            optimizer=None,
+        # Validation uses axial-only slicing + deterministic degradation so the
+        # reported val loss is comparable across epochs.
+        val_ds = DWISliceDataset(
+            zarr_path, val_subjects,
+            augment=False,
             use_brain_mask=use_brain_mask,
-            amp_enabled=amp_enabled,
-            amp_dtype=amp_dtype,
-            channels_last=channels_last,
+            random_axis=False,
+            eval_mode=True,
         )
-        scheduler.step()
 
-        lr = optimizer.param_groups[0]["lr"]
-        elapsed = time.time() - t0
+        # Derive all normalisation constants from training data only to prevent
+        # information leakage from val/test into training.
+        # max_n must accommodate the largest subject across all splits (structural
+        # padding requirement), but max_bval, dti_scale and canonical_hw are true
+        # normalisation scales and must come from training data exclusively.
+        global_max_n = max(train_ds.max_n, val_ds.max_n)
+        train_ds.max_n = global_max_n
+        val_ds.max_n = global_max_n
 
-        record = {
-            "epoch": epoch,
-            "lr": lr,
-            "train_loss": train_metrics["loss"],
-            "train_tensor_mse": train_metrics["tensor_mse"],
-            "train_fa_mae": train_metrics["fa_mae"],
-            "train_md_mae": train_metrics["md_mae"],
-            "val_loss": val_metrics["loss"],
-            "val_tensor_mse": val_metrics["tensor_mse"],
-            "val_fa_mae": val_metrics["fa_mae"],
-            "val_md_mae": val_metrics["md_mae"],
-            "elapsed_s": round(elapsed, 1),
+        # Keep explicit local names for logging and checkpoint metadata.
+        global_max_bval = train_ds.max_bval
+        global_dti_scale = train_ds.dti_scale
+        canonical_hw = (
+            max(train_ds.canonical_hw[0], val_ds.canonical_hw[0]),
+            max(train_ds.canonical_hw[1], val_ds.canonical_hw[1]),
+        )
+        train_ds.canonical_hw = canonical_hw
+        val_ds.canonical_hw = canonical_hw
+
+        val_ds.max_bval = global_max_bval
+        val_ds.dti_scale = global_dti_scale
+
+        loader_kwargs = {
+            "num_workers": num_workers,
+            "pin_memory": device.type == "cuda",
+            "persistent_workers": num_workers > 0,
+            # Each worker preloads all subject data into its own RAM on startup,
+            # eliminating zarr I/O overhead during training (~25x faster per sample).
+            "worker_init_fn": dwi_worker_init if num_workers > 0 else None,
         }
-        history.append(record)
+        if num_workers > 0:
+            loader_kwargs["prefetch_factor"] = args.prefetch_factor
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=args.batch_size,
+            shuffle=True,
+            **loader_kwargs,
+        )
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=args.batch_size,
+            shuffle=False,
+            **loader_kwargs,
+        )
+        log.info(
+            "DataLoader: batch_size=%d workers=%d prefetch=%s pin_memory=%s "
+            "preload_in_workers=%s gpu_degrade=%s",
+            args.batch_size,
+            num_workers,
+            args.prefetch_factor if num_workers > 0 else "off",
+            device.type == "cuda",
+            num_workers > 0,
+            train_ds.gpu_degrade,
+        )
 
-        # ── TensorBoard: scalars ─────────────────────────────────────────────
-        writer.add_scalar("loss/train", train_metrics["loss"], epoch)
-        writer.add_scalar("loss/val", val_metrics["loss"], epoch)
-        writer.add_scalar("tensor_mse/train", train_metrics["tensor_mse"], epoch)
-        writer.add_scalar("tensor_mse/val", val_metrics["tensor_mse"], epoch)
-        writer.add_scalar("fa_mae/train", train_metrics["fa_mae"], epoch)
-        writer.add_scalar("fa_mae/val", val_metrics["fa_mae"], epoch)
-        writer.add_scalar("md_mae/train", train_metrics["md_mae"], epoch)
-        writer.add_scalar("md_mae/val", val_metrics["md_mae"], epoch)
-        writer.add_scalar("lr", lr, epoch)
+        log.info("Train slices: %d  Val slices: %d  max_n: %d  max_bval: %.0f  dti_scale: %.4f",
+                 len(train_ds), len(val_ds), global_max_n, global_max_bval, global_dti_scale)
 
-        # ── TensorBoard: baseline reference lines ────────────────────────────
-        log_baseline_references(writer, baselines, epoch)
+        # ── Model ───────────────────────────────────────────────────────────────
+        raw_model = QSpaceUNet(
+            max_n=global_max_n,
+            feat_dim=args.feat_dim,
+            channels=tuple(args.channels),
+            cholesky=args.cholesky,
+        ).to(device)
+        if channels_last:
+            raw_model = raw_model.to(memory_format=torch.channels_last)
+        model, is_compiled = maybe_compile_model(
+            raw_model,
+            setting=args.compile,
+            device=device,
+            mode=args.compile_mode,
+        )
+        if is_compiled:
+            log.info("torch.compile: enabled (mode=%s)", args.compile_mode)
+        else:
+            log.info("torch.compile: disabled")
 
-        # ── TensorBoard: validation visualisation ────────────────────────────
-        if epoch % args.vis_every == 0 or epoch == 1:
-            fig = make_val_figure(
+        n_params = sum(p.numel() for p in raw_model.parameters() if p.requires_grad)
+        log.info("Model parameters: %s", f"{n_params:,}")
+
+        # ── Optimiser & scheduler ───────────────────────────────────────────────
+        criterion = DTILoss(
+            lambda_scalar=args.lambda_scalar,
+            lambda_edge=args.lambda_edge,
+        ).to(device)
+        fused_adamw = args.fused_adamw and device.type == "cuda"
+        try:
+            optimizer = torch.optim.AdamW(
+                raw_model.parameters(),
+                lr=args.lr,
+                weight_decay=args.weight_decay,
+                betas=(0.9, 0.99),
+                fused=fused_adamw,
+            )
+        except TypeError:
+            if fused_adamw:
+                log.warning("Fused AdamW is unavailable in this PyTorch build; using regular AdamW")
+            fused_adamw = False
+            optimizer = torch.optim.AdamW(
+                raw_model.parameters(),
+                lr=args.lr,
+                weight_decay=args.weight_decay,
+                betas=(0.9, 0.99),
+            )
+        log.info("Optimizer: AdamW%s", " (fused)" if fused_adamw else "")
+        scaler = make_grad_scaler(device, enabled=amp_enabled, dtype=amp_dtype)
+
+        wandb_config = build_wandb_config(
+            args,
+            out_dir=out_dir,
+            zarr_path=zarr_path,
+            device=device,
+            global_max_n=global_max_n,
+            global_max_bval=global_max_bval,
+            global_dti_scale=global_dti_scale,
+            train_subjects=train_subjects,
+            val_subjects=val_subjects,
+            test_subjects=test_subjects,
+            train_slices=len(train_ds),
+            val_slices=len(val_ds),
+            use_brain_mask=use_brain_mask,
+            amp_enabled=amp_enabled,
+            amp_dtype=amp_dtype,
+            channels_last=channels_last,
+            num_workers=num_workers,
+            fused_adamw=fused_adamw,
+            n_params=n_params,
+            is_compiled=is_compiled,
+        )
+        wandb_run = init_wandb_run(
+            args,
+            out_dir=out_dir,
+            config=wandb_config,
+            baseline_metrics=baseline_log_metrics,
+        )
+        log.info(
+            "W&B tracking enabled for run '%s'; GPU/system utilization is collected automatically",
+            wandb_run.name,
+        )
+
+        # Linear warmup -> cosine annealing. Warmup stabilises early epochs when
+        # the encoder embeddings are still random and gradients can spike.
+        warmup_epochs = min(args.warmup_epochs, max(args.epochs - 1, 1))
+        cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=max(args.epochs - warmup_epochs, 1),
+            eta_min=args.lr * 0.01,
+        )
+        if warmup_epochs > 0:
+            warmup = torch.optim.lr_scheduler.LinearLR(
+                optimizer,
+                start_factor=1e-3,
+                end_factor=1.0,
+                total_iters=warmup_epochs,
+            )
+            scheduler = torch.optim.lr_scheduler.SequentialLR(
+                optimizer, schedulers=[warmup, cosine], milestones=[warmup_epochs],
+            )
+        else:
+            scheduler = cosine
+
+        # ── Pick a fixed validation slice for visualisation ───────────────────
+        vis_slice_idx = -1
+
+        # ── Training loop ─────────────────────────────────────────────────────
+        best_val_loss = float("inf")
+        best_epoch = 0
+        patience_counter = 0
+        history: list[dict] = []
+
+        log.info("Starting training for %d epochs (patience=%d)", args.epochs, args.patience)
+
+        for epoch in range(1, args.epochs + 1):
+            t0 = time.time()
+
+            train_metrics = run_epoch(
                 model,
-                val_ds,
+                train_loader,
+                criterion,
                 device,
-                dti_scale=train_ds.dti_scale,
-                slice_idx=vis_slice_idx,
+                optimizer,
+                use_brain_mask=use_brain_mask,
+                amp_enabled=amp_enabled,
+                amp_dtype=amp_dtype,
+                scaler=scaler,
+                channels_last=channels_last,
+            )
+            val_metrics = run_epoch(
+                model,
+                val_loader,
+                criterion,
+                device,
+                optimizer=None,
+                use_brain_mask=use_brain_mask,
                 amp_enabled=amp_enabled,
                 amp_dtype=amp_dtype,
                 channels_last=channels_last,
             )
-            writer.add_figure("val_prediction", fig, epoch)
-            plt.close(fig)
+            scheduler.step()
 
-        # ── Checkpoint ───────────────────────────────────────────────────────
-        improved = val_metrics["loss"] < best_val_loss
-        if improved:
-            best_val_loss = val_metrics["loss"]
-            patience_counter = 0
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "model_state_dict": raw_model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "val_loss": best_val_loss,
-                    "max_n": global_max_n,
-                    "feat_dim": args.feat_dim,
-                    "channels": list(args.channels),
-                    "cholesky": args.cholesky,
-                    "dti_scale": train_ds.dti_scale,
-                    "max_bval": train_ds.max_bval,
-                    "train_subjects": train_subjects,
-                    "val_subjects": val_subjects,
-                    "test_subjects": test_subjects,
-                    "use_brain_mask": use_brain_mask,
-                    "amp_dtype": args.amp_dtype,
-                    "channels_last": channels_last,
-                },
-                out_dir / "best_model.pt",
+            lr = optimizer.param_groups[0]["lr"]
+            elapsed = time.time() - t0
+
+            record = {
+                "epoch": epoch,
+                "lr": lr,
+                "train_loss": train_metrics["loss"],
+                "train_tensor_mse": train_metrics["tensor_mse"],
+                "train_fa_mae": train_metrics["fa_mae"],
+                "train_md_mae": train_metrics["md_mae"],
+                "val_loss": val_metrics["loss"],
+                "val_tensor_mse": val_metrics["tensor_mse"],
+                "val_fa_mae": val_metrics["fa_mae"],
+                "val_md_mae": val_metrics["md_mae"],
+                "elapsed_s": round(elapsed, 1),
+            }
+            history.append(record)
+
+            epoch_log = {
+                "epoch": epoch,
+                "learning_rate": lr,
+                "epoch_time_s": elapsed,
+                "train_loss": train_metrics["loss"],
+                "val_loss": val_metrics["loss"],
+                "train_tensor_mse": train_metrics["tensor_mse"],
+                "val_tensor_mse": val_metrics["tensor_mse"],
+                "train_fa_mae": train_metrics["fa_mae"],
+                "val_fa_mae": val_metrics["fa_mae"],
+                "train_md_mae": train_metrics["md_mae"],
+                "val_md_mae": val_metrics["md_mae"],
+            }
+            epoch_log.update(baseline_log_metrics)
+
+            # ── W&B: validation visualisation ────────────────────────────────
+            if epoch % args.vis_every == 0 or epoch == 1:
+                fig = make_val_figure(
+                    model,
+                    val_ds,
+                    device,
+                    dti_scale=train_ds.dti_scale,
+                    slice_idx=vis_slice_idx,
+                    amp_enabled=amp_enabled,
+                    amp_dtype=amp_dtype,
+                    channels_last=channels_last,
+                )
+                epoch_log["val_prediction"] = wandb.Image(fig, caption=f"Epoch {epoch}")
+                plt.close(fig)
+
+            wandb_run.log(epoch_log)
+
+            # ── Checkpoint ───────────────────────────────────────────────────
+            improved = val_metrics["loss"] < best_val_loss
+            if improved:
+                best_val_loss = val_metrics["loss"]
+                best_epoch = epoch
+                patience_counter = 0
+                torch.save(
+                    {
+                        "epoch": epoch,
+                        "model_state_dict": raw_model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "val_loss": best_val_loss,
+                        "max_n": global_max_n,
+                        "feat_dim": args.feat_dim,
+                        "channels": list(args.channels),
+                        "cholesky": args.cholesky,
+                        "dti_scale": train_ds.dti_scale,
+                        "max_bval": train_ds.max_bval,
+                        "train_subjects": train_subjects,
+                        "val_subjects": val_subjects,
+                        "test_subjects": test_subjects,
+                        "use_brain_mask": use_brain_mask,
+                        "amp_dtype": args.amp_dtype,
+                        "channels_last": channels_last,
+                    },
+                    out_dir / "best_model.pt",
+                )
+                wandb_run.summary["best_epoch"] = epoch
+                wandb_run.summary["best_val_loss"] = best_val_loss
+                wandb_run.summary["best_model_path"] = str(out_dir / "best_model.pt")
+            else:
+                patience_counter += 1
+
+            marker = "*" if improved else ""
+            log.info(
+                "Epoch %3d/%d  train=%.6f  val=%.6f  "
+                "t_mse=%.6f  fa=%.4f  md=%.6f  "
+                "lr=%.2e  %.1fs %s",
+                epoch,
+                args.epochs,
+                train_metrics["loss"],
+                val_metrics["loss"],
+                val_metrics["tensor_mse"],
+                val_metrics["fa_mae"],
+                val_metrics["md_mae"],
+                lr,
+                elapsed,
+                marker,
             )
-        else:
-            patience_counter += 1
 
-        marker = "*" if improved else ""
-        log.info(
-            "Epoch %3d/%d  train=%.6f  val=%.6f  "
-            "t_mse=%.6f  fa=%.4f  md=%.6f  "
-            "lr=%.2e  %.1fs %s",
-            epoch,
-            args.epochs,
-            train_metrics["loss"],
-            val_metrics["loss"],
-            val_metrics["tensor_mse"],
-            val_metrics["fa_mae"],
-            val_metrics["md_mae"],
-            lr,
-            elapsed,
-            marker,
+            if patience_counter >= args.patience:
+                log.info("Early stopping at epoch %d (patience=%d)", epoch, args.patience)
+                break
+
+        # ── Save training history ─────────────────────────────────────────────
+        with (out_dir / "history.json").open("w", encoding="utf-8") as f:
+            json.dump(history, f, indent=2)
+
+        # Save final model
+        torch.save(
+            {
+                "epoch": epoch,
+                "model_state_dict": raw_model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "val_loss": val_metrics["loss"],
+                "max_n": global_max_n,
+                "feat_dim": args.feat_dim,
+                "channels": list(args.channels),
+                "cholesky": args.cholesky,
+                "dti_scale": train_ds.dti_scale,
+                "max_bval": train_ds.max_bval,
+                "train_subjects": train_subjects,
+                "val_subjects": val_subjects,
+                "test_subjects": test_subjects,
+                "use_brain_mask": use_brain_mask,
+                "amp_dtype": args.amp_dtype,
+                "channels_last": channels_last,
+            },
+            out_dir / "last_model.pt",
         )
 
-        if patience_counter >= args.patience:
-            log.info("Early stopping at epoch %d (patience=%d)", epoch, args.patience)
-            break
+        wandb_run.summary["best_epoch"] = best_epoch
+        wandb_run.summary["best_val_loss"] = best_val_loss
+        wandb_run.summary["final_epoch"] = epoch
+        wandb_run.summary["final_val_loss"] = val_metrics["loss"]
+        wandb_run.summary["history_path"] = str(out_dir / "history.json")
+        wandb_run.summary["last_model_path"] = str(out_dir / "last_model.pt")
 
-    # ── Save training history ─────────────────────────────────────────────────
-    with (out_dir / "history.json").open("w", encoding="utf-8") as f:
-        json.dump(history, f, indent=2)
-
-    # Save final model
-    torch.save(
-        {
-            "epoch": epoch,
-            "model_state_dict": raw_model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "val_loss": val_metrics["loss"],
-            "max_n": global_max_n,
-            "feat_dim": args.feat_dim,
-            "channels": list(args.channels),
-            "cholesky": args.cholesky,
-            "dti_scale": train_ds.dti_scale,
-            "max_bval": train_ds.max_bval,
-            "train_subjects": train_subjects,
-            "val_subjects": val_subjects,
-            "test_subjects": test_subjects,
-            "use_brain_mask": use_brain_mask,
-            "amp_dtype": args.amp_dtype,
-            "channels_last": channels_last,
-        },
-        out_dir / "last_model.pt",
-    )
-
-    writer.close()
-    log.info("Done. Best val loss: %.6f  Saved to %s", best_val_loss, out_dir)
+        completed = True
+        log.info("Done. Best val loss: %.6f  Saved to %s", best_val_loss, out_dir)
+    finally:
+        if wandb_run is not None:
+            wandb_run.finish(exit_code=0 if completed else 1)
 
 
 if __name__ == "__main__":
@@ -700,6 +856,15 @@ if __name__ == "__main__":
                         help="Biological subject IDs for test (default: sub-10 sub-11)")
     parser.add_argument("--val_subjects", nargs="*", default=None,
                         help="Biological subject IDs for validation (default: sub-08 sub-09)")
+    parser.add_argument("--wandb_project", "--wandb-project", default="DW_THI_Project",
+                        help="Weights & Biases project name")
+    parser.add_argument("--wandb_entity", "--wandb-entity", default=None,
+                        help="Optional Weights & Biases team/user entity")
+    parser.add_argument("--wandb_name", "--wandb-name", default=None,
+                        help="Optional Weights & Biases run name (defaults to out_dir name)")
+    parser.add_argument("--wandb_mode", "--wandb-mode",
+                        choices=["online", "offline", "disabled"], default="online",
+                        help="Weights & Biases sync mode")
 
     # Model
     parser.add_argument("--feat_dim", type=int, default=cfg.FEAT_DIM)
@@ -720,7 +885,7 @@ if __name__ == "__main__":
                         help="Linear LR warmup length before cosine annealing")
     parser.add_argument("--patience", type=int, default=cfg.PATIENCE)
     parser.add_argument("--vis_every", type=int, default=1,
-                        help="Generate validation visualisation every N epochs (default: 10)")
+                        help="Generate validation visualisation every N epochs (default: 1)")
     parser.add_argument("--num_workers", type=int, default=-1,
                         help="DataLoader worker processes (-1 = OS-aware auto)")
     parser.add_argument("--prefetch_factor", type=int, default=4,

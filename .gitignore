@@ -218,6 +218,7 @@ __marimo__/
 CLAUDE.md
 /research/runs/
 /runs/
+/wandb/
 *.pt
 *.png
 *.jpg

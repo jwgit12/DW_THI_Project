@@ -69,25 +69,31 @@ Variable `N` is handled by zero-padding to `max_n` with a volume mask. The gradi
 - **Augmentation**: random horizontal/vertical flips
 - **Early stopping**: patience=25 on validation loss
 
-### TensorBoard monitoring
+### Weights & Biases monitoring
 
-`research/train.py` writes TensorBoard event files to `{out_dir}/tb/`.
+`research/train.py` starts one W&B run per training job and stores local run files in `{out_dir}/wandb/`.
 
 **Scalars logged every epoch:**
 
 | Tag | Description |
 |---|---|
-| `loss/train`, `loss/val` | Total combined loss |
-| `tensor_mse/train`, `tensor_mse/val` | 6D tensor MSE component |
-| `fa_mae/train`, `fa_mae/val` | FA MAE auxiliary loss component |
-| `md_mae/train`, `md_mae/val` | MD MAE auxiliary loss component |
-| `lr` | Current learning rate |
-| `baselines/fa_rmse/patch2self` | Patch2Self mean FA RMSE (flat reference line) |
-| `baselines/fa_rmse/mppca` | MP-PCA mean FA RMSE (flat reference line) |
+| `train_loss`, `val_loss` | Total combined loss |
+| `train_tensor_mse`, `val_tensor_mse` | 6D tensor MSE component |
+| `train_fa_mae`, `val_fa_mae` | FA MAE auxiliary loss component |
+| `train_md_mae`, `val_md_mae` | MD MAE auxiliary loss component |
+| `learning_rate` | Current learning rate |
+| `epoch_time_s` | Wall-clock time per epoch |
+| `baseline_patch2self_fa_rmse` | Patch2Self mean FA RMSE (flat reference line) |
+| `baseline_mppca_fa_rmse` | MP-PCA mean FA RMSE (flat reference line) |
 
-**Images logged every `--vis_every` epochs (default: 10):**
+**Images logged every `--vis_every` epochs (default: 1):**
 
 `val_prediction` -- a 2x4 panel showing for a fixed validation slice: target FA, predicted FA, FA error map, FA scatter plot (with RMSE and R2), and the same four panels for ADC.
+
+**Automatically tracked by W&B:**
+
+- Hyperparameters and derived run config (dataset split, model size, AMP/compile settings, loader settings)
+- System metrics including GPU utilization, GPU memory, CPU usage, RAM, disk I/O, and network traffic
 
 ## Evaluation
 
@@ -114,7 +120,7 @@ Only `research.train` and `research.evaluate` are command-line entry points. The
 | `research/model.py` | Defines `QSpaceUNet`, `QSpaceEncoder`, `UNet2D`, and optional Cholesky-to-tensor conversion. Imported by training, evaluation, and the viewer. |
 | `research/loss.py` | Defines `DTILoss`, a masked tensor MSE plus optional FA/MD MAE auxiliary loss controlled by `--lambda_scalar`. |
 | `research/utils.py` | Shared metric and plotting helpers: DWI metrics, DTI fitting, tensor sanitization, FA/ADC conversion, scalar-map metrics, automatic plot slice/volume selection, denoising plots, and prediction plots. |
-| `research/train.py` | CLI for supervised QSpaceUNet training. Writes checkpoints, `history.json`, and TensorBoard logs. |
+| `research/train.py` | CLI for supervised QSpaceUNet training. Writes checkpoints, `history.json`, and W&B logs. |
 | `research/evaluate.py` | CLI for checkpoint evaluation. Runs QSpaceUNet and, unless skipped, Patch2Self and MP-PCA baselines through the same brain-mask metric pipeline. |
 | `research/__init__.py` | Marks `research` as an importable package for `python3 -m research.train` and `python3 -m research.evaluate`. |
 
@@ -142,7 +148,7 @@ Useful optional overrides:
 Training outputs in `--out_dir`:
 - `best_model.pt` and `last_model.pt`
 - `history.json`
-- `tb/` TensorBoard event files
+- `wandb/` local Weights & Biases run files
 
 ### `research.evaluate` options
 
@@ -262,11 +268,13 @@ python3 -m research.train \
   --batch_size 8
 ```
 
-Monitor training with TensorBoard:
+Track training in Weights & Biases:
 
 ```bash
-tensorboard --logdir research/runs/run_01/tb
+wandb login
 ```
+
+Then launch training normally, or add `--wandb_mode offline` if you want local-only tracking without cloud sync.
 
 Evaluate the trained model and baselines on test subjects:
 
