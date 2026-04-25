@@ -8,6 +8,9 @@ preprocessing, training, evaluation, and visualization.
 
 ## Pipeline
 
+For a paper-style visual walkthrough of the production flow, see
+[`src/pipeline.md`](src/pipeline.md).
+
 ```text
 Raw DWI NIfTI + bval/bvec
   -> build_pretext_dataset.py

@@ -226,3 +226,7 @@ CLAUDE.md
 *.bmp
 *.gif
 *.csv
+
+# Keep documentation infographics tracked.
+!src/assests/
+!src/assests/*.png

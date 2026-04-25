@@ -70,8 +70,8 @@ VAL_SUBJECTS = ["sub-05", "sub-11"]
 # ─────────────────────────────────────────────────────────────────────────────
 # Model architecture
 # ─────────────────────────────────────────────────────────────────────────────
-FEAT_DIM = 64                # q-space encoder feature dimension (matches channels[0])
-UNET_CHANNELS = [64, 128, 256]  # 3 encoder levels; factor=8 fits (132, 130) easily
+FEAT_DIM = 128                # q-space encoder feature dimension (matches channels[0])
+UNET_CHANNELS = [128, 256, 512]  # 3 encoder levels; factor=8 fits (132, 130) easily
 DROPOUT = 0.1                # spatial dropout rate in U-Net conv blocks
 LAMBDA_SCALAR = 0.3          # weight for FA/MD auxiliary loss
 LAMBDA_EDGE = 0.1            # weight for FA spatial-gradient (edge) loss
@@ -97,6 +97,21 @@ COMPILE_MODE = "max-autotune"
 FUSED_ADAMW = True           # CUDA-only fused optimizer when available
 DETERMINISTIC = False
 REQUIRE_CUDA = False
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Profiling
+# ─────────────────────────────────────────────────────────────────────────────
+PROFILE = False
+PROFILE_WAIT = 1
+PROFILE_WARMUP = 1
+PROFILE_ACTIVE = 4
+PROFILE_REPEAT = 1
+PROFILE_RECORD_SHAPES = True
+PROFILE_MEMORY = True
+PROFILE_WITH_STACK = False
+PROFILE_WITH_FLOPS = False
+PROFILE_ROW_LIMIT = 20
+PROFILE_EXIT_AFTER_CAPTURE = False
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Patch2Self baseline

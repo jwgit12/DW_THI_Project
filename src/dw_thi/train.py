@@ -12,6 +12,8 @@ import logging
 import random
 import sys
 import time
+from contextlib import nullcontext
+from dataclasses import dataclass, field
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -26,6 +28,20 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader
+try:
+    from torch.profiler import (
+        ProfilerActivity,
+        profile as torch_profile,
+        record_function,
+        schedule as profiler_schedule,
+        tensorboard_trace_handler,
+    )
+except ImportError:  # pragma: no cover - exercised only in incomplete envs
+    ProfilerActivity = None
+    torch_profile = None
+    record_function = None
+    profiler_schedule = None
+    tensorboard_trace_handler = None
 try:
     from torch.utils.tensorboard import SummaryWriter
 except ImportError:  # pragma: no cover - exercised only in incomplete envs
@@ -57,6 +73,218 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger(__name__)
+
+
+@dataclass
+class ProfilerController:
+    enabled: bool = False
+    output_dir: Path | None = None
+    tensorboard_dir: Path | None = None
+    row_limit: int = cfg.PROFILE_ROW_LIMIT
+    sort_key: str = "self_device_time_total"
+    wait_steps: int = cfg.PROFILE_WAIT
+    warmup_steps: int = cfg.PROFILE_WARMUP
+    active_steps: int = cfg.PROFILE_ACTIVE
+    repeat: int = cfg.PROFILE_REPEAT
+    trace_count: int = 0
+    train_steps: int = 0
+    capture_steps: int = 0
+    exit_after_capture: bool = False
+    stop_requested: bool = False
+    summary_paths: list[Path] = field(default_factory=list)
+    _profiler: object | None = None
+    _trace_handler: object | None = None
+
+    @classmethod
+    def create(
+        cls,
+        args: argparse.Namespace,
+        *,
+        device: torch.device,
+        out_dir: Path,
+    ) -> ProfilerController:
+        if not args.profile:
+            return cls(enabled=False)
+        if (
+            torch_profile is None
+            or profiler_schedule is None
+            or tensorboard_trace_handler is None
+            or record_function is None
+            or ProfilerActivity is None
+        ):
+            raise RuntimeError(
+                "PyTorch profiler is unavailable in this environment. "
+                "Install a complete PyTorch build before using --profile."
+            )
+
+        output_dir = out_dir / "profiler"
+        tensorboard_dir = out_dir / "tb"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        tensorboard_dir.mkdir(parents=True, exist_ok=True)
+
+        activities = [ProfilerActivity.CPU]
+        if device.type == "cuda":
+            activities.append(ProfilerActivity.CUDA)
+
+        controller = cls(
+            enabled=True,
+            output_dir=output_dir,
+            tensorboard_dir=tensorboard_dir,
+            row_limit=args.profile_row_limit,
+            sort_key="self_device_time_total" if device.type == "cuda" else "self_cpu_time_total",
+            wait_steps=args.profile_wait,
+            warmup_steps=args.profile_warmup,
+            active_steps=args.profile_active,
+            repeat=args.profile_repeat,
+            capture_steps=(args.profile_wait + args.profile_warmup + args.profile_active)
+            * args.profile_repeat,
+            exit_after_capture=args.profile_exit_after_capture,
+        )
+        controller._trace_handler = tensorboard_trace_handler(str(tensorboard_dir))
+        controller._profiler = torch_profile(
+            activities=activities,
+            schedule=profiler_schedule(
+                wait=args.profile_wait,
+                warmup=args.profile_warmup,
+                active=args.profile_active,
+                repeat=args.profile_repeat,
+            ),
+            on_trace_ready=controller._on_trace_ready,
+            record_shapes=args.profile_record_shapes,
+            profile_memory=args.profile_memory,
+            with_stack=args.profile_with_stack,
+            with_flops=args.profile_with_flops,
+        )
+        return controller
+
+    def __enter__(self) -> ProfilerController:
+        if self._profiler is not None:
+            self._profiler.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool | None:
+        if self._profiler is None:
+            return None
+        return self._profiler.__exit__(exc_type, exc, tb)
+
+    def record(self, name: str):
+        if not self.enabled or record_function is None:
+            return nullcontext()
+        return record_function(name)
+
+    def step(self, *, is_train: bool) -> None:
+        if not self.enabled or self._profiler is None or not is_train:
+            return
+        self.train_steps += 1
+        self._profiler.step()
+        if self.exit_after_capture and self.train_steps >= self.capture_steps:
+            self.stop_requested = True
+
+    def log_enabled(self) -> None:
+        if not self.enabled:
+            return
+        log.info(
+            "Profiler enabled: wait=%d warmup=%d active=%d repeat=%d traces -> %s",
+            self.wait_steps,
+            self.warmup_steps,
+            self.active_steps,
+            self.repeat,
+            self.tensorboard_dir,
+        )
+
+    def _on_trace_ready(self, prof) -> None:
+        self.trace_count += 1
+        if self._trace_handler is not None:
+            self._trace_handler(prof)
+        self._write_summary(prof, trace_idx=self.trace_count)
+
+    def _write_summary(self, prof, *, trace_idx: int) -> None:
+        if self.output_dir is None:
+            return
+
+        key_averages = prof.key_averages()
+        text_path = self.output_dir / f"summary_trace_{trace_idx:02d}.txt"
+        json_path = self.output_dir / f"summary_trace_{trace_idx:02d}.json"
+
+        sort_candidates = [
+            self.sort_key,
+            "self_cuda_time_total",
+            "device_time_total",
+            "cuda_time_total",
+            "self_cpu_time_total",
+            "cpu_time_total",
+        ]
+        written_tables: list[tuple[str, str]] = []
+        for sort_key in dict.fromkeys(sort_candidates):
+            try:
+                table = key_averages.table(sort_by=sort_key, row_limit=self.row_limit)
+            except Exception:
+                continue
+            written_tables.append((sort_key, table))
+
+        with text_path.open("w", encoding="utf-8") as f:
+            f.write("PyTorch profiler summary\n")
+            f.write(f"trace_index: {trace_idx}\n")
+            f.write(f"recorded_train_steps: {self.train_steps}\n")
+            f.write(f"tensorboard_logdir: {self.tensorboard_dir}\n")
+            for sort_key, table in written_tables:
+                f.write(f"\n=== Sorted by {sort_key} ===\n")
+                f.write(table)
+                f.write("\n")
+
+        top_ops: list[dict[str, float | int | str]] = []
+        for evt in sorted(
+            key_averages,
+            key=lambda item: self._metric_value(item, self.sort_key),
+            reverse=True,
+        )[: self.row_limit]:
+            top_ops.append(
+                {
+                    "name": evt.key,
+                    "count": int(getattr(evt, "count", 0)),
+                    "self_cpu_time_total_us": float(getattr(evt, "self_cpu_time_total", 0.0)),
+                    "cpu_time_total_us": float(getattr(evt, "cpu_time_total", 0.0)),
+                    "self_device_time_total_us": self._metric_value(
+                        evt,
+                        "self_device_time_total",
+                        "self_cuda_time_total",
+                    ),
+                    "device_time_total_us": self._metric_value(
+                        evt,
+                        "device_time_total",
+                        "cuda_time_total",
+                    ),
+                    "self_cpu_memory_usage_bytes": float(
+                        getattr(evt, "self_cpu_memory_usage", 0.0)
+                    ),
+                    "self_device_memory_usage_bytes": float(
+                        getattr(evt, "self_device_memory_usage", getattr(evt, "self_cuda_memory_usage", 0.0))
+                    ),
+                }
+            )
+
+        with json_path.open("w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "trace_index": trace_idx,
+                    "recorded_train_steps": self.train_steps,
+                    "sort_key": self.sort_key,
+                    "tensorboard_logdir": str(self.tensorboard_dir),
+                    "top_ops": top_ops,
+                },
+                f,
+                indent=2,
+            )
+
+        self.summary_paths.extend([text_path, json_path])
+        log.info("Profiler trace %d written to %s", trace_idx, text_path)
+
+    @staticmethod
+    def _metric_value(evt, *names: str) -> float:
+        for name in names:
+            if hasattr(evt, name):
+                return float(getattr(evt, name))
+        return 0.0
 
 
 def seed_everything(seed: int) -> None:
@@ -229,6 +457,7 @@ def run_epoch(
     amp_dtype: torch.dtype | None = None,
     scaler=None,
     channels_last: bool = False,
+    profiler: ProfilerController | None = None,
 ) -> dict[str, float]:
     """Run one train or validation epoch."""
     is_train = optimizer is not None
@@ -252,54 +481,70 @@ def run_epoch(
     ctx = torch.enable_grad() if is_train else torch.no_grad()
     with ctx:
         for batch in loader:
-            signal = batch["input"].to(device, non_blocking=non_blocking)
+            if profiler is not None and profiler.stop_requested:
+                break
+
+            record = profiler.record if profiler is not None else (lambda _name: nullcontext())
+
+            with record("train/data_to_device" if is_train else "val/data_to_device"):
+                signal = batch["input"].to(device, non_blocking=non_blocking)
+                target = batch["target"].to(device, non_blocking=non_blocking)
+                target = maybe_channels_last(target, channels_last)
+                bvals = batch["bvals"].to(device, non_blocking=non_blocking)
+                bvecs = batch["bvecs"].to(device, non_blocking=non_blocking)
+                vol_mask = batch["vol_mask"].to(device, non_blocking=non_blocking)
+                brain_mask = (
+                    batch["brain_mask"].to(device, non_blocking=non_blocking)
+                    if use_brain_mask
+                    else None
+                )
 
             if "degrade_kf" in batch:
-                degrade_kf = batch["degrade_kf"].to(device, non_blocking=non_blocking)
-                degrade_nl = batch["degrade_nl"].to(device, non_blocking=non_blocking)
-                b0_mask = batch["b0_mask"].to(device, non_blocking=non_blocking)
-                signal = gpu_degrade_dwi_batch(signal, degrade_kf, degrade_nl)
-                signal = gpu_b0_normalize_batch(signal, b0_mask)
+                with record("train/gpu_degrade" if is_train else "val/gpu_degrade"):
+                    degrade_kf = batch["degrade_kf"].to(device, non_blocking=non_blocking)
+                    degrade_nl = batch["degrade_nl"].to(device, non_blocking=non_blocking)
+                    b0_mask = batch["b0_mask"].to(device, non_blocking=non_blocking)
+                    signal = gpu_degrade_dwi_batch(signal, degrade_kf, degrade_nl)
+                    signal = gpu_b0_normalize_batch(signal, b0_mask)
 
             signal = maybe_channels_last(signal, channels_last)
-            target = batch["target"].to(device, non_blocking=non_blocking)
-            target = maybe_channels_last(target, channels_last)
-            bvals = batch["bvals"].to(device, non_blocking=non_blocking)
-            bvecs = batch["bvecs"].to(device, non_blocking=non_blocking)
-            vol_mask = batch["vol_mask"].to(device, non_blocking=non_blocking)
-            brain_mask = (
-                batch["brain_mask"].to(device, non_blocking=non_blocking)
-                if use_brain_mask
-                else None
-            )
 
-            with autocast_context(device, enabled=amp_enabled, dtype=amp_dtype):
-                pred = model(signal, bvals, bvecs, vol_mask)
-            loss, metrics = criterion(
-                pred.float(),
-                target,
-                mask=brain_mask,
-                return_tensor_metrics=True,
-            )
+            with record("train/forward" if is_train else "val/forward"):
+                with autocast_context(device, enabled=amp_enabled, dtype=amp_dtype):
+                    pred = model(signal, bvals, bvecs, vol_mask)
+            with record("train/loss" if is_train else "val/loss"):
+                loss, metrics = criterion(
+                    pred.float(),
+                    target,
+                    mask=brain_mask,
+                    return_tensor_metrics=True,
+                )
 
             if is_train:
-                optimizer.zero_grad(set_to_none=True)
-                if scaler is not None:
-                    scaler.scale(loss).backward()
-                    scaler.unscale_(optimizer)
+                with record("train/optimizer_zero_grad"):
+                    optimizer.zero_grad(set_to_none=True)
+                with record("train/backward"):
+                    if scaler is not None:
+                        scaler.scale(loss).backward()
+                        scaler.unscale_(optimizer)
+                    else:
+                        loss.backward()
+                with record("train/optimizer_step"):
                     torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.GRAD_CLIP)
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.GRAD_CLIP)
-                    optimizer.step()
+                    if scaler is not None:
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        optimizer.step()
 
             total_loss += loss.detach()
             total_tensor += metric_tensor(metrics, "tensor_mse")
             total_fa += metric_tensor(metrics, "fa_mae")
             total_md += metric_tensor(metrics, "md_mae")
             n_batches += 1
+
+            if profiler is not None:
+                profiler.step(is_train=is_train)
 
     n = max(n_batches, 1)
 
@@ -369,6 +614,21 @@ def build_run_config(
         "train_subjects": train_subjects,
         "val_subjects": val_subjects,
         "test_subjects": test_subjects,
+        "profile": {
+            "enabled": args.profile,
+            "wait": args.profile_wait,
+            "warmup": args.profile_warmup,
+            "active": args.profile_active,
+            "repeat": args.profile_repeat,
+            "record_shapes": args.profile_record_shapes,
+            "memory": args.profile_memory,
+            "with_stack": args.profile_with_stack,
+            "with_flops": args.profile_with_flops,
+            "row_limit": args.profile_row_limit,
+            "exit_after_capture": args.profile_exit_after_capture,
+            "summary_dir": str(out_dir / "profiler") if args.profile else None,
+            "tensorboard_logdir": str(out_dir / "tb") if args.profile else None,
+        },
     }
 
 
@@ -446,6 +706,8 @@ def main(args: argparse.Namespace) -> None:
     log.info("AMP: %s", str(amp_dtype).replace("torch.", "") if amp_enabled else "disabled")
     if channels_last:
         log.info("Memory format: channels_last")
+    profiler = ProfilerController.create(args, device=device, out_dir=out_dir)
+    profiler.log_enabled()
 
     store = zarr.open_group(zarr_path, mode="r")
     all_keys = sorted(store.keys())
@@ -634,7 +896,7 @@ def main(args: argparse.Namespace) -> None:
             "TensorBoard is required for production training. "
             "Install dependencies with `pip install -r requirements.txt`."
         )
-    writer = SummaryWriter(log_dir=str(out_dir / "tb"))
+    writer: SummaryWriter | None = SummaryWriter(log_dir=str(out_dir / "tb"))
     writer.add_text("config/json", f"```json\n{json.dumps(run_config, indent=2)}\n```", 0)
     for name, metrics in baselines.items():
         for metric, value in metrics.items():
@@ -649,137 +911,157 @@ def main(args: argparse.Namespace) -> None:
 
     log.info("Starting training for %d epochs (patience=%d)", args.epochs, args.patience)
     try:
-        for epoch in range(1, args.epochs + 1):
-            t0 = time.time()
-            train_metrics = run_epoch(
-                model,
-                train_loader,
-                criterion,
-                device,
-                optimizer,
-                use_brain_mask=use_brain_mask,
-                amp_enabled=amp_enabled,
-                amp_dtype=amp_dtype,
-                scaler=scaler,
-                channels_last=channels_last,
-            )
-            val_metrics = run_epoch(
-                model,
-                val_loader,
-                criterion,
-                device,
-                optimizer=None,
-                use_brain_mask=use_brain_mask,
-                amp_enabled=amp_enabled,
-                amp_dtype=amp_dtype,
-                channels_last=channels_last,
-            )
-            scheduler.step()
-
-            lr = optimizer.param_groups[0]["lr"]
-            elapsed = time.time() - t0
-            record = {
-                "epoch": epoch,
-                "lr": lr,
-                "train_loss": train_metrics["loss"],
-                "train_tensor_mse": train_metrics["tensor_mse"],
-                "train_fa_mae": train_metrics["fa_mae"],
-                "train_md_mae": train_metrics["md_mae"],
-                "val_loss": val_metrics["loss"],
-                "val_tensor_mse": val_metrics["tensor_mse"],
-                "val_fa_mae": val_metrics["fa_mae"],
-                "val_md_mae": val_metrics["md_mae"],
-                "elapsed_s": round(elapsed, 1),
-            }
-            history.append(record)
-
-            log_scalars(writer, "train", train_metrics, epoch)
-            log_scalars(writer, "val", val_metrics, epoch)
-            writer.add_scalar("train/learning_rate", lr, epoch)
-            writer.add_scalar("train/epoch_time_s", elapsed, epoch)
-
-            if epoch % args.vis_every == 0 or epoch == 1:
-                fig = make_val_figure(
+        with profiler:
+            for epoch in range(1, args.epochs + 1):
+                t0 = time.time()
+                train_metrics = run_epoch(
                     model,
-                    val_ds,
+                    train_loader,
+                    criterion,
                     device,
-                    dti_scale=train_ds.dti_scale,
-                    slice_idx=vis_slice_idx,
+                    optimizer,
+                    use_brain_mask=use_brain_mask,
+                    amp_enabled=amp_enabled,
+                    amp_dtype=amp_dtype,
+                    scaler=scaler,
+                    channels_last=channels_last,
+                    profiler=profiler,
+                )
+                if profiler.stop_requested:
+                    log.info(
+                        "Profiler capture complete after %d training batches; "
+                        "stopping early because --profile_exit_after_capture was set.",
+                        profiler.train_steps,
+                    )
+                    completed = True
+                    break
+
+                val_metrics = run_epoch(
+                    model,
+                    val_loader,
+                    criterion,
+                    device,
+                    optimizer=None,
+                    use_brain_mask=use_brain_mask,
                     amp_enabled=amp_enabled,
                     amp_dtype=amp_dtype,
                     channels_last=channels_last,
                 )
-                writer.add_figure("val/prediction", fig, epoch)
-                plt.close(fig)
+                scheduler.step()
 
-            improved = val_metrics["loss"] < best_val_loss
-            if improved:
-                best_val_loss = val_metrics["loss"]
-                best_epoch = epoch
-                patience_counter = 0
-                save_checkpoint(
-                    out_dir / "best_model.pt",
-                    epoch=epoch,
-                    raw_model=raw_model,
-                    optimizer=optimizer,
-                    val_loss=best_val_loss,
-                    args=args,
-                    train_ds=train_ds,
-                    train_subjects=train_subjects,
-                    val_subjects=val_subjects,
-                    test_subjects=test_subjects,
-                    use_brain_mask=use_brain_mask,
-                    channels_last=channels_last,
-                    run_config=run_config,
+                lr = optimizer.param_groups[0]["lr"]
+                elapsed = time.time() - t0
+                record = {
+                    "epoch": epoch,
+                    "lr": lr,
+                    "train_loss": train_metrics["loss"],
+                    "train_tensor_mse": train_metrics["tensor_mse"],
+                    "train_fa_mae": train_metrics["fa_mae"],
+                    "train_md_mae": train_metrics["md_mae"],
+                    "val_loss": val_metrics["loss"],
+                    "val_tensor_mse": val_metrics["tensor_mse"],
+                    "val_fa_mae": val_metrics["fa_mae"],
+                    "val_md_mae": val_metrics["md_mae"],
+                    "elapsed_s": round(elapsed, 1),
+                }
+                history.append(record)
+
+                log_scalars(writer, "train", train_metrics, epoch)
+                log_scalars(writer, "val", val_metrics, epoch)
+                writer.add_scalar("train/learning_rate", lr, epoch)
+                writer.add_scalar("train/epoch_time_s", elapsed, epoch)
+
+                if epoch % args.vis_every == 0 or epoch == 1:
+                    fig = make_val_figure(
+                        model,
+                        val_ds,
+                        device,
+                        dti_scale=train_ds.dti_scale,
+                        slice_idx=vis_slice_idx,
+                        amp_enabled=amp_enabled,
+                        amp_dtype=amp_dtype,
+                        channels_last=channels_last,
+                    )
+                    writer.add_figure("val/prediction", fig, epoch)
+                    plt.close(fig)
+
+                improved = val_metrics["loss"] < best_val_loss
+                if improved:
+                    best_val_loss = val_metrics["loss"]
+                    best_epoch = epoch
+                    patience_counter = 0
+                    save_checkpoint(
+                        out_dir / "best_model.pt",
+                        epoch=epoch,
+                        raw_model=raw_model,
+                        optimizer=optimizer,
+                        val_loss=best_val_loss,
+                        args=args,
+                        train_ds=train_ds,
+                        train_subjects=train_subjects,
+                        val_subjects=val_subjects,
+                        test_subjects=test_subjects,
+                        use_brain_mask=use_brain_mask,
+                        channels_last=channels_last,
+                        run_config=run_config,
+                    )
+                else:
+                    patience_counter += 1
+
+                marker = "*" if improved else ""
+                log.info(
+                    "Epoch %3d/%d train=%.6f val=%.6f t_mse=%.6f fa=%.4f md=%.6f lr=%.2e %.1fs %s",
+                    epoch,
+                    args.epochs,
+                    train_metrics["loss"],
+                    val_metrics["loss"],
+                    val_metrics["tensor_mse"],
+                    val_metrics["fa_mae"],
+                    val_metrics["md_mae"],
+                    lr,
+                    elapsed,
+                    marker,
                 )
-            else:
-                patience_counter += 1
+                if patience_counter >= args.patience:
+                    log.info("Early stopping at epoch %d (patience=%d)", epoch, args.patience)
+                    break
 
-            marker = "*" if improved else ""
-            log.info(
-                "Epoch %3d/%d train=%.6f val=%.6f t_mse=%.6f fa=%.4f md=%.6f lr=%.2e %.1fs %s",
-                epoch,
-                args.epochs,
-                train_metrics["loss"],
-                val_metrics["loss"],
-                val_metrics["tensor_mse"],
-                val_metrics["fa_mae"],
-                val_metrics["md_mae"],
-                lr,
-                elapsed,
-                marker,
+        if history:
+            with (out_dir / "history.json").open("w", encoding="utf-8") as f:
+                json.dump(history, f, indent=2)
+
+            save_checkpoint(
+                out_dir / "last_model.pt",
+                epoch=history[-1]["epoch"],
+                raw_model=raw_model,
+                optimizer=optimizer,
+                val_loss=history[-1]["val_loss"],
+                args=args,
+                train_ds=train_ds,
+                train_subjects=train_subjects,
+                val_subjects=val_subjects,
+                test_subjects=test_subjects,
+                use_brain_mask=use_brain_mask,
+                channels_last=channels_last,
+                run_config=run_config,
             )
 
-            if patience_counter >= args.patience:
-                log.info("Early stopping at epoch %d (patience=%d)", epoch, args.patience)
-                break
-
-        with (out_dir / "history.json").open("w", encoding="utf-8") as f:
-            json.dump(history, f, indent=2)
-
-        save_checkpoint(
-            out_dir / "last_model.pt",
-            epoch=history[-1]["epoch"],
-            raw_model=raw_model,
-            optimizer=optimizer,
-            val_loss=history[-1]["val_loss"],
-            args=args,
-            train_ds=train_ds,
-            train_subjects=train_subjects,
-            val_subjects=val_subjects,
-            test_subjects=test_subjects,
-            use_brain_mask=use_brain_mask,
-            channels_last=channels_last,
-            run_config=run_config,
-        )
-
-        writer.add_scalar("summary/best_val_loss", best_val_loss, best_epoch)
-        writer.add_scalar("summary/final_val_loss", history[-1]["val_loss"], history[-1]["epoch"])
-        completed = True
-        log.info("Done. Best val loss: %.6f at epoch %d. Saved to %s", best_val_loss, best_epoch, out_dir)
+            writer.add_scalar("summary/best_val_loss", best_val_loss, best_epoch)
+            writer.add_scalar("summary/final_val_loss", history[-1]["val_loss"], history[-1]["epoch"])
+            completed = True
+            log.info(
+                "Done. Best val loss: %.6f at epoch %d. Saved to %s",
+                best_val_loss,
+                best_epoch,
+                out_dir,
+            )
+        elif profiler.enabled and profiler.trace_count > 0:
+            completed = True
+            log.info("Profiler-only run complete. Trace artifacts saved to %s", profiler.output_dir)
     finally:
-        writer.flush()
-        writer.close()
+        if writer is not None:
+            writer.flush()
+            writer.close()
         if not completed:
             log.info("Training stopped before normal completion; partial outputs remain in %s", out_dir)
 
@@ -831,6 +1113,37 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--deterministic", action=argparse.BooleanOptionalAction, default=cfg.DETERMINISTIC)
     parser.add_argument("--fused_adamw", action=argparse.BooleanOptionalAction, default=cfg.FUSED_ADAMW)
     parser.add_argument("--require_cuda", action=argparse.BooleanOptionalAction, default=cfg.REQUIRE_CUDA)
+    parser.add_argument("--profile", action=argparse.BooleanOptionalAction, default=cfg.PROFILE)
+    parser.add_argument("--profile_wait", type=int, default=cfg.PROFILE_WAIT)
+    parser.add_argument("--profile_warmup", type=int, default=cfg.PROFILE_WARMUP)
+    parser.add_argument("--profile_active", type=int, default=cfg.PROFILE_ACTIVE)
+    parser.add_argument("--profile_repeat", type=int, default=cfg.PROFILE_REPEAT)
+    parser.add_argument(
+        "--profile_record_shapes",
+        action=argparse.BooleanOptionalAction,
+        default=cfg.PROFILE_RECORD_SHAPES,
+    )
+    parser.add_argument(
+        "--profile_memory",
+        action=argparse.BooleanOptionalAction,
+        default=cfg.PROFILE_MEMORY,
+    )
+    parser.add_argument(
+        "--profile_with_stack",
+        action=argparse.BooleanOptionalAction,
+        default=cfg.PROFILE_WITH_STACK,
+    )
+    parser.add_argument(
+        "--profile_with_flops",
+        action=argparse.BooleanOptionalAction,
+        default=cfg.PROFILE_WITH_FLOPS,
+    )
+    parser.add_argument("--profile_row_limit", type=int, default=cfg.PROFILE_ROW_LIMIT)
+    parser.add_argument(
+        "--profile_exit_after_capture",
+        action=argparse.BooleanOptionalAction,
+        default=cfg.PROFILE_EXIT_AFTER_CAPTURE,
+    )
     parser.add_argument("--no_brain_mask", action="store_true")
     return parser
 
