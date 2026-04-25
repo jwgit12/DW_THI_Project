@@ -213,13 +213,14 @@ def _run_patch2self(
         ).astype(np.float32)
 
 
-def _run_mppca(noisy: np.ndarray) -> np.ndarray:
+def _run_mppca(noisy: np.ndarray, mask: np.ndarray | None = None) -> np.ndarray:
     from dipy.denoise.localpca import mppca
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         return mppca(
             noisy, patch_radius=MPPCA_CFG["patch_radius"],
             pca_method=MPPCA_CFG["pca_method"],
+            mask=mask,
             suppress_warning=True,
         ).astype(np.float32)
 
@@ -409,7 +410,7 @@ def evaluate_subject(
 
     if run_mppca:
         t2 = time.time()
-        mppca_denoised = _run_mppca(input_dwi)
+        mppca_denoised = _run_mppca(input_dwi, mask=mask_3d)
         mppca_metrics, mppca_dti6d = _baseline_dti_metrics(
             mppca_denoised, target_dti6d, bvals, bvecs, b0_threshold,
             mask=mask_3d,

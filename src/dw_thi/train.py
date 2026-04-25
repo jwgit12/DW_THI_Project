@@ -350,6 +350,28 @@ def load_baseline_metrics(csv_paths: list[Path]) -> dict[str, dict[str, float]]:
     return baselines
 
 
+def move_batch_tensor(
+    tensor: torch.Tensor,
+    device: torch.device,
+    *,
+    non_blocking: bool,
+    channels_last: bool = False,
+) -> torch.Tensor:
+    """Move a batch tensor to device, optionally fusing the NHWC relayout.
+
+    When ``channels_last`` is enabled we ask ``Tensor.to`` to apply the memory
+    format during the host->device copy instead of copying once to CUDA and
+    then doing a second device-side ``contiguous(memory_format=...)`` pass.
+    """
+    if channels_last and tensor.ndim == 4:
+        return tensor.to(
+            device=device,
+            non_blocking=non_blocking,
+            memory_format=torch.channels_last,
+        )
+    return tensor.to(device, non_blocking=non_blocking)
+
+
 def make_val_figure(
     model: QSpaceUNet,
     val_ds: DWISliceDataset,
@@ -366,8 +388,12 @@ def make_val_figure(
 
     sample = val_ds[slice_idx]
     non_blocking = device.type == "cuda"
-    signal = sample["input"].unsqueeze(0).to(device, non_blocking=non_blocking)
-    signal = maybe_channels_last(signal, channels_last)
+    signal = move_batch_tensor(
+        sample["input"].unsqueeze(0),
+        device,
+        non_blocking=non_blocking,
+        channels_last=channels_last,
+    )
     bvals = sample["bvals"].unsqueeze(0).to(device, non_blocking=non_blocking)
     bvecs = sample["bvecs"].unsqueeze(0).to(device, non_blocking=non_blocking)
     vol_mask = sample["vol_mask"].unsqueeze(0).to(device, non_blocking=non_blocking)
@@ -487,9 +513,13 @@ def run_epoch(
             record = profiler.record if profiler is not None else (lambda _name: nullcontext())
 
             with record("train/data_to_device" if is_train else "val/data_to_device"):
-                signal = batch["input"].to(device, non_blocking=non_blocking)
+                signal = move_batch_tensor(
+                    batch["input"],
+                    device,
+                    non_blocking=non_blocking,
+                    channels_last=channels_last,
+                )
                 target = batch["target"].to(device, non_blocking=non_blocking)
-                target = maybe_channels_last(target, channels_last)
                 bvals = batch["bvals"].to(device, non_blocking=non_blocking)
                 bvecs = batch["bvecs"].to(device, non_blocking=non_blocking)
                 vol_mask = batch["vol_mask"].to(device, non_blocking=non_blocking)
@@ -506,8 +536,6 @@ def run_epoch(
                     b0_mask = batch["b0_mask"].to(device, non_blocking=non_blocking)
                     signal = gpu_degrade_dwi_batch(signal, degrade_kf, degrade_nl)
                     signal = gpu_b0_normalize_batch(signal, b0_mask)
-
-            signal = maybe_channels_last(signal, channels_last)
 
             with record("train/forward" if is_train else "val/forward"):
                 with autocast_context(device, enabled=amp_enabled, dtype=amp_dtype):
@@ -1078,7 +1106,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--feat_dim", type=int, default=cfg.FEAT_DIM)
     parser.add_argument("--channels", type=int, nargs="+", default=cfg.UNET_CHANNELS)
     parser.add_argument("--dropout", type=float, default=cfg.DROPOUT)
-    parser.add_argument("--cholesky", action="store_true")
+    parser.add_argument("--cholesky", action="store_true", default=True)
 
     parser.add_argument("--epochs", type=int, default=cfg.EPOCHS)
     parser.add_argument("--batch_size", type=int, default=cfg.BATCH_SIZE)

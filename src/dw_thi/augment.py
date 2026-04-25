@@ -157,7 +157,10 @@ def gpu_degrade_dwi_batch(
 
     slice_max = lowres.reshape(B, N, -1).amax(dim=-1)            # (B, N)
     sigma = (noise_level[:, None] * slice_max).view(B, N, 1, 1)
-    return lowres + torch.randn_like(lowres) * sigma
+    noise = torch.randn_like(lowres)
+    noise.mul_(sigma)
+    lowres.add_(noise)
+    return lowres
 
 
 def gpu_b0_normalize_batch(
@@ -177,7 +180,7 @@ def gpu_b0_normalize_batch(
     normalized : (B, N, H, W) float32
     """
     B, N, H, W = signal.shape
-    b0_float = b0_mask.float()                                          # (B, N)
+    b0_float = b0_mask.to(dtype=signal.dtype)                           # (B, N)
     n_b0 = b0_float.sum(dim=1).clamp(min=1.0)                          # (B,)
     mean_b0 = (signal * b0_float[:, :, None, None]).sum(dim=1) / n_b0[:, None, None]  # (B, H, W)
 
@@ -190,4 +193,5 @@ def gpu_b0_normalize_batch(
     has_b0 = b0_mask.any(dim=1)                                        # (B,)
     b0_norm = torch.where(has_b0, b0_norm, torch.ones_like(b0_norm))
 
-    return signal / b0_norm[:, None, None, None]
+    signal.div_(b0_norm[:, None, None, None])
+    return signal
