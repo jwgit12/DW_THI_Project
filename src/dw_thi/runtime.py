@@ -1,4 +1,4 @@
-"""Runtime helpers shared by research training and evaluation scripts."""
+"""Runtime helpers shared by training and evaluation scripts."""
 
 from __future__ import annotations
 

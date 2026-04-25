@@ -2,7 +2,7 @@
 """Lightweight desktop viewer for DW_THI Zarr datasets.
 
 Usage:
-    python3 visualizer.py --zarr_path dataset/default_dataset.zarr --checkpoint research/runs/run_small/best_model.pt
+    python visualizer.py --zarr_path dataset/default_clean.zarr --checkpoint runs/production/best_model.pt
 """
 
 from __future__ import annotations
@@ -45,16 +45,17 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 import config as cfg
-from functions import (
-    compute_fa_from_tensor6,
-    tensor6_to_full,
-    tensor_to_eig,
-)
 from dw_thi.augment import degrade_dwi_slice, degrade_dwi_volume
 from dw_thi.model import QSpaceUNet
 from dw_thi.preprocessing import compute_b0_norm, compute_brain_mask_from_dwi
 from dw_thi.runtime import get_device
-from dw_thi.utils import fit_dti_to_6d, sanitize_dti6d
+from dw_thi.utils import (
+    compute_fa_from_tensor6,
+    fit_dti_to_6d,
+    sanitize_dti6d,
+    tensor6_to_full,
+    tensor_to_eig,
+)
 
 
 DEGRADE_SLIDER_STEPS = 1000

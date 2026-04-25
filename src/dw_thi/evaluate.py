@@ -8,9 +8,9 @@ run unless disabled, and comparison plots + metric tables are saved.
 
 Usage:
     python evaluate.py
-    python evaluate.py --checkpoint research/runs/production/best_model.pt --subjects sub-10 sub-11
-    python evaluate.py --checkpoint research/runs/production/best_model.pt --skip_baselines
-    python evaluate.py --checkpoint research/runs/production/best_model.pt --eval_repeats 5 --skip_mppca
+    python evaluate.py --checkpoint runs/production/best_model.pt --subjects sub-10 sub-11
+    python evaluate.py --checkpoint runs/production/best_model.pt --skip_baselines
+    python evaluate.py --checkpoint runs/production/best_model.pt --eval_repeats 5 --skip_mppca
     python evaluate.py --sweep_patch2self --eval_repeats 3
 """
 
@@ -316,7 +316,7 @@ def evaluate_subject(
     Returns
     -------
     metrics : dict
-        Keys: 'research', and optionally 'patch2self', 'mppca'.
+        Keys: 'qspaceunet', and optionally 'patch2self', 'mppca'.
         Each value is a dict of scalar metrics plus degradation metadata.
     arrays : dict
         Raw arrays needed for visualization.
@@ -343,7 +343,7 @@ def evaluate_subject(
     else:
         mask_3d = compute_brain_mask_from_dwi(target_dwi, bvals, b0_threshold)
 
-    # ── Research model ────────────────────────────────────────────────────
+    # ── QSpaceUNet model ──────────────────────────────────────────────────
     pred_dti6d = predict_subject(
         model, zarr_path, subject_key, device,
         b0_threshold=b0_threshold,
@@ -356,7 +356,7 @@ def evaluate_subject(
         channels_last=channels_last,
     )
 
-    research_elapsed = time.time() - t0
+    qspaceunet_elapsed = time.time() - t0
     row_meta = {
         "subject": subject_key,
         "repeat": int(repeat_idx),
@@ -364,18 +364,18 @@ def evaluate_subject(
         "noise_level": round(float(noise_level), 6),
         "degrade_seed": int(degrade_seed),
     }
-    research_metrics = _compute_dti_metrics(pred_dti6d, target_dti6d, mask=mask_3d)
-    research_metrics.update(row_meta)
-    research_metrics["elapsed_s"] = round(research_elapsed, 2)
+    qspaceunet_metrics = _compute_dti_metrics(pred_dti6d, target_dti6d, mask=mask_3d)
+    qspaceunet_metrics.update(row_meta)
+    qspaceunet_metrics["elapsed_s"] = round(qspaceunet_elapsed, 2)
 
-    all_metrics = {"research": research_metrics}
+    all_metrics = {"qspaceunet": qspaceunet_metrics}
     arrays = {
         "input_dwi": input_dwi,
         "target_dwi": target_dwi,
         "target_dti6d": target_dti6d,
         "bvals": bvals,
         "bvecs": bvecs,
-        "research_dti6d": pred_dti6d,
+        "qspaceunet_dti6d": pred_dti6d,
         "brain_mask_3d": mask_3d,
         "repeat": int(repeat_idx),
         "keep_fraction": float(keep_fraction),
@@ -469,7 +469,7 @@ def save_comparison_plot(
         methods.append(("Patch2Self", arrays["patch2self_dti6d"]))
     if "mppca_dti6d" in arrays:
         methods.append(("MP-PCA", arrays["mppca_dti6d"]))
-    methods.append(("QSpaceUNet", arrays["research_dti6d"]))
+    methods.append(("QSpaceUNet", arrays["qspaceunet_dti6d"]))
     methods.append(("Target", target_dti6d))
 
     # Brain mask for this slice
@@ -513,7 +513,7 @@ def save_comparison_plot(
         ax.set_title(label, fontsize=10)
         ax.axis("off")
 
-    # Diff column: show QSpaceUNet diff (the research method)
+    # Diff column: show QSpaceUNet diff.
     if "QSpaceUNet" in method_diffs_fa:
         diff_fa = method_diffs_fa["QSpaceUNet"]
     elif method_diffs_fa:
@@ -623,7 +623,12 @@ def save_metric_comparison(
     fig, axes = plt.subplots(3, 3, figsize=(16, 12))
     axes = axes.ravel()
     method_names = list(means_df.index)
-    colors = {"research": "#2196F3", "patch2self": "#FF9800", "mppca": "#4CAF50"}
+    display_names = {
+        "qspaceunet": "QSpaceUNet",
+        "patch2self": "Patch2Self",
+        "mppca": "MP-PCA",
+    }
+    colors = {"qspaceunet": "#2196F3", "patch2self": "#FF9800", "mppca": "#4CAF50"}
     bar_colors = [colors.get(m, "#9E9E9E") for m in method_names]
 
     for i, metric in enumerate(metric_cols):
@@ -631,7 +636,8 @@ def save_metric_comparison(
             break
         ax = axes[i]
         vals = [means_df.loc[m, metric] if metric in means_df.columns else 0 for m in method_names]
-        bars = ax.bar(method_names, vals, color=bar_colors, edgecolor="black", linewidth=0.5)
+        labels = [display_names.get(m, m) for m in method_names]
+        bars = ax.bar(labels, vals, color=bar_colors, edgecolor="black", linewidth=0.5)
 
         # Highlight best
         if metric in higher_is_better:
@@ -1068,7 +1074,7 @@ def main(args):
     )
 
     # Run evaluation
-    research_rows = []
+    qspaceunet_rows = []
     p2s_rows = []
     mppca_rows = []
     plot_arrays = {}
@@ -1103,7 +1109,7 @@ def main(args):
                     amp_dtype=amp_dtype,
                     channels_last=channels_last,
                 )
-                rm = all_metrics["research"]
+                rm = all_metrics["qspaceunet"]
                 log.info(
                     "%-14s  r=%02d  keep=%.3f noise=%.3f  tensor_rmse=%.5f  "
                     "FA[rmse=%.4f r2=%.3f]  ADC[rmse=%.2e r2=%.3f]  (%.1fs)",
@@ -1111,7 +1117,7 @@ def main(args):
                     rm["tensor_rmse"], rm["fa_rmse"], rm["fa_r2"],
                     rm["adc_rmse"], rm["adc_r2"], rm["elapsed_s"],
                 )
-                research_rows.append(rm)
+                qspaceunet_rows.append(rm)
                 if "patch2self" in all_metrics:
                     p2s_rows.append(all_metrics["patch2self"])
                     log.info(
@@ -1140,7 +1146,7 @@ def main(args):
             except Exception as exc:
                 log.warning("FAIL  %s repeat=%d  —  %s", subj, repeat_idx, exc)
 
-    if not research_rows:
+    if not qspaceunet_rows:
         log.error("No subjects evaluated successfully.")
         return
 
@@ -1166,15 +1172,15 @@ def main(args):
         log.info("Saved -> %s", path)
         return df
 
-    df_research = _save_method_csv(research_rows, "research")
+    df_qspaceunet = _save_method_csv(qspaceunet_rows, "qspaceunet")
     if p2s_rows:
         _save_method_csv(p2s_rows, "patch2self")
     if mppca_rows:
         _save_method_csv(mppca_rows, "mppca")
 
-    # Also save the research-only CSV for backward compatibility
-    compat_sort_cols = [c for c in ("subject", "repeat") if c in research_rows[0]]
-    df_compat = pd.DataFrame(research_rows).sort_values(compat_sort_cols).reset_index(drop=True)
+    # Also save the primary model CSV under a generic name for convenience.
+    compat_sort_cols = [c for c in ("subject", "repeat") if c in qspaceunet_rows[0]]
+    df_compat = pd.DataFrame(qspaceunet_rows).sort_values(compat_sort_cols).reset_index(drop=True)
     cols = [c for c in metric_cols if c in df_compat.columns]
     summary = df_compat[cols].agg(["mean", "std"]).round(6).reset_index()
     summary.columns = ["subject"] + cols
@@ -1184,7 +1190,7 @@ def main(args):
     )
 
     # ── Metric comparison ─────────────────────────────────────────────────
-    comparison_rows = {"research": research_rows}
+    comparison_rows = {"qspaceunet": qspaceunet_rows}
     if p2s_rows:
         comparison_rows["patch2self"] = p2s_rows
     if mppca_rows:
@@ -1193,14 +1199,14 @@ def main(args):
         save_metric_comparison(comparison_rows, out_dir)
 
     # ── Visualization ─────────────────────────────────────────────────────
-    if research_rows and not args.skip_plot and plot_arrays:
+    if qspaceunet_rows and not args.skip_plot and plot_arrays:
         for plot_subject, arrs in plot_arrays.items():
             # Original prediction plot
             plot_path = out_dir / f"prediction_example_{plot_subject}.png"
             try:
                 plot_meta = save_prediction_slice_plot(
                     input_dwi=arrs["input_dwi"],
-                    pred_dti6d=arrs["research_dti6d"],
+                    pred_dti6d=arrs["qspaceunet_dti6d"],
                     target_dti6d=arrs["target_dti6d"],
                     bvals=arrs["bvals"],
                     out_path=plot_path,
@@ -1242,15 +1248,15 @@ def main(args):
         "tensor_rmse", "fa_rmse", "fa_mae", "fa_nrmse", "fa_r2",
         "adc_rmse", "adc_mae", "adc_nrmse", "adc_r2",
     ]
-    display_cols = [c for c in display_cols if c in df_research.columns]
-    print(df_research[display_cols].to_string(index=False))
-    print(f"\n  MEAN  " + "  ".join(f"{c}={df_research[c].mean():.4f}" for c in metric_cols))
+    display_cols = [c for c in display_cols if c in df_qspaceunet.columns]
+    print(df_qspaceunet[display_cols].to_string(index=False))
+    print(f"\n  MEAN  " + "  ".join(f"{c}={df_qspaceunet[c].mean():.4f}" for c in metric_cols))
 
     if len(comparison_rows) > 1:
         print(f"\n{'─' * 72}")
         print("  Method Comparison (mean over evaluation repeats)")
         print(f"{'─' * 72}")
-        comp = {"QSpaceUNet": df_research}
+        comp = {"QSpaceUNet": df_qspaceunet}
         if p2s_rows:
             comp["Patch2Self"] = pd.DataFrame(p2s_rows)
         if mppca_rows:

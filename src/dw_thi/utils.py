@@ -54,6 +54,43 @@ def dwi_metrics(ref_4d: np.ndarray, est_4d: np.ndarray) -> dict:
 # ═════════════════════════════════════════════════════════════════════════════════
 # DTI helpers
 # ═════════════════════
+def tensor6_to_full(tensor6: np.ndarray) -> np.ndarray:
+    """Convert compact 6D tensor maps to full 3x3 symmetric matrices."""
+    arr = np.asarray(tensor6)
+    if arr.shape[-1] != 6:
+        raise ValueError(f"Expected tensor6 last dimension of 6, got {arr.shape}")
+
+    dtype = np.result_type(arr.dtype, np.float32)
+    full = np.empty(arr.shape[:-1] + (3, 3), dtype=dtype)
+    dxx, dxy, dyy, dxz, dyz, dzz = (arr[..., i] for i in range(6))
+
+    full[..., 0, 0] = dxx
+    full[..., 0, 1] = dxy
+    full[..., 1, 0] = dxy
+    full[..., 1, 1] = dyy
+    full[..., 0, 2] = dxz
+    full[..., 2, 0] = dxz
+    full[..., 1, 2] = dyz
+    full[..., 2, 1] = dyz
+    full[..., 2, 2] = dzz
+    return full
+
+
+def tensor_to_eig(tensor: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return eigenvalues/eigenvectors sorted from largest to smallest."""
+    evals, evecs = np.linalg.eigh(np.asarray(tensor))
+    idx = np.argsort(evals, axis=-1)[..., ::-1]
+    evals = np.take_along_axis(evals, idx, axis=-1)
+    evecs = np.take_along_axis(evecs, idx[..., None, :], axis=-1)
+    return evals.astype(np.float32), evecs.astype(np.float32)
+
+
+def compute_fa_from_tensor6(tensor6: np.ndarray) -> np.ndarray:
+    """Compute FA from compact 6D tensor maps."""
+    evals, _ = tensor_to_eig(tensor6_to_full(tensor6))
+    return evals_to_fa(evals)
+
+
 def sanitize_dti6d(dti_6d: np.ndarray,
                    max_eigenvalue: float = 0.01) -> np.ndarray:
     """Project DTI tensors to PSD and cap eigenvalues for physical plausibility.

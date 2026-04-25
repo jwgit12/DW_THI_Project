@@ -3,8 +3,8 @@
 Production-ready DWI preprocessing, QSpaceUNet training, and evaluation for
 clean DWI -> 6D DTI tensor prediction.
 
-The stable pipeline lives in `src/dw_thi/`. The original `research/` files are
-kept for reference and final cleanup.
+The stable pipeline lives in `src/dw_thi/`, with thin root entry points for
+preprocessing, training, evaluation, and visualization.
 
 ## Pipeline
 
@@ -55,16 +55,16 @@ python train.py
 Defaults come from `config.py`, including:
 
 - Dataset: `dataset/default_clean.zarr`
-- Output: `research/runs/production`
-- TensorBoard logs: `research/runs/production/tb`
+- Output: `runs/production`
+- TensorBoard logs: `runs/production/tb`
 - Subject split: `VAL_SUBJECTS` and `TEST_SUBJECTS`
 - Model, optimizer, augmentation, AMP, compile, and DataLoader settings
 
 Useful overrides:
 
 ```bash
-python train.py --epochs 200 --batch_size 8 --out_dir research/runs/my_run
-tensorboard --logdir research/runs/production/tb
+python train.py --epochs 200 --batch_size 8 --out_dir runs/my_run
+tensorboard --logdir runs/production/tb
 ```
 
 Training uses CUDA automatically when available, Apple MPS on M-series Macs,
@@ -76,11 +76,11 @@ GPU-side k-space degradation.
 
 ```bash
 python evaluate.py \
-  --checkpoint research/runs/production/best_model.pt \
+  --checkpoint runs/production/best_model.pt \
   --zarr_path dataset/default_clean.zarr
 ```
 
-Evaluation writes CSV metrics and plots to `research/results` by default. It
+Evaluation writes CSV metrics and plots to `runs/evaluation` by default. It
 can run QSpaceUNet alone or include Patch2Self and MP-PCA baselines:
 
 ```bash

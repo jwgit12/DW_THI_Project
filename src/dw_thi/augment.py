@@ -61,7 +61,7 @@ def add_scaled_gaussian_noise(
 ) -> np.ndarray:
     """Add Gaussian noise with per-slice ``sigma = rel_noise_level * max(slice)``.
 
-    Matches the semantics of ``functions.lowres_noise`` but operates on a
+    Matches the legacy low-resolution/noise degradation but operates on a
     (N, H, W) stack and takes a single noise level that can vary per call.
     """
     slice_max = slice_nhw.reshape(slice_nhw.shape[0], -1).max(axis=1)

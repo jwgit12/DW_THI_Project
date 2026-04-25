@@ -1,4 +1,4 @@
-"""Centralised hyperparameters shared across research and data prep.
+"""Centralised hyperparameters for preprocessing, training, and evaluation.
 
 Import from here instead of hardcoding values so that every script uses
 the same constants.  CLI argument defaults should reference these too.
@@ -9,8 +9,8 @@ the same constants.  CLI argument defaults should reference these too.
 # ─────────────────────────────────────────────────────────────────────────────
 DATASET_ZARR_PATH = "dataset/default_clean.zarr"
 DATASET_QC_DIR = "dataset/default_clean_qc"
-TRAIN_OUT_DIR = "research/runs/production"
-EVAL_OUT_DIR = "research/results"
+TRAIN_OUT_DIR = "runs/production"
+EVAL_OUT_DIR = "runs/evaluation"
 SEED = 42
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -34,7 +34,7 @@ EVAL_KEEP_FRACTION_MAX = KEEP_FRACTION_MAX
 EVAL_NOISE_MIN = NOISE_MIN
 EVAL_NOISE_MAX = NOISE_MAX
 EVAL_DEGRADE_SEED = 1234      # fixed seed so evaluation is reproducible
-EVAL_DEFAULT_CHECKPOINT = "research/runs/production/best_model.pt"
+EVAL_DEFAULT_CHECKPOINT = "runs/production/best_model.pt"
 EVAL_INFER_BATCH_SIZE = 16
 
 # ─────────────────────────────────────────────────────────────────────────────
