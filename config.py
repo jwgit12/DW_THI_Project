@@ -9,8 +9,8 @@ the same constants.  CLI argument defaults should reference these too.
 # ─────────────────────────────────────────────────────────────────────────────
 DATASET_ZARR_PATH = "dataset/default_clean.zarr"
 DATASET_QC_DIR = "dataset/default_clean_qc"
-TRAIN_OUT_DIR = "runs/production"
-EVAL_OUT_DIR = "runs/evaluation"
+TRAIN_OUT_DIR = "runs/production_medium_more_noise"
+EVAL_OUT_DIR = "runs/evaluation_medium"
 SEED = 42
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -18,10 +18,10 @@ SEED = 42
 # sees different noise and k-space cutouts for the same clean slice. The
 # dataset build stores only the clean DWI; there is no pre-degraded array.
 # ─────────────────────────────────────────────────────────────────────────────
-NOISE_MIN = 0.01              # minimum relative Gaussian noise level
-NOISE_MAX = 0.10              # maximum relative Gaussian noise level
-KEEP_FRACTION_MIN = 0.5       # min central k-space fraction kept
-KEEP_FRACTION_MAX = 0.7       # max central k-space fraction kept
+NOISE_MIN = 0.05              # minimum relative Gaussian noise level
+NOISE_MAX = 0.25              # maximum relative Gaussian noise level
+KEEP_FRACTION_MIN = 0.4       # min central k-space fraction kept
+KEEP_FRACTION_MAX = 0.6      # max central k-space fraction kept
 
 # Deterministic single-value defaults used at eval time (and as a back-compat
 # scalar when callers expect the legacy ``KEEP_FRACTION`` / Zarr attrs).
@@ -62,6 +62,16 @@ BRAIN_MASK_DILATE = 1
 BRAIN_MASK_FINALIZE = True
 
 # ─────────────────────────────────────────────────────────────────────────────
+# fODF (single-shell CSD) — fitted at build-time on clean DWI and stored in Zarr
+# as spherical-harmonic coefficients (n_coeffs depends on FODF_SH_ORDER:
+# 6→28, 8→45, 10→66). Not yet wired into training.
+# ─────────────────────────────────────────────────────────────────────────────
+FODF_SH_ORDER = 8
+FODF_RESPONSE_ROI_RADII = 10        # ROI radius for auto_response_ssst (voxels)
+FODF_RESPONSE_FA_THR = 0.7          # FA threshold for response-function ROI
+FODF_SINGLE_SHELL_TOL = 100.0       # b-value tolerance for "single shell" check
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Subject split (biological subject IDs — all sessions stay together)
 # ─────────────────────────────────────────────────────────────────────────────
 TEST_SUBJECTS = ["sub-03", "sub-04"]
@@ -70,8 +80,8 @@ VAL_SUBJECTS = ["sub-05", "sub-11"]
 # ─────────────────────────────────────────────────────────────────────────────
 # Model architecture
 # ─────────────────────────────────────────────────────────────────────────────
-FEAT_DIM = 128                # q-space encoder feature dimension (matches channels[0])
-UNET_CHANNELS = [128, 256, 512]  # 3 encoder levels; factor=8 fits (132, 130) easily
+FEAT_DIM = 64                # q-space encoder feature dimension (matches channels[0])
+UNET_CHANNELS = [64, 128, 256]  # 3 encoder levels; factor=8 fits (132, 130) easily
 DROPOUT = 0.1                # spatial dropout rate in U-Net conv blocks
 LAMBDA_SCALAR = 0.3          # weight for FA/MD auxiliary loss
 LAMBDA_EDGE = 0.1            # weight for FA spatial-gradient (edge) loss
@@ -88,12 +98,12 @@ GRAD_CLIP = 1.0              # gradient norm clipping value
 WARMUP_EPOCHS = 5            # linear LR warmup before cosine annealing
 VIS_EVERY = 1                # TensorBoard validation figure cadence
 NUM_WORKERS = 4            # -1 = OS-aware auto
-PREFETCH_FACTOR = 2          # DataLoader prefetch per worker
+PREFETCH_FACTOR = 4          # DataLoader prefetch per worker
 AMP = True
 AMP_DTYPE = "auto"           # 'auto' | 'bf16' | 'fp16'
 CHANNELS_LAST = True         # CUDA-only channels-last conv layout
-COMPILE = "auto"             # 'off' | 'auto' | 'on'
-COMPILE_MODE = "max-autotune"
+COMPILE = "on"               # 'off' | 'auto' | 'on'
+COMPILE_MODE = "reduce-overhead"
 FUSED_ADAMW = True           # CUDA-only fused optimizer when available
 DETERMINISTIC = False
 REQUIRE_CUDA = False

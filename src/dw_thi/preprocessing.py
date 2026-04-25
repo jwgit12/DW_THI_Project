@@ -23,6 +23,7 @@ import numpy as np
 import zarr
 from dipy.core.gradients import gradient_table
 from dipy.io import read_bvals_bvecs
+from dipy.reconst.csdeconv import ConstrainedSphericalDeconvModel, auto_response_ssst
 from dipy.reconst.dti import TensorModel
 from dipy.segment.mask import median_otsu
 from tqdm import tqdm
@@ -129,6 +130,66 @@ def tensor_to_6d(tensor: np.ndarray) -> np.ndarray:
         ],
         axis=-1,
     ).astype(np.float32)
+
+
+def _detect_single_shell_bval(
+    bvals: np.ndarray,
+    b0_threshold: float = cfg.B0_THRESHOLD,
+    tol: float = cfg.FODF_SINGLE_SHELL_TOL,
+) -> float:
+    """Return the (single) non-zero b-value, or raise if multiple shells exist."""
+    bvals = np.asarray(bvals, dtype=np.float32)
+    nonzero = bvals[bvals >= b0_threshold]
+    if nonzero.size == 0:
+        raise ValueError("No non-b0 volumes found; cannot fit single-shell CSD.")
+    bmin, bmax = float(nonzero.min()), float(nonzero.max())
+    if (bmax - bmin) > tol:
+        raise ValueError(
+            f"Multiple shells detected (b in [{bmin:.1f}, {bmax:.1f}], tol={tol}). "
+            "single-shell CSD requires one non-zero shell."
+        )
+    return float(nonzero.mean())
+
+
+def compute_fodf_sh(
+    data: np.ndarray,
+    gtab,
+    mask: np.ndarray | None = None,
+    sh_order: int = cfg.FODF_SH_ORDER,
+    roi_radii: int = cfg.FODF_RESPONSE_ROI_RADII,
+    fa_thr: float = cfg.FODF_RESPONSE_FA_THR,
+) -> tuple[np.ndarray, dict[str, object]]:
+    """Fit single-shell CSD and return SH coefficients ``(X, Y, Z, n_coeffs)``.
+
+    Uses ``auto_response_ssst`` to estimate the white-matter response function,
+    then ``ConstrainedSphericalDeconvModel`` to fit the fODF. SH coefficients
+    are returned in DIPY's default ``descoteaux07`` basis.
+    """
+    _detect_single_shell_bval(np.asarray(gtab.bvals))
+
+    response, ratio = auto_response_ssst(
+        gtab,
+        data,
+        roi_radii=int(roi_radii),
+        fa_thr=float(fa_thr),
+    )
+    csd_model = ConstrainedSphericalDeconvModel(gtab, response, sh_order_max=int(sh_order))
+    csd_fit = csd_model.fit(data, mask=mask)
+    sh_coeffs = np.asarray(csd_fit.shm_coeff, dtype=np.float32)
+    sh_coeffs = np.nan_to_num(sh_coeffs, nan=0.0, posinf=0.0, neginf=0.0)
+
+    eigvals, S0 = response
+    info = {
+        "sh_order": int(sh_order),
+        "n_coeffs": int(sh_coeffs.shape[-1]),
+        "sh_basis": "descoteaux07",
+        "response_eigvals": [float(v) for v in np.asarray(eigvals).ravel()],
+        "response_S0": float(S0),
+        "response_ratio": float(ratio),
+        "roi_radii": int(roi_radii),
+        "fa_thr": float(fa_thr),
+    }
+    return sh_coeffs, info
 
 
 def compute_b0_norm(mean_b0_slice: np.ndarray) -> float:
@@ -288,7 +349,14 @@ def save_qc_plot(
 
 def validate_store(store: zarr.Group) -> None:
     """Validate the production Zarr contract."""
-    required_keys = {"target_dwi", "target_dti_6d", "bvals", "bvecs", "brain_mask"}
+    required_keys = {
+        "target_dwi",
+        "target_dti_6d",
+        "target_fodf_sh",
+        "bvals",
+        "bvecs",
+        "brain_mask",
+    }
     for subject_id in sorted(store.group_keys()):
         group = store[subject_id]
         missing = required_keys.difference(set(group.array_keys()))
@@ -297,10 +365,13 @@ def validate_store(store: zarr.Group) -> None:
 
         target_shape = group["target_dwi"].shape
         tensor_shape = group["target_dti_6d"].shape
+        fodf_shape = group["target_fodf_sh"].shape
         mask_shape = group["brain_mask"].shape
 
         if len(tensor_shape) != 4 or tensor_shape[:3] != target_shape[:3] or tensor_shape[-1:] != (6,):
             raise ValueError(f"{subject_id} invalid target_dti_6d shape: {tensor_shape}")
+        if len(fodf_shape) != 4 or fodf_shape[:3] != target_shape[:3] or fodf_shape[-1] < 1:
+            raise ValueError(f"{subject_id} invalid target_fodf_sh shape: {fodf_shape}")
         if mask_shape != target_shape[:3]:
             raise ValueError(f"{subject_id} invalid brain_mask shape: {mask_shape}")
 
@@ -353,6 +424,15 @@ def build_pretext_dataset(args: argparse.Namespace) -> dict[str, object]:
         "dilate": cfg.BRAIN_MASK_DILATE,
         "finalize_mask": cfg.BRAIN_MASK_FINALIZE,
     }
+    store.attrs["fodf"] = {
+        "method": "dipy.reconst.csdeconv.ConstrainedSphericalDeconvModel",
+        "response": "auto_response_ssst",
+        "sh_order": cfg.FODF_SH_ORDER,
+        "sh_basis": "descoteaux07",
+        "roi_radii": cfg.FODF_RESPONSE_ROI_RADII,
+        "fa_thr": cfg.FODF_RESPONSE_FA_THR,
+        "single_shell_only": True,
+    }
     store.attrs["degradation_ranges"] = {
         "keep_fraction": [cfg.KEEP_FRACTION_MIN, cfg.KEEP_FRACTION_MAX],
         "noise_level": [cfg.NOISE_MIN, cfg.NOISE_MAX],
@@ -367,6 +447,7 @@ def build_pretext_dataset(args: argparse.Namespace) -> dict[str, object]:
 
         brain_mask = compute_brain_mask_from_dwi(clean_dwi, bvals)
         tensor_clean_6d = tensor_to_6d(compute_dti(clean_dwi, sample["gtab"], mask=brain_mask))
+        fodf_sh, fodf_info = compute_fodf_sh(clean_dwi, sample["gtab"], mask=brain_mask)
 
         subject_id = entry["key"]
         group = store.create_group(subject_id)
@@ -374,9 +455,11 @@ def build_pretext_dataset(args: argparse.Namespace) -> dict[str, object]:
         group.attrs["original_subject"] = entry["subject"]
         group.attrs["original_session"] = entry["session"]
         group.attrs["original_run"] = entry["run"]
+        group.attrs["fodf"] = fodf_info
 
         group.create_array("target_dwi", data=clean_dwi)
         group.create_array("target_dti_6d", data=tensor_clean_6d)
+        group.create_array("target_fodf_sh", data=fodf_sh)
         group.create_array("brain_mask", data=brain_mask.astype(np.uint8))
         group.create_array("bvals", data=bvals)
         group.create_array("bvecs", data=bvecs)
