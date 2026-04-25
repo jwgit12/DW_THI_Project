@@ -84,14 +84,15 @@ def default_num_workers(requested: int | None) -> int:
         return requested
 
     cpu_count = os.cpu_count() or 1
-    # This dataset preloads full subject arrays into RAM. Windows uses spawn
-    # workers, which must pickle that dataset state and can fail before the
-    # first batch; keep auto mode single-process there.
+    # Dataset now uses lazy zarr slice-loading in __getitem__, so workers
+    # only pickle bvals/bvecs/brain_masks (~10 MB) — safe on all platforms.
     if platform.system() == "Windows":
-        return 0
-    # macOS also uses spawn, so keep the automatic default conservative.
+        # Keep per-worker FFT load manageable: cpu_count//4 workers, each
+        # running scipy.fft internally.
+        return min(8, max(2, cpu_count // 4))
+    # macOS also uses spawn, conservative default.
     if platform.system() == "Darwin":
-        return min(2, max(1, cpu_count // 2))
+        return min(4, max(1, cpu_count // 2))
     if platform.system() == "Linux":
         return min(12, max(1, cpu_count - 2))
     return min(4, max(1, cpu_count // 2))
@@ -146,13 +147,24 @@ def maybe_channels_last(tensor: torch.Tensor, enabled: bool) -> torch.Tensor:
     return tensor
 
 
+def _triton_available() -> bool:
+    try:
+        import triton  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
 def should_compile_model(setting: str, device: torch.device) -> bool:
     if setting == "off" or device.type != "cuda" or not hasattr(torch, "compile"):
         return False
     if setting == "on":
         return True
-    # Inductor support is most reliable on Linux. Users can still force it with
-    # ``--compile on`` on other platforms when their PyTorch install supports it.
+    # On Windows, torch.compile requires triton-windows (not installed by
+    # default). Skip silently when it's absent; users can install it or pass
+    # --compile on to force the attempt (which gives a clear error message).
+    if platform.system() == "Windows":
+        return _triton_available()
     return platform.system() == "Linux"
 
 

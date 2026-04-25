@@ -13,3 +13,5 @@ torch
 torchvision
 tensorboard
 tqdm
+
+triton

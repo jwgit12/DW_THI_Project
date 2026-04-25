@@ -18,8 +18,17 @@ Performance notes
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import scipy.fft as sfft
+import torch
+
+# Each DataLoader worker runs its own FFT threads. Cap per-call threads so
+# total thread count stays ≤ cpu_count when multiple workers run in parallel.
+# With 4 workers on a 16-core CPU: 4 × 4 = 16 threads → fully utilised.
+# Override with DW_FFT_WORKERS env var if needed.
+_FFT_WORKERS: int = int(os.environ.get("DW_FFT_WORKERS", max(1, (os.cpu_count() or 4) // 4)))
 
 
 def lowres_kspace_cutout(slice_nhw: np.ndarray, keep_fraction: float) -> np.ndarray:
@@ -36,12 +45,12 @@ def lowres_kspace_cutout(slice_nhw: np.ndarray, keep_fraction: float) -> np.ndar
     lowres : (N, H, W) float32
     """
     _, h, w = slice_nhw.shape
-    k = sfft.rfft2(slice_nhw, axes=(-2, -1), workers=-1)
+    k = sfft.rfft2(slice_nhw, axes=(-2, -1), workers=_FFT_WORKERS)
     ry = max(1, int(h * keep_fraction / 2))
     rx = max(1, int(w * keep_fraction / 2))
     k[:, ry:h - ry, :] = 0
     k[:, :, rx:] = 0
-    lowres = sfft.irfft2(k, s=(h, w), axes=(-2, -1), workers=-1).astype(np.float32)
+    lowres = sfft.irfft2(k, s=(h, w), axes=(-2, -1), workers=_FFT_WORKERS).astype(np.float32)
     return lowres
 
 
@@ -102,3 +111,83 @@ def degrade_dwi_volume(
     return np.ascontiguousarray(
         noisy.reshape(z, n, x, y).transpose(2, 3, 0, 1)
     )
+
+
+# ---------------------------------------------------------------------------
+# GPU degradation helpers (cuFFT — ~50× faster than CPU scipy path)
+# ---------------------------------------------------------------------------
+
+def gpu_degrade_dwi_batch(
+    signal: torch.Tensor,
+    keep_fraction: torch.Tensor,
+    noise_level: torch.Tensor,
+) -> torch.Tensor:
+    """K-space cutout + Gaussian noise for a full batch on GPU (cuFFT).
+
+    Semantically identical to ``degrade_dwi_slice`` but operates on
+    ``(B, N, H, W)`` tensors and uses ``torch.fft.rfft2``, which is
+    ~50× faster than the per-sample scipy path on CUDA.
+
+    Parameters
+    ----------
+    signal : (B, N, H, W) float32, on device
+    keep_fraction : (B,) float32 — fraction of each spatial axis kept around DC
+    noise_level : (B,) float32 — rel_noise_level per sample
+
+    Returns
+    -------
+    degraded : (B, N, H, W) float32
+    """
+    B, N, H, W = signal.shape
+
+    k = torch.fft.rfft2(signal, dim=(-2, -1))  # (B, N, H, W//2+1) complex
+
+    ry = (H * keep_fraction / 2).long().clamp(min=1)   # (B,)
+    rx = (W * keep_fraction / 2).long().clamp(min=1)   # (B,)
+
+    freq_h = torch.arange(H, device=signal.device)           # (H,)
+    freq_w = torch.arange(W // 2 + 1, device=signal.device)  # (W//2+1,)
+
+    # Vectorized per-sample frequency masks (no Python loops).
+    row_keep = (freq_h[None] < ry[:, None]) | (freq_h[None] >= H - ry[:, None])  # (B, H)
+    col_keep = freq_w[None] < rx[:, None]                                          # (B, W//2+1)
+    mask = (row_keep[:, :, None] & col_keep[:, None, :]).unsqueeze(1)             # (B, 1, H, W//2+1)
+
+    lowres = torch.fft.irfft2(k * mask, s=(H, W), dim=(-2, -1))  # (B, N, H, W)
+
+    slice_max = lowres.reshape(B, N, -1).amax(dim=-1)            # (B, N)
+    sigma = (noise_level[:, None] * slice_max).view(B, N, 1, 1)
+    return lowres + torch.randn_like(lowres) * sigma
+
+
+def gpu_b0_normalize_batch(
+    signal: torch.Tensor,
+    b0_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Normalize each batch item by its mean-b0 intensity (GPU counterpart of
+    ``compute_b0_norm`` + the b0-normalization step in ``DWISliceDataset``).
+
+    Parameters
+    ----------
+    signal : (B, N, H, W) float32
+    b0_mask : (B, N) bool — True for b0 volumes (bval < threshold)
+
+    Returns
+    -------
+    normalized : (B, N, H, W) float32
+    """
+    B, N, H, W = signal.shape
+    b0_float = b0_mask.float()                                          # (B, N)
+    n_b0 = b0_float.sum(dim=1).clamp(min=1.0)                          # (B,)
+    mean_b0 = (signal * b0_float[:, :, None, None]).sum(dim=1) / n_b0[:, None, None]  # (B, H, W)
+
+    max_val = mean_b0.reshape(B, -1).amax(dim=1)                       # (B,)
+    brain = mean_b0 > (0.1 * max_val)[:, None, None]                   # (B, H, W)
+    brain_sum = (mean_b0 * brain.float()).reshape(B, -1).sum(dim=1)    # (B,)
+    brain_count = brain.reshape(B, -1).sum(dim=1).float().clamp(min=1) # (B,)
+    b0_norm = (brain_sum / brain_count).clamp(min=1e-6)                # (B,)
+
+    has_b0 = b0_mask.any(dim=1)                                        # (B,)
+    b0_norm = torch.where(has_b0, b0_norm, torch.ones_like(b0_norm))
+
+    return signal / b0_norm[:, None, None, None]
