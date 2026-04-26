@@ -1,7 +1,8 @@
-"""Train QSpaceUNet with TensorBoard tracking.
+"""Train QSpaceUNet for fODF SH prediction with TensorBoard tracking.
 
 The production defaults live in config.py. CLI flags only override that single
-config source when you need an ad-hoc run.
+config source when you need an ad-hoc run. This branch trains the fODF head
+only — no DTI supervision.
 """
 
 from __future__ import annotations
@@ -25,7 +26,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 try:
@@ -50,7 +50,7 @@ except ImportError:  # pragma: no cover - exercised only in incomplete envs
 import config as cfg
 from .augment import gpu_b0_normalize_batch, gpu_degrade_dwi_batch
 from .dataset import DWISliceDataset, dwi_worker_init
-from .loss import DTILoss
+from .loss import FodfLoss
 from .model import QSpaceUNet
 from .runtime import (
     amp_dtype_from_name,
@@ -59,13 +59,12 @@ from .runtime import (
     default_num_workers,
     get_device,
     make_grad_scaler,
-    maybe_channels_last,
     maybe_compile_model,
     path_str,
     require_cuda_if_requested,
     resolve_project_path,
+    should_pin_memory,
 )
-from .utils import dti6d_to_scalar_maps, scalar_map_metrics
 
 logging.basicConfig(
     level=logging.INFO,
@@ -73,6 +72,21 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger(__name__)
+
+
+FODF_METRIC_KEYS = (
+    "loss",
+    "fodf_loss",
+    "fodf_mse",
+    "fodf_acc",
+    "fodf_corr_loss",
+    "fodf_sf_loss",
+    "fodf_peak_loss",
+    "fodf_peak_mae",
+    "fodf_peak_ratio",
+    "fodf_nonneg_loss",
+    "fodf_power_loss",
+)
 
 
 @dataclass
@@ -320,36 +334,6 @@ def split_subjects(
     return train, val, test
 
 
-def load_baseline_metrics(csv_paths: list[Path]) -> dict[str, dict[str, float]]:
-    """Load optional baseline CSVs and return {baseline_name: metric_means}."""
-    baselines: dict[str, dict[str, float]] = {}
-    for csv_path in csv_paths:
-        if not csv_path.exists():
-            continue
-        df = pd.read_csv(csv_path)
-        mean_row = df[df["subject"] == "MEAN"]
-        if mean_row.empty:
-            continue
-        name = csv_path.stem.replace("metrics_", "")
-        metrics: dict[str, float] = {}
-        for col in [
-            "fa_rmse",
-            "fa_mae",
-            "fa_nrmse",
-            "fa_r2",
-            "adc_rmse",
-            "adc_mae",
-            "adc_nrmse",
-            "adc_r2",
-        ]:
-            if col in mean_row.columns:
-                val = mean_row[col].values[0]
-                if pd.notna(val):
-                    metrics[col] = float(val)
-        baselines[name] = metrics
-    return baselines
-
-
 def move_batch_tensor(
     tensor: torch.Tensor,
     device: torch.device,
@@ -376,13 +360,19 @@ def make_val_figure(
     model: QSpaceUNet,
     val_ds: DWISliceDataset,
     device: torch.device,
-    dti_scale: float,
+    n_bands: int,
+    band_slices: list[tuple[int, int]],
     slice_idx: int | None = None,
     amp_enabled: bool = False,
     amp_dtype: torch.dtype | None = None,
     channels_last: bool = False,
 ) -> plt.Figure:
-    """Generate a prediction-vs-target figure for TensorBoard."""
+    """Generate an fODF prediction-vs-target figure for TensorBoard.
+
+    Plots SH-energy maps (rotation-invariant), the per-voxel cosine
+    similarity, and a target-vs-pred per-ℓ-band power-spectrum bar plot
+    averaged over brain voxels. No DTI scalars.
+    """
     if slice_idx is None:
         slice_idx = len(val_ds) // 2
 
@@ -397,75 +387,89 @@ def make_val_figure(
     bvals = sample["bvals"].unsqueeze(0).to(device, non_blocking=non_blocking)
     bvecs = sample["bvecs"].unsqueeze(0).to(device, non_blocking=non_blocking)
     vol_mask = sample["vol_mask"].unsqueeze(0).to(device, non_blocking=non_blocking)
-    target = sample["target"].numpy()
-    bmask = sample["brain_mask"].numpy()
+
+    target_fodf = sample["target_fodf"].numpy()  # (C, H, W)
+    bmask = sample["brain_mask"].numpy() if "brain_mask" in sample else None
 
     model.eval()
     with torch.inference_mode(), autocast_context(device, enabled=amp_enabled, dtype=amp_dtype):
         pred = model(signal, bvals, bvecs, vol_mask)
-    pred_np = pred[0].float().cpu().numpy()
+    _, pred_fodf_t = model.split_outputs(pred.float())
+    pred_fodf = pred_fodf_t[0].cpu().numpy()  # (C, H, W)
 
-    pred_np = pred_np / dti_scale
-    target = target / dti_scale
+    tgt_energy = np.sqrt((target_fodf ** 2).sum(axis=0))
+    pred_energy = np.sqrt((pred_fodf ** 2).sum(axis=0))
+    energy_diff = pred_energy - tgt_energy
 
-    pred_vol = pred_np.transpose(1, 2, 0)[..., np.newaxis, :]
-    tgt_vol = target.transpose(1, 2, 0)[..., np.newaxis, :]
-    pred_fa, pred_adc = dti6d_to_scalar_maps(pred_vol)
-    tgt_fa, tgt_adc = dti6d_to_scalar_maps(tgt_vol)
+    pred_flat = pred_fodf.reshape(pred_fodf.shape[0], -1)
+    tgt_flat = target_fodf.reshape(target_fodf.shape[0], -1)
+    norm_pred = np.linalg.norm(pred_flat, axis=0) + 1e-8
+    norm_tgt = np.linalg.norm(tgt_flat, axis=0) + 1e-8
+    cosine = (pred_flat * tgt_flat).sum(axis=0) / (norm_pred * norm_tgt)
+    cosine_map = cosine.reshape(target_fodf.shape[1], target_fodf.shape[2])
 
-    pred_fa = pred_fa[:, :, 0]
-    pred_adc = pred_adc[:, :, 0]
-    tgt_fa = tgt_fa[:, :, 0]
-    tgt_adc = tgt_adc[:, :, 0]
-    bmask_bool = bmask > 0.5
+    if bmask is not None:
+        bmask_bool = bmask > 0.5
+        tgt_energy_disp = tgt_energy * bmask
+        pred_energy_disp = pred_energy * bmask
+        energy_diff_disp = energy_diff * bmask
+        cosine_disp = np.where(bmask_bool, cosine_map, np.nan)
+    else:
+        bmask_bool = np.ones_like(tgt_energy, dtype=bool)
+        tgt_energy_disp = tgt_energy
+        pred_energy_disp = pred_energy
+        energy_diff_disp = energy_diff
+        cosine_disp = cosine_map
 
-    fa_diff = (tgt_fa - pred_fa) * bmask
-    adc_diff = (tgt_adc - pred_adc) * bmask
+    if bmask_bool.any():
+        tgt_band_power = np.array(
+            [(target_fodf[s:e][:, bmask_bool] ** 2).sum(axis=0).mean()
+             for s, e in band_slices]
+        )
+        pred_band_power = np.array(
+            [(pred_fodf[s:e][:, bmask_bool] ** 2).sum(axis=0).mean()
+             for s, e in band_slices]
+        )
+    else:
+        tgt_band_power = np.zeros(n_bands)
+        pred_band_power = np.zeros(n_bands)
 
-    fig, axes = plt.subplots(2, 4, figsize=(20, 10))
+    energy_max = max(float(np.nanmax(tgt_energy_disp)), float(np.nanmax(pred_energy_disp)), 1e-6)
+    diff_abs = max(float(np.nanmax(np.abs(energy_diff_disp))), 1e-6)
 
-    axes[0, 0].imshow(np.rot90(tgt_fa * bmask), cmap="viridis", vmin=0, vmax=1)
-    axes[0, 0].set_title("Target FA")
-    axes[0, 1].imshow(np.rot90(pred_fa * bmask), cmap="viridis", vmin=0, vmax=1)
-    axes[0, 1].set_title("Predicted FA")
-    fa_abs = max(float(np.max(np.abs(fa_diff))), 1e-6)
-    im_fa = axes[0, 2].imshow(np.rot90(fa_diff), cmap="bwr", vmin=-fa_abs, vmax=fa_abs)
-    axes[0, 2].set_title("FA error")
-    fig.colorbar(im_fa, ax=axes[0, 2], fraction=0.046, pad=0.04)
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
 
-    fa_tgt_brain = tgt_fa[bmask_bool]
-    fa_pred_brain = pred_fa[bmask_bool]
-    axes[0, 3].scatter(fa_tgt_brain, fa_pred_brain, s=1, alpha=0.3)
-    axes[0, 3].plot([0, 1], [0, 1], "r--", lw=1)
-    fa_metrics = scalar_map_metrics(tgt_fa, pred_fa, mask=bmask_bool)
-    axes[0, 3].set_title(f"FA RMSE={fa_metrics['rmse']:.4f} R2={fa_metrics['r2']:.3f}")
-    axes[0, 3].set_xlabel("Target")
-    axes[0, 3].set_ylabel("Predicted")
-    axes[0, 3].set_aspect("equal")
+    axes[0, 0].imshow(np.rot90(tgt_energy_disp), cmap="viridis", vmin=0, vmax=energy_max)
+    axes[0, 0].set_title("Target SH energy ‖c‖")
+    axes[0, 1].imshow(np.rot90(pred_energy_disp), cmap="viridis", vmin=0, vmax=energy_max)
+    axes[0, 1].set_title("Predicted SH energy ‖c‖")
+    im_diff = axes[0, 2].imshow(np.rot90(energy_diff_disp), cmap="bwr", vmin=-diff_abs, vmax=diff_abs)
+    axes[0, 2].set_title("Energy residual (pred − target)")
+    fig.colorbar(im_diff, ax=axes[0, 2], fraction=0.046, pad=0.04)
 
-    adc_brain = tgt_adc[bmask_bool]
-    adc_hi = max(float(np.percentile(adc_brain, 99)), 1e-6) if adc_brain.size else 1e-6
-    axes[1, 0].imshow(np.rot90(tgt_adc * bmask), cmap="magma", vmin=0, vmax=adc_hi)
-    axes[1, 0].set_title("Target ADC")
-    axes[1, 1].imshow(np.rot90(pred_adc * bmask), cmap="magma", vmin=0, vmax=adc_hi)
-    axes[1, 1].set_title("Predicted ADC")
-    adc_abs = max(float(np.max(np.abs(adc_diff))), 1e-6)
-    im_adc = axes[1, 2].imshow(np.rot90(adc_diff), cmap="bwr", vmin=-adc_abs, vmax=adc_abs)
-    axes[1, 2].set_title("ADC error")
-    fig.colorbar(im_adc, ax=axes[1, 2], fraction=0.046, pad=0.04)
+    im_cos = axes[1, 0].imshow(np.rot90(cosine_disp), cmap="RdYlBu", vmin=-1, vmax=1)
+    cosine_brain = cosine_map[bmask_bool] if bmask_bool.any() else np.array([0.0])
+    axes[1, 0].set_title(f"Cosine similarity (mean={cosine_brain.mean():.3f})")
+    fig.colorbar(im_cos, ax=axes[1, 0], fraction=0.046, pad=0.04)
 
-    adc_pred_brain = pred_adc[bmask_bool]
-    axes[1, 3].scatter(adc_brain, adc_pred_brain, s=1, alpha=0.3)
-    axes[1, 3].plot([0, adc_hi], [0, adc_hi], "r--", lw=1)
-    adc_metrics = scalar_map_metrics(tgt_adc, pred_adc, mask=bmask_bool)
-    axes[1, 3].set_title(f"ADC RMSE={adc_metrics['rmse']:.2e} R2={adc_metrics['r2']:.3f}")
-    axes[1, 3].set_xlabel("Target")
-    axes[1, 3].set_ylabel("Predicted")
-    axes[1, 3].set_aspect("equal")
+    axes[1, 1].hist(cosine_brain, bins=40, range=(-1.0, 1.0), color="steelblue")
+    axes[1, 1].axvline(float(cosine_brain.mean()), color="red", lw=1)
+    axes[1, 1].set_title("Cosine sim histogram (brain)")
+    axes[1, 1].set_xlabel("cosine")
+    axes[1, 1].set_ylabel("voxels")
 
-    for ax in axes.ravel():
-        if ax not in [axes[0, 3], axes[1, 3]]:
-            ax.axis("off")
+    band_idx = np.arange(n_bands)
+    width = 0.4
+    axes[1, 2].bar(band_idx - width / 2, tgt_band_power, width, label="target", color="black", alpha=0.7)
+    axes[1, 2].bar(band_idx + width / 2, pred_band_power, width, label="pred", color="orange", alpha=0.8)
+    axes[1, 2].set_xticks(band_idx)
+    axes[1, 2].set_xticklabels([f"ℓ={2 * i}" for i in band_idx])
+    axes[1, 2].set_title("Mean per-ℓ-band power (brain)")
+    axes[1, 2].set_yscale("log")
+    axes[1, 2].legend()
+
+    for r, c in [(0, 0), (0, 1), (0, 2), (1, 0)]:
+        axes[r, c].axis("off")
 
     fig.tight_layout()
     return fig
@@ -474,7 +478,7 @@ def make_val_figure(
 def run_epoch(
     model: torch.nn.Module,
     loader: DataLoader,
-    criterion: DTILoss,
+    criterion: FodfLoss,
     device: torch.device,
     optimizer: torch.optim.Optimizer | None = None,
     use_brain_mask: bool = True,
@@ -482,19 +486,16 @@ def run_epoch(
     amp_enabled: bool = False,
     amp_dtype: torch.dtype | None = None,
     scaler=None,
+    non_blocking: bool = False,
     channels_last: bool = False,
     profiler: ProfilerController | None = None,
 ) -> dict[str, float]:
-    """Run one train or validation epoch."""
+    """Run one train or validation epoch (fODF-only)."""
     is_train = optimizer is not None
     model.train(is_train)
 
-    total_loss = torch.zeros((), device=device)
-    total_tensor = torch.zeros((), device=device)
-    total_fa = torch.zeros((), device=device)
-    total_md = torch.zeros((), device=device)
+    totals = {key: torch.zeros((), device=device) for key in FODF_METRIC_KEYS}
     n_batches = 0
-    non_blocking = device.type == "cuda"
 
     def metric_tensor(metrics: dict, key: str) -> torch.Tensor:
         value = metrics.get(key)
@@ -505,86 +506,88 @@ def run_epoch(
         return torch.tensor(float(value), device=device)
 
     ctx = torch.enable_grad() if is_train else torch.no_grad()
-    with ctx:
-        for batch in loader:
-            if profiler is not None and profiler.stop_requested:
-                break
+    try:
+        with ctx:
+            for batch in loader:
+                if profiler is not None and profiler.stop_requested:
+                    break
 
-            record = profiler.record if profiler is not None else (lambda _name: nullcontext())
+                record = profiler.record if profiler is not None else (lambda _name: nullcontext())
 
-            with record("train/data_to_device" if is_train else "val/data_to_device"):
-                signal = move_batch_tensor(
-                    batch["input"],
-                    device,
-                    non_blocking=non_blocking,
-                    channels_last=channels_last,
-                )
-                target = batch["target"].to(device, non_blocking=non_blocking)
-                bvals = batch["bvals"].to(device, non_blocking=non_blocking)
-                bvecs = batch["bvecs"].to(device, non_blocking=non_blocking)
-                vol_mask = batch["vol_mask"].to(device, non_blocking=non_blocking)
-                brain_mask = (
-                    batch["brain_mask"].to(device, non_blocking=non_blocking)
-                    if use_brain_mask
-                    else None
-                )
+                with record("train/data_to_device" if is_train else "val/data_to_device"):
+                    signal = move_batch_tensor(
+                        batch["input"],
+                        device,
+                        non_blocking=non_blocking,
+                        channels_last=channels_last,
+                    )
+                    target_fodf = batch["target_fodf"].to(device, non_blocking=non_blocking)
+                    bvals = batch["bvals"].to(device, non_blocking=non_blocking)
+                    bvecs = batch["bvecs"].to(device, non_blocking=non_blocking)
+                    vol_mask = batch["vol_mask"].to(device, non_blocking=non_blocking)
+                    brain_mask = (
+                        batch["brain_mask"].to(device, non_blocking=non_blocking)
+                        if use_brain_mask
+                        else None
+                    )
 
-            if "degrade_kf" in batch:
-                with record("train/gpu_degrade" if is_train else "val/gpu_degrade"):
-                    degrade_kf = batch["degrade_kf"].to(device, non_blocking=non_blocking)
-                    degrade_nl = batch["degrade_nl"].to(device, non_blocking=non_blocking)
-                    b0_mask = batch["b0_mask"].to(device, non_blocking=non_blocking)
-                    signal = gpu_degrade_dwi_batch(signal, degrade_kf, degrade_nl)
-                    signal = gpu_b0_normalize_batch(signal, b0_mask)
+                if "degrade_kf" in batch:
+                    with record("train/gpu_degrade" if is_train else "val/gpu_degrade"):
+                        degrade_kf = batch["degrade_kf"].to(device, non_blocking=non_blocking)
+                        degrade_nl = batch["degrade_nl"].to(device, non_blocking=non_blocking)
+                        b0_mask = batch["b0_mask"].to(device, non_blocking=non_blocking)
+                        signal = gpu_degrade_dwi_batch(signal, degrade_kf, degrade_nl)
+                        signal = gpu_b0_normalize_batch(signal, b0_mask)
 
-            with record("train/forward" if is_train else "val/forward"):
-                with autocast_context(device, enabled=amp_enabled, dtype=amp_dtype):
-                    pred = model(signal, bvals, bvecs, vol_mask)
-            with record("train/loss" if is_train else "val/loss"):
-                loss, metrics = criterion(
-                    pred.float(),
-                    target,
-                    mask=brain_mask,
-                    return_tensor_metrics=True,
-                )
+                with record("train/forward" if is_train else "val/forward"):
+                    with autocast_context(device, enabled=amp_enabled, dtype=amp_dtype):
+                        pred = model(signal, bvals, bvecs, vol_mask)
+                pred_fodf = pred.float()
+                with record("train/loss" if is_train else "val/loss"):
+                    loss, metrics = criterion(
+                        pred_fodf,
+                        target_fodf,
+                        mask=brain_mask,
+                        return_tensor_metrics=True,
+                    )
 
-            if is_train:
-                with record("train/optimizer_zero_grad"):
-                    optimizer.zero_grad(set_to_none=True)
-                with record("train/backward"):
-                    if scaler is not None:
-                        scaler.scale(loss).backward()
-                        scaler.unscale_(optimizer)
-                    else:
-                        loss.backward()
-                with record("train/optimizer_step"):
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.GRAD_CLIP)
-                    if scaler is not None:
-                        scaler.step(optimizer)
-                        scaler.update()
-                    else:
-                        optimizer.step()
+                if is_train:
+                    with record("train/optimizer_zero_grad"):
+                        optimizer.zero_grad(set_to_none=True)
+                    with record("train/backward"):
+                        if scaler is not None:
+                            scaler.scale(loss).backward()
+                            scaler.unscale_(optimizer)
+                        else:
+                            loss.backward()
+                    with record("train/optimizer_step"):
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.GRAD_CLIP)
+                        if scaler is not None:
+                            scaler.step(optimizer)
+                            scaler.update()
+                        else:
+                            optimizer.step()
 
-            total_loss += loss.detach()
-            total_tensor += metric_tensor(metrics, "tensor_mse")
-            total_fa += metric_tensor(metrics, "fa_mae")
-            total_md += metric_tensor(metrics, "md_mae")
-            n_batches += 1
+                totals["loss"] += loss.detach()
+                for key in FODF_METRIC_KEYS:
+                    if key == "loss":
+                        continue
+                    totals[key] += metric_tensor(metrics, key)
+                n_batches += 1
 
-            if profiler is not None:
-                profiler.step(is_train=is_train)
+                if profiler is not None:
+                    profiler.step(is_train=is_train)
+    except torch.AcceleratorError as exc:
+        if "resource already mapped" in str(exc):
+            raise RuntimeError(
+                "CUDA pinned host memory failed with 'resource already mapped'. "
+                "Disable DataLoader pinning with --no-pin_memory, or use --num_workers 0 "
+                "if you want to retry pinned transfers on Windows."
+            ) from exc
+        raise
 
     n = max(n_batches, 1)
-
-    def mean_float(value: torch.Tensor) -> float:
-        return float((value / n).detach().cpu())
-
-    return {
-        "loss": mean_float(total_loss),
-        "tensor_mse": mean_float(total_tensor),
-        "fa_mae": mean_float(total_fa),
-        "md_mae": mean_float(total_md),
-    }
+    return {key: float((totals[key] / n).detach().cpu()) for key in FODF_METRIC_KEYS}
 
 
 def build_run_config(
@@ -602,6 +605,7 @@ def build_run_config(
     amp_enabled: bool,
     amp_dtype: torch.dtype | None,
     channels_last: bool,
+    pin_memory: bool,
     fused_adamw: bool,
     n_params: int,
     is_compiled: bool,
@@ -613,17 +617,27 @@ def build_run_config(
         "seed": args.seed,
         "max_n": train_ds.max_n,
         "max_bval": train_ds.max_bval,
-        "dti_scale": train_ds.dti_scale,
+        "fodf_channels": train_ds.fodf_n_coeffs,
+        "dti_channels": 0,
         "canonical_hw": list(train_ds.canonical_hw),
         "feat_dim": args.feat_dim,
         "channels": list(args.channels),
-        "cholesky": args.cholesky,
         "batch_size": args.batch_size,
         "epochs": args.epochs,
         "lr": args.lr,
         "weight_decay": args.weight_decay,
-        "lambda_scalar": args.lambda_scalar,
-        "lambda_edge": args.lambda_edge,
+        "lambda_fodf": args.lambda_fodf,
+        "lambda_fodf_corr": args.lambda_fodf_corr,
+        "lambda_fodf_sf": args.lambda_fodf_sf,
+        "lambda_fodf_peak": args.lambda_fodf_peak,
+        "lambda_fodf_nonneg": args.lambda_fodf_nonneg,
+        "lambda_fodf_power": args.lambda_fodf_power,
+        "fodf_loss_sphere": args.fodf_loss_sphere,
+        "fodf_sf_chunk_size": args.fodf_sf_chunk_size,
+        "fodf_peak_topk": args.fodf_peak_topk,
+        "fodf_peak_weight": args.fodf_peak_weight,
+        "fodf_peak_gamma": args.fodf_peak_gamma,
+        "fodf_peak_rel_threshold": args.fodf_peak_rel_threshold,
         "warmup_epochs": args.warmup_epochs,
         "patience": args.patience,
         "use_brain_mask": not args.no_brain_mask,
@@ -635,6 +649,7 @@ def build_run_config(
         "compile_enabled": is_compiled,
         "num_workers": num_workers,
         "prefetch_factor": args.prefetch_factor if num_workers > 0 else None,
+        "pin_memory": pin_memory,
         "fused_adamw": fused_adamw,
         "n_params": n_params,
         "train_slices": len(train_ds),
@@ -666,10 +681,9 @@ def log_scalars(
     metrics: dict[str, float],
     epoch: int,
 ) -> None:
-    writer.add_scalar(f"{prefix}/loss", metrics["loss"], epoch)
-    writer.add_scalar(f"{prefix}/tensor_mse", metrics["tensor_mse"], epoch)
-    writer.add_scalar(f"{prefix}/fa_mae", metrics["fa_mae"], epoch)
-    writer.add_scalar(f"{prefix}/md_mae", metrics["md_mae"], epoch)
+    for key in FODF_METRIC_KEYS:
+        if key in metrics:
+            writer.add_scalar(f"{prefix}/{key}", metrics[key], epoch)
 
 
 def save_checkpoint(
@@ -697,7 +711,11 @@ def save_checkpoint(
             "max_n": train_ds.max_n,
             "feat_dim": args.feat_dim,
             "channels": list(args.channels),
-            "cholesky": args.cholesky,
+            "cholesky": False,
+            "fodf_channels": train_ds.fodf_n_coeffs,
+            "dti_channels": 0,
+            # ``dti_scale`` is preserved so the visualizer can fall back to a
+            # sensible default when this checkpoint is reused as a DTI source.
             "dti_scale": train_ds.dti_scale,
             "max_bval": train_ds.max_bval,
             "train_subjects": train_subjects,
@@ -729,7 +747,8 @@ def main(args: argparse.Namespace) -> None:
     amp_enabled = bool(args.amp and amp_dtype is not None)
     channels_last = bool(args.channels_last and device.type == "cuda")
     num_workers = default_num_workers(args.num_workers)
-    non_blocking_cuda = device.type == "cuda"
+    pin_memory = should_pin_memory(device, requested=args.pin_memory, num_workers=num_workers)
+    non_blocking_cuda = pin_memory
 
     log.info("AMP: %s", str(amp_dtype).replace("torch.", "") if amp_enabled else "disabled")
     if channels_last:
@@ -778,6 +797,16 @@ def main(args: argparse.Namespace) -> None:
         eval_seed=args.eval_seed,
     )
 
+    if train_ds.fodf_n_coeffs <= 0:
+        raise ValueError(
+            f"This branch trains the fODF head only, but the dataset at "
+            f"{zarr_path} has no target_fodf_sh coefficients."
+        )
+    if not val_ds.has_fodf:
+        raise ValueError(
+            "Validation dataset has no target_fodf_sh coefficients; cannot validate fODF training."
+        )
+
     global_max_n = max(train_ds.max_n, val_ds.max_n)
     train_ds.max_n = global_max_n
     val_ds.max_n = global_max_n
@@ -790,10 +819,11 @@ def main(args: argparse.Namespace) -> None:
     val_ds.canonical_hw = canonical_hw
     val_ds.max_bval = train_ds.max_bval
     val_ds.dti_scale = train_ds.dti_scale
+    val_ds.fodf_n_coeffs = train_ds.fodf_n_coeffs
 
     loader_kwargs = {
         "num_workers": num_workers,
-        "pin_memory": non_blocking_cuda,
+        "pin_memory": pin_memory,
         "persistent_workers": num_workers > 0,
         "worker_init_fn": dwi_worker_init if num_workers > 0 else None,
     }
@@ -817,23 +847,25 @@ def main(args: argparse.Namespace) -> None:
         "DataLoader: batch_size=%d workers=%d pin_memory=%s gpu_degrade=%s",
         args.batch_size,
         num_workers,
-        non_blocking_cuda,
+        pin_memory,
         train_ds.gpu_degrade,
     )
     log.info(
-        "Train slices: %d Val slices: %d max_n: %d max_bval: %.0f dti_scale: %.4f",
+        "Train slices: %d Val slices: %d max_n: %d max_bval: %.0f fodf_channels: %d",
         len(train_ds),
         len(val_ds),
         global_max_n,
         train_ds.max_bval,
-        train_ds.dti_scale,
+        train_ds.fodf_n_coeffs,
     )
 
     raw_model = QSpaceUNet(
         max_n=global_max_n,
         feat_dim=args.feat_dim,
         channels=tuple(args.channels),
-        cholesky=args.cholesky,
+        cholesky=False,
+        fodf_channels=train_ds.fodf_n_coeffs,
+        dti_channels=0,
         dropout=args.dropout,
     ).to(device)
     if channels_last:
@@ -849,7 +881,21 @@ def main(args: argparse.Namespace) -> None:
     n_params = sum(p.numel() for p in raw_model.parameters() if p.requires_grad)
     log.info("Model parameters: %s", f"{n_params:,}")
 
-    criterion = DTILoss(lambda_scalar=args.lambda_scalar, lambda_edge=args.lambda_edge).to(device)
+    criterion = FodfLoss(
+        lambda_fodf=args.lambda_fodf,
+        lambda_fodf_corr=args.lambda_fodf_corr,
+        lambda_fodf_sf=args.lambda_fodf_sf,
+        lambda_fodf_peak=args.lambda_fodf_peak,
+        lambda_fodf_nonneg=args.lambda_fodf_nonneg,
+        lambda_fodf_power=args.lambda_fodf_power,
+        fodf_loss_sphere=args.fodf_loss_sphere,
+        fodf_sf_chunk_size=args.fodf_sf_chunk_size,
+        fodf_peak_topk=args.fodf_peak_topk,
+        fodf_peak_weight=args.fodf_peak_weight,
+        fodf_peak_gamma=args.fodf_peak_gamma,
+        fodf_peak_rel_threshold=args.fodf_peak_rel_threshold,
+    ).to(device)
+
     fused_adamw = bool(args.fused_adamw and device.type == "cuda")
     try:
         optimizer = torch.optim.AdamW(
@@ -906,18 +952,13 @@ def main(args: argparse.Namespace) -> None:
         amp_enabled=amp_enabled,
         amp_dtype=amp_dtype,
         channels_last=channels_last,
+        pin_memory=pin_memory,
         fused_adamw=fused_adamw,
         n_params=n_params,
         is_compiled=is_compiled,
     )
     with (out_dir / "config.json").open("w", encoding="utf-8") as f:
         json.dump(run_config, f, indent=2)
-
-    baseline_csvs = [
-        out_dir / "metrics_patch2self.csv",
-        out_dir / "metrics_mppca.csv",
-    ]
-    baselines = load_baseline_metrics(baseline_csvs)
 
     if SummaryWriter is None:
         raise RuntimeError(
@@ -926,15 +967,15 @@ def main(args: argparse.Namespace) -> None:
         )
     writer: SummaryWriter | None = SummaryWriter(log_dir=str(out_dir / "tb"))
     writer.add_text("config/json", f"```json\n{json.dumps(run_config, indent=2)}\n```", 0)
-    for name, metrics in baselines.items():
-        for metric, value in metrics.items():
-            writer.add_scalar(f"baseline/{name}/{metric}", value, 0)
+
+    from .loss import _sh_band_slices  # local import to avoid cycle at top-level
+    band_slices = _sh_band_slices(train_ds.fodf_n_coeffs)
+    n_bands = len(band_slices)
 
     best_val_loss = float("inf")
     best_epoch = 0
     patience_counter = 0
     history: list[dict[str, object]] = []
-    vis_slice_idx = -1
     completed = False
 
     log.info("Starting training for %d epochs (patience=%d)", args.epochs, args.patience)
@@ -952,6 +993,7 @@ def main(args: argparse.Namespace) -> None:
                     amp_enabled=amp_enabled,
                     amp_dtype=amp_dtype,
                     scaler=scaler,
+                    non_blocking=non_blocking_cuda,
                     channels_last=channels_last,
                     profiler=profiler,
                 )
@@ -973,25 +1015,17 @@ def main(args: argparse.Namespace) -> None:
                     use_brain_mask=use_brain_mask,
                     amp_enabled=amp_enabled,
                     amp_dtype=amp_dtype,
+                    non_blocking=non_blocking_cuda,
                     channels_last=channels_last,
                 )
                 scheduler.step()
 
                 lr = optimizer.param_groups[0]["lr"]
                 elapsed = time.time() - t0
-                record = {
-                    "epoch": epoch,
-                    "lr": lr,
-                    "train_loss": train_metrics["loss"],
-                    "train_tensor_mse": train_metrics["tensor_mse"],
-                    "train_fa_mae": train_metrics["fa_mae"],
-                    "train_md_mae": train_metrics["md_mae"],
-                    "val_loss": val_metrics["loss"],
-                    "val_tensor_mse": val_metrics["tensor_mse"],
-                    "val_fa_mae": val_metrics["fa_mae"],
-                    "val_md_mae": val_metrics["md_mae"],
-                    "elapsed_s": round(elapsed, 1),
-                }
+                record = {"epoch": epoch, "lr": lr, "elapsed_s": round(elapsed, 1)}
+                for key in FODF_METRIC_KEYS:
+                    record[f"train_{key}"] = train_metrics[key]
+                    record[f"val_{key}"] = val_metrics[key]
                 history.append(record)
 
                 log_scalars(writer, "train", train_metrics, epoch)
@@ -1004,13 +1038,13 @@ def main(args: argparse.Namespace) -> None:
                         model,
                         val_ds,
                         device,
-                        dti_scale=train_ds.dti_scale,
-                        slice_idx=vis_slice_idx,
+                        n_bands=n_bands,
+                        band_slices=band_slices,
                         amp_enabled=amp_enabled,
                         amp_dtype=amp_dtype,
                         channels_last=channels_last,
                     )
-                    writer.add_figure("val/prediction", fig, epoch)
+                    writer.add_figure("val/fodf", fig, epoch)
                     plt.close(fig)
 
                 improved = val_metrics["loss"] < best_val_loss
@@ -1038,14 +1072,18 @@ def main(args: argparse.Namespace) -> None:
 
                 marker = "*" if improved else ""
                 log.info(
-                    "Epoch %3d/%d train=%.6f val=%.6f t_mse=%.6f fa=%.4f md=%.6f lr=%.2e %.1fs %s",
+                    "Epoch %3d/%d train=%.6f val=%.6f fodf=%.6f sf=%.6f peak=%.6f "
+                    "p_ratio=%.3f acc=%.4f power=%.6f lr=%.2e %.1fs %s",
                     epoch,
                     args.epochs,
                     train_metrics["loss"],
                     val_metrics["loss"],
-                    val_metrics["tensor_mse"],
-                    val_metrics["fa_mae"],
-                    val_metrics["md_mae"],
+                    val_metrics["fodf_loss"],
+                    val_metrics["fodf_sf_loss"],
+                    val_metrics["fodf_peak_loss"],
+                    val_metrics["fodf_peak_ratio"],
+                    val_metrics["fodf_acc"],
+                    val_metrics["fodf_power_loss"],
                     lr,
                     elapsed,
                     marker,
@@ -1095,7 +1133,9 @@ def main(args: argparse.Namespace) -> None:
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train QSpaceUNet for DWI -> DTI prediction")
+    parser = argparse.ArgumentParser(
+        description="Train QSpaceUNet for DWI -> fODF SH coefficient prediction"
+    )
 
     parser.add_argument("--zarr_path", default=cfg.DATASET_ZARR_PATH)
     parser.add_argument("--out_dir", default=cfg.TRAIN_OUT_DIR)
@@ -1106,14 +1146,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--feat_dim", type=int, default=cfg.FEAT_DIM)
     parser.add_argument("--channels", type=int, nargs="+", default=cfg.UNET_CHANNELS)
     parser.add_argument("--dropout", type=float, default=cfg.DROPOUT)
-    parser.add_argument("--cholesky", action="store_true", default=True)
 
     parser.add_argument("--epochs", type=int, default=cfg.EPOCHS)
     parser.add_argument("--batch_size", type=int, default=cfg.BATCH_SIZE)
     parser.add_argument("--lr", type=float, default=cfg.LEARNING_RATE)
     parser.add_argument("--weight_decay", type=float, default=cfg.WEIGHT_DECAY)
-    parser.add_argument("--lambda_scalar", type=float, default=cfg.LAMBDA_SCALAR)
-    parser.add_argument("--lambda_edge", type=float, default=cfg.LAMBDA_EDGE)
+    parser.add_argument("--lambda_fodf", type=float, default=cfg.LAMBDA_FODF)
+    parser.add_argument("--lambda_fodf_corr", type=float, default=cfg.LAMBDA_FODF_CORR)
+    parser.add_argument("--lambda_fodf_sf", type=float, default=cfg.LAMBDA_FODF_SF)
+    parser.add_argument("--lambda_fodf_peak", type=float, default=cfg.LAMBDA_FODF_PEAK)
+    parser.add_argument("--lambda_fodf_nonneg", type=float, default=cfg.LAMBDA_FODF_NONNEG)
+    parser.add_argument("--lambda_fodf_power", type=float, default=cfg.LAMBDA_FODF_POWER)
+    parser.add_argument("--fodf_loss_sphere", default=cfg.FODF_LOSS_SPHERE)
+    parser.add_argument("--fodf_sf_chunk_size", type=int, default=cfg.FODF_SF_CHUNK_SIZE)
+    parser.add_argument("--fodf_peak_topk", type=int, default=cfg.FODF_PEAK_TOPK)
+    parser.add_argument("--fodf_peak_weight", type=float, default=cfg.FODF_PEAK_WEIGHT)
+    parser.add_argument("--fodf_peak_gamma", type=float, default=cfg.FODF_PEAK_GAMMA)
+    parser.add_argument(
+        "--fodf_peak_rel_threshold",
+        type=float,
+        default=cfg.FODF_PEAK_REL_THRESHOLD,
+    )
     parser.add_argument("--warmup_epochs", type=int, default=cfg.WARMUP_EPOCHS)
     parser.add_argument("--patience", type=int, default=cfg.PATIENCE)
     parser.add_argument("--vis_every", type=int, default=cfg.VIS_EVERY)
@@ -1133,6 +1186,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--num_workers", type=int, default=cfg.NUM_WORKERS)
     parser.add_argument("--prefetch_factor", type=int, default=cfg.PREFETCH_FACTOR)
+    parser.add_argument("--pin_memory", action=argparse.BooleanOptionalAction, default=cfg.PIN_MEMORY)
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=cfg.AMP)
     parser.add_argument("--amp_dtype", choices=["auto", "bf16", "fp16"], default=cfg.AMP_DTYPE)
     parser.add_argument("--channels_last", action=argparse.BooleanOptionalAction, default=cfg.CHANNELS_LAST)

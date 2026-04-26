@@ -7,10 +7,10 @@ the same constants.  CLI argument defaults should reference these too.
 # ─────────────────────────────────────────────────────────────────────────────
 # Paths
 # ─────────────────────────────────────────────────────────────────────────────
-DATASET_ZARR_PATH = "dataset/default_clean.zarr"
+DATASET_ZARR_PATH = "dataset/default_odf.zarr"
 DATASET_QC_DIR = "dataset/default_clean_qc"
-TRAIN_OUT_DIR = "runs/production_medium_more_noise"
-EVAL_OUT_DIR = "runs/evaluation_medium"
+TRAIN_OUT_DIR = "runs/production_fodf_2"
+EVAL_OUT_DIR = "runs/evaluation_multitask"
 SEED = 42
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -34,7 +34,7 @@ EVAL_KEEP_FRACTION_MAX = KEEP_FRACTION_MAX
 EVAL_NOISE_MIN = NOISE_MIN
 EVAL_NOISE_MAX = NOISE_MAX
 EVAL_DEGRADE_SEED = 1234      # fixed seed so evaluation is reproducible
-EVAL_DEFAULT_CHECKPOINT = "runs/production/best_model.pt"
+EVAL_DEFAULT_CHECKPOINT = "runs/production_multitask/best_model.pt"
 EVAL_INFER_BATCH_SIZE = 16
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -64,7 +64,7 @@ BRAIN_MASK_FINALIZE = True
 # ─────────────────────────────────────────────────────────────────────────────
 # fODF (single-shell CSD) — fitted at build-time on clean DWI and stored in Zarr
 # as spherical-harmonic coefficients (n_coeffs depends on FODF_SH_ORDER:
-# 6→28, 8→45, 10→66). Not yet wired into training.
+# 6→28, 8→45, 10→66).
 # ─────────────────────────────────────────────────────────────────────────────
 FODF_SH_ORDER = 8
 FODF_RESPONSE_ROI_RADII = 10        # ROI radius for auto_response_ssst (voxels)
@@ -81,10 +81,20 @@ VAL_SUBJECTS = ["sub-05", "sub-11"]
 # Model architecture
 # ─────────────────────────────────────────────────────────────────────────────
 FEAT_DIM = 64                # q-space encoder feature dimension (matches channels[0])
-UNET_CHANNELS = [64, 128, 256]  # 3 encoder levels; factor=8 fits (132, 130) easily
+UNET_CHANNELS = [64, 128, 256, 512]  # 4 encoder levels; factor=16 fits (132, 130) via padding
 DROPOUT = 0.1                # spatial dropout rate in U-Net conv blocks
-LAMBDA_SCALAR = 0.3          # weight for FA/MD auxiliary loss
-LAMBDA_EDGE = 0.1            # weight for FA spatial-gradient (edge) loss
+LAMBDA_FODF = 0.5            # weight for fODF SH-coefficient reconstruction
+LAMBDA_FODF_CORR = 0.5       # weight for fODF angular-correlation surrogate
+LAMBDA_FODF_SF = 1.5         # weight for sphere-sampled fODF reconstruction
+LAMBDA_FODF_PEAK = 1.0       # extra supervision at the target's strongest fODF lobes
+LAMBDA_FODF_NONNEG = 0.05    # discourage physically implausible negative fODF values
+LAMBDA_FODF_POWER = 0.5      # rotation-invariant per-ℓ-band SH power-spectrum match
+FODF_LOSS_SPHERE = "repulsion100"  # small sphere keeps peak-aware training affordable
+FODF_SF_CHUNK_SIZE = 25      # directions per loss chunk; lower if GPU memory is tight
+FODF_PEAK_TOPK = 3           # number of target peak directions supervised per voxel
+FODF_PEAK_WEIGHT = 8.0       # surface-loss multiplier near high target fODF values
+FODF_PEAK_GAMMA = 2.0        # sharper weighting toward large fODF peaks
+FODF_PEAK_REL_THRESHOLD = 0.25  # ignore tiny top-k directions below this relative height
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Training
@@ -97,8 +107,10 @@ PATIENCE = 25                # early stopping patience (epochs)
 GRAD_CLIP = 1.0              # gradient norm clipping value
 WARMUP_EPOCHS = 5            # linear LR warmup before cosine annealing
 VIS_EVERY = 1                # TensorBoard validation figure cadence
-NUM_WORKERS = 4            # -1 = OS-aware auto
+NUM_WORKERS = 2            # -1 = OS-aware auto
 PREFETCH_FACTOR = 4          # DataLoader prefetch per worker
+PIN_MEMORY = True            # auto-disabled on Windows when worker processes are active
+PRELOAD_FODF = True          # cache target_fodf_sh in worker RAM; set False if RAM is tight
 AMP = True
 AMP_DTYPE = "auto"           # 'auto' | 'bf16' | 'fp16'
 CHANNELS_LAST = True         # CUDA-only channels-last conv layout

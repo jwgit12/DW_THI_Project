@@ -1,10 +1,12 @@
-"""U-Net with q-space encoder for DWI -> 6D DTI prediction."""
+"""U-Net with q-space encoder for DWI -> DTI (+ optional fODF SH) prediction."""
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 import config as cfg
+
+DTI_CHANNELS = 6
 
 
 # ---------------------------------------------------------------------------
@@ -193,7 +195,7 @@ class UNet2D(nn.Module):
 # ---------------------------------------------------------------------------
 
 class QSpaceUNet(nn.Module):
-    """Q-space encoder + 2D U-Net: DWI volumes -> 6D DTI tensor."""
+    """Q-space encoder + 2D U-Net: DWI volumes -> DTI (+ optional fODF SH)."""
 
     def __init__(
         self,
@@ -201,6 +203,8 @@ class QSpaceUNet(nn.Module):
         feat_dim: int = 64,
         channels: tuple[int, ...] = (64, 128, 256, 512),
         cholesky: bool = False,
+        fodf_channels: int = 0,
+        dti_channels: int = DTI_CHANNELS,
         dropout: float = cfg.DROPOUT,
     ):
         super().__init__()
@@ -209,8 +213,30 @@ class QSpaceUNet(nn.Module):
         # encoder itself is now permutation-invariant and does not need it.
         self.max_n = max_n
         self.cholesky = cholesky
+        self.dti_channels = int(dti_channels)
+        self.fodf_channels = int(fodf_channels)
+        out_ch = self.dti_channels + self.fodf_channels
+        if out_ch <= 0:
+            raise ValueError("QSpaceUNet must predict at least one DTI or fODF channel.")
+        if self.cholesky and self.dti_channels not in (0, DTI_CHANNELS):
+            raise ValueError(
+                f"cholesky=True requires dti_channels={DTI_CHANNELS}, got {self.dti_channels}."
+            )
         self.q_encoder = QSpaceEncoder(feat_dim=feat_dim)
-        self.unet = UNet2D(feat_dim, out_ch=6, channels=channels, dropout=dropout)
+        self.unet = UNet2D(
+            feat_dim,
+            out_ch=out_ch,
+            channels=channels,
+            dropout=dropout,
+        )
+
+    def split_outputs(
+        self,
+        output: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        dti = output[:, : self.dti_channels] if self.dti_channels > 0 else None
+        fodf = output[:, self.dti_channels :] if self.fodf_channels > 0 else None
+        return dti, fodf
 
     def forward(
         self,
@@ -221,6 +247,8 @@ class QSpaceUNet(nn.Module):
     ) -> torch.Tensor:
         features = self.q_encoder(signal, bvals, bvecs, vol_mask)
         out = self.unet(features)
-        if self.cholesky:
-            out = cholesky_to_tensor6(out)
+        if self.cholesky and self.dti_channels == DTI_CHANNELS:
+            dti, fodf = self.split_outputs(out)
+            dti = cholesky_to_tensor6(dti)
+            out = torch.cat([dti, fodf], dim=1) if fodf is not None else dti
         return out

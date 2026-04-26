@@ -98,6 +98,25 @@ def default_num_workers(requested: int | None) -> int:
     return min(4, max(1, cpu_count // 2))
 
 
+def should_pin_memory(
+    device: torch.device,
+    *,
+    requested: bool,
+    num_workers: int,
+) -> bool:
+    """Return whether DataLoader pinning should stay enabled for this runtime."""
+    if device.type != "cuda" or not requested:
+        return False
+    if platform.system() == "Windows" and num_workers > 0:
+        log.warning(
+            "Disabling DataLoader pin_memory on Windows when num_workers=%d to "
+            "avoid CUDA 'resource already mapped' failures in the pin-memory thread.",
+            num_workers,
+        )
+        return False
+    return True
+
+
 def amp_dtype_from_name(device: torch.device, name: str) -> torch.dtype | None:
     if device.type != "cuda":
         return None

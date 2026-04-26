@@ -1,9 +1,9 @@
 """DWI slice dataset with on-the-fly degradation and multi-axis slicing.
 
 The Zarr store holds only clean data (`target_dwi`, `target_dti_6d`,
-`bvals`, `bvecs`, `brain_mask`). The noisy model input is synthesized on the fly in
-`__getitem__`, so every epoch sees a different noise realisation and a
-different k-space cutout for the same underlying slice.
+`target_fodf_sh`, `bvals`, `bvecs`, `brain_mask`). The noisy model input is
+synthesized on the fly in `__getitem__`, so every epoch sees a different noise
+realisation and a different k-space cutout for the same underlying slice.
 
 Slices can be drawn from any of the three spatial axes; padding to a
 canonical (H, W) is applied at the end of `__getitem__` so batches stack
@@ -71,12 +71,13 @@ class DWISliceDataset(Dataset):
     """Loads 2D DWI slices and degrades them on the fly.
 
     Each sample returns:
-        input:      (max_n, H, W)   padded noisy DWI (generated on the fly)
-        target:     (6, H, W)       6D DTI tensor, scaled by dti_scale
-        bvals:      (max_n,)        normalised b-values
-        bvecs:      (3, max_n)      b-vectors
-        vol_mask:   (max_n,)        1 for real volumes, 0 for padding
-        brain_mask: (H, W)          binary brain mask (1 inside brain)
+        input:        (max_n, H, W)   padded noisy DWI (generated on the fly)
+        target:       (6, H, W)       6D DTI tensor, scaled by dti_scale
+        target_fodf:  (C, H, W)       optional fODF SH coefficients
+        bvals:        (max_n,)        normalised b-values
+        bvecs:        (3, max_n)      b-vectors
+        vol_mask:     (max_n,)        1 for real volumes, 0 for padding
+        brain_mask:   (H, W)          binary brain mask (1 inside brain)
     """
 
     def __init__(
@@ -114,7 +115,7 @@ class DWISliceDataset(Dataset):
         self.noise_range = tuple(noise_range)
         self.random_axis = random_axis
         self.slice_axes = tuple(slice_axes) if random_axis else (2,)
-        self.aug_flip = aug_flip
+        self.aug_flip = bool(aug_flip)
         self.aug_intensity = float(aug_intensity)
         self.aug_volume_dropout = float(aug_volume_dropout)
         self.eval_mode = eval_mode
@@ -137,11 +138,14 @@ class DWISliceDataset(Dataset):
         self._data: dict[str, dict[str, np.ndarray]] = {}
         self._brain_masks: dict[str, np.ndarray | None] = {}
         self.samples: list[tuple[str, int, int]] = []  # (key, axis, slice_index)
+        self.has_fodf = False
+        self.fodf_n_coeffs = 0
 
         self.max_n = 0
         global_max_bval = 0.0
         all_dti_abs: list[np.ndarray] = []
         max_h, max_w = 0, 0
+        expected_fodf_n_coeffs: int | None = None
 
         for key in self.subject_keys:
             grp = store[key]
@@ -176,6 +180,21 @@ class DWISliceDataset(Dataset):
             self.max_n = max(self.max_n, N)
             global_max_bval = max(global_max_bval, float(bvals.max()))
 
+            has_fodf = "target_fodf_sh" in set(grp.array_keys())
+            if has_fodf:
+                n_coeffs = int(grp["target_fodf_sh"].shape[-1])
+                if expected_fodf_n_coeffs is None:
+                    expected_fodf_n_coeffs = n_coeffs
+                elif n_coeffs != expected_fodf_n_coeffs:
+                    raise ValueError(
+                        f"Inconsistent target_fodf_sh coefficient count: "
+                        f"{key} has {n_coeffs}, expected {expected_fodf_n_coeffs}."
+                    )
+            elif expected_fodf_n_coeffs is not None:
+                raise ValueError(
+                    f"{key} is missing target_fodf_sh but other subjects provide it."
+                )
+
             target_dti = np.asarray(grp["target_dti_6d"][:], dtype=np.float32)
             nonzero = np.abs(target_dti[target_dti != 0])
             if nonzero.size > 0:
@@ -198,6 +217,15 @@ class DWISliceDataset(Dataset):
         self.canonical_hw = (
             tuple(canonical_hw) if canonical_hw is not None else (max_h, max_w)
         )
+        self.has_fodf = expected_fodf_n_coeffs is not None
+        self.fodf_n_coeffs = expected_fodf_n_coeffs or 0
+        if self.has_fodf and self.augment and self.aug_flip:
+            log.warning(
+                "Disabling aug_flip for %s because mirrored fODF SH targets would "
+                "need an SH-basis reflection transform that is not applied here.",
+                self.zarr_path,
+            )
+            self.aug_flip = False
 
         self.max_bval = global_max_bval if global_max_bval > 0 else 1.0
         if all_dti_abs:
@@ -216,6 +244,7 @@ class DWISliceDataset(Dataset):
         key, axis, s = self.samples[idx]
         d = self._data[key]
         bmask_3d = self._brain_masks[key]
+        tgt_fodf = None
 
         bvals = d["bvals"]   # (N,)
         bvecs = d["bvecs"]   # (3, N)
@@ -227,20 +256,27 @@ class DWISliceDataset(Dataset):
 
         if preloaded is not None:
             # ── In-worker RAM path (fast) ───────────────────────────────────
-            arr_dwi = preloaded[key]["target_dwi"]
-            arr_dti = preloaded[key]["target_dti_6d"]
+            arr_dwi  = preloaded[key]["target_dwi"]
+            arr_dti  = preloaded[key]["target_dti_6d"]
+            arr_fodf = preloaded[key].get("target_fodf_sh")
             if axis == 0:
                 clean = arr_dwi[s].copy()                 # (Y, Z, N)
                 tgt   = arr_dti[s].copy()                 # (Y, Z, 6)
                 bmask = bmask_3d[s] if bmask_3d is not None else None
+                if self.has_fodf and arr_fodf is not None:
+                    tgt_fodf = arr_fodf[s].copy()         # (Y, Z, C)
             elif axis == 1:
                 clean = arr_dwi[:, s].copy()              # (X, Z, N)
                 tgt   = arr_dti[:, s].copy()              # (X, Z, 6)
                 bmask = bmask_3d[:, s] if bmask_3d is not None else None
+                if self.has_fodf and arr_fodf is not None:
+                    tgt_fodf = arr_fodf[:, s].copy()      # (X, Z, C)
             else:
                 clean = arr_dwi[:, :, s].copy()           # (X, Y, N)
                 tgt   = arr_dti[:, :, s].copy()           # (X, Y, 6)
                 bmask = bmask_3d[:, :, s] if bmask_3d is not None else None
+                if self.has_fodf and arr_fodf is not None:
+                    tgt_fodf = arr_fodf[:, :, s].copy()   # (X, Y, C)
         else:
             # ── Lazy-load the required 2D slice from zarr ──────────────────
             # _get_zarr_group caches the store handle per process, so each
@@ -259,9 +295,22 @@ class DWISliceDataset(Dataset):
                 tgt   = np.asarray(grp["target_dti_6d"][:, :, s], dtype=np.float32)  # (X, Y, 6)
                 bmask = bmask_3d[:, :, s] if bmask_3d is not None else None
 
+        if self.has_fodf and tgt_fodf is None:
+            grp = _get_zarr_group(self.zarr_path)[key]
+            if axis == 0:
+                tgt_fodf = np.asarray(grp["target_fodf_sh"][s], dtype=np.float32)
+            elif axis == 1:
+                tgt_fodf = np.asarray(grp["target_fodf_sh"][:, s], dtype=np.float32)
+            else:
+                tgt_fodf = np.asarray(grp["target_fodf_sh"][:, :, s], dtype=np.float32)
+
         # (H, W, C) -> (C, H, W) channel-first; contiguous for later in-place ops.
         clean_nhw = np.ascontiguousarray(clean.transpose(2, 0, 1))     # (N, H, W)
         tgt_chw = np.ascontiguousarray(tgt.transpose(2, 0, 1))         # (6, H, W)
+        if tgt_fodf is not None:
+            tgt_fodf_chw = np.ascontiguousarray(tgt_fodf.transpose(2, 0, 1))
+        else:
+            tgt_fodf_chw = None
         if bmask is not None:
             bmask_hw = np.ascontiguousarray(bmask.astype(np.float32))
         else:
@@ -376,6 +425,8 @@ class DWISliceDataset(Dataset):
             pw = cw - w
             input_nhw = np.pad(input_nhw, ((0, 0), (0, ph), (0, pw)))
             tgt_chw = np.pad(tgt_chw, ((0, 0), (0, ph), (0, pw)))
+            if tgt_fodf_chw is not None:
+                tgt_fodf_chw = np.pad(tgt_fodf_chw, ((0, 0), (0, ph), (0, pw)))
             bmask_hw = np.pad(bmask_hw, ((0, ph), (0, pw)))
 
         result = {
@@ -386,6 +437,8 @@ class DWISliceDataset(Dataset):
             "vol_mask": torch.from_numpy(vol_mask),
             "brain_mask": torch.from_numpy(np.ascontiguousarray(bmask_hw)),
         }
+        if tgt_fodf_chw is not None:
+            result["target_fodf"] = torch.from_numpy(np.ascontiguousarray(tgt_fodf_chw))
         if degrade_kf is not None:
             # b0_mask padded to max_n; run_epoch uses it for GPU b0 normalization.
             b0_mask_full = np.zeros(self.max_n, dtype=bool)
@@ -412,16 +465,23 @@ def dwi_worker_init(worker_id: int) -> None:
     import torch.utils.data as _tud
     info = _tud.get_worker_info()
     if info is not None:
-        preload_dataset_in_worker(info.dataset)
+        preload_dataset_in_worker(info.dataset, preload_fodf=cfg.PRELOAD_FODF)
 
 
-def preload_dataset_in_worker(dataset: DWISliceDataset) -> None:
+def preload_dataset_in_worker(
+    dataset: DWISliceDataset,
+    preload_fodf: bool = True,
+) -> None:
     """Load all subject arrays into this worker process's RAM.
 
     Call from DataLoader's ``worker_init_fn`` so each worker has in-memory
     access to the data instead of making zarr chunk reads per sample. The
     dataset object is tiny when pickled (only bvals/bvecs/brain_masks), so
     the worker can safely preload on startup without OOM risk from pickling.
+
+    Set ``preload_fodf=False`` to skip caching ``target_fodf_sh`` — useful
+    when RAM is tight, since the OS filesystem cache keeps zarr reads fast
+    after the first epoch anyway.
 
     Example usage in the training script::
 
@@ -436,8 +496,11 @@ def preload_dataset_in_worker(dataset: DWISliceDataset) -> None:
     preloaded: dict[str, dict[str, np.ndarray]] = {}
     for key in dataset.subject_keys:
         grp = store[key]
-        preloaded[key] = {
+        entry: dict[str, np.ndarray] = {
             "target_dwi": np.asarray(grp["target_dwi"][:], dtype=np.float32),
             "target_dti_6d": np.asarray(grp["target_dti_6d"][:], dtype=np.float32),
         }
+        if preload_fodf and "target_fodf_sh" in set(grp.array_keys()):
+            entry["target_fodf_sh"] = np.asarray(grp["target_fodf_sh"][:], dtype=np.float32)
+        preloaded[key] = entry
     dataset._preloaded = preloaded
