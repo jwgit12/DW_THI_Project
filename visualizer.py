@@ -2,7 +2,8 @@
 """Lightweight desktop viewer for DW_THI Zarr datasets.
 
 Usage:
-    python visualizer.py --zarr_path dataset/default_clean.zarr --checkpoint runs/production/best_model.pt
+    python visualizer.py --zarr_path dataset/default_clean.zarr --dti_checkpoint runs/production_medium_more_noise/best_model.pt --fodf_checkpoint runs/production_fodf/best_model.pt
+    python visualizer.py --zarr_path dataset/default_clean.zarr --checkpoint runs/production_multitask/best_model.pt
 """
 
 from __future__ import annotations
@@ -16,13 +17,16 @@ from pathlib import Path
 import matplotlib
 import numpy as np
 from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.collections import LineCollection
 from matplotlib.figure import Figure
 import torch
 import zarr
+from dipy.data import get_sphere
+from dipy.reconst.shm import sh_to_sf
 from matplotlib import colormaps
 from PyQt6.QtCore import Qt, QRunnable, QThreadPool, pyqtSignal, QObject, pyqtSlot
-from PyQt6.QtGui import QImage, QPixmap
+from PyQt6.QtGui import QImage, QMouseEvent, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -46,7 +50,7 @@ if str(ROOT_DIR) not in sys.path:
 
 import config as cfg
 from dw_thi.augment import degrade_dwi_slice, degrade_dwi_volume
-from dw_thi.model import QSpaceUNet
+from dw_thi.model import DTI_CHANNELS, QSpaceUNet
 from dw_thi.preprocessing import compute_b0_norm, compute_brain_mask_from_dwi
 from dw_thi.runtime import get_device
 from dw_thi.utils import (
@@ -96,6 +100,14 @@ def _group_shape(group) -> tuple[int, ...]:
     return tuple(group[key].shape)
 
 matplotlib.rcParams["font.family"] = "DejaVu Sans"
+FODF_SPHERE = get_sphere(name="repulsion724")
+
+# Pre-compute direction-encoded colour direction per face (|x|→R, |y|→G, |z|→B).
+# Face centroid direction on the unit sphere stays constant across all voxels.
+_fodf_face_verts = FODF_SPHERE.vertices[FODF_SPHERE.faces]          # (F, 3, 3)
+_fodf_face_centroids = _fodf_face_verts.mean(axis=1)                 # (F, 3)
+_fodf_face_norms = np.linalg.norm(_fodf_face_centroids, axis=1, keepdims=True)
+FODF_FACE_DIRS = _fodf_face_centroids / np.maximum(_fodf_face_norms, 1e-8)  # (F, 3)
 
 
 PLANE_TO_AXIS = {
@@ -149,7 +161,22 @@ def parse_args() -> argparse.Namespace:
         "--checkpoint",
         type=str,
         default=None,
-        help="Path to a QSpaceUNet checkpoint (.pt). Enables live prediction panels.",
+        help=(
+            "Legacy single-checkpoint mode. When --dti_checkpoint and "
+            "--fodf_checkpoint are omitted, this checkpoint is reused for both."
+        ),
+    )
+    parser.add_argument(
+        "--dti_checkpoint",
+        type=str,
+        default=None,
+        help="Checkpoint used for predicted FA/MD/ColorFA panels and tractography.",
+    )
+    parser.add_argument(
+        "--fodf_checkpoint",
+        type=str,
+        default=None,
+        help="Checkpoint used for predicted fODF visualization.",
     )
     parser.add_argument(
         "--summary-only",
@@ -157,6 +184,42 @@ def parse_args() -> argparse.Namespace:
         help="Print dataset summary and exit without opening the GUI.",
     )
     return parser.parse_args()
+
+
+def load_checkpoint_model(
+    checkpoint_path: str,
+    device: torch.device,
+) -> tuple[QSpaceUNet, dict[str, object]]:
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    max_n = int(ckpt["max_n"])
+    feat_dim = int(ckpt.get("feat_dim", 64))
+    channels = tuple(ckpt.get("channels", [64, 128, 256, 512]))
+    cholesky = bool(ckpt.get("cholesky", False))
+    fodf_channels = int(ckpt.get("fodf_channels", 0))
+    # Older DTI/multitask checkpoints predate the dti_channels metadata; default
+    # to 6 so they keep loading. New fODF-only checkpoints store dti_channels=0.
+    dti_channels = int(ckpt.get("dti_channels", DTI_CHANNELS))
+    dti_scale = float(ckpt.get("dti_scale", 1.0))
+    max_bval = float(ckpt.get("max_bval", 1000.0))
+
+    model = QSpaceUNet(
+        max_n=max_n,
+        feat_dim=feat_dim,
+        channels=channels,
+        cholesky=cholesky,
+        fodf_channels=fodf_channels,
+        dti_channels=dti_channels,
+    ).to(device)
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.eval()
+    return model, {
+        "epoch": int(ckpt.get("epoch", -1)),
+        "max_n": max_n,
+        "fodf_channels": fodf_channels,
+        "dti_channels": dti_channels,
+        "dti_scale": dti_scale,
+        "max_bval": max_bval,
+    }
 
 
 def _safe_percentile(values: np.ndarray, percentile: float) -> float:
@@ -208,6 +271,27 @@ def summarize_shells(bvals: np.ndarray) -> str:
 
 def rotate_for_display(arr: np.ndarray) -> np.ndarray:
     return np.rot90(arr, 1)
+
+
+def infer_fodf_sh_order(n_coeffs: int) -> int:
+    for order in range(0, 20, 2):
+        if (order + 1) * (order + 2) // 2 == int(n_coeffs):
+            return order
+    raise ValueError(f"Unsupported fODF SH coefficient count: {n_coeffs}")
+
+
+def reconstruct_fodf_sf(sh_coeffs: np.ndarray) -> np.ndarray:
+    sh_coeffs = np.asarray(sh_coeffs, dtype=np.float32)
+    sf = sh_to_sf(
+        sh_coeffs,
+        FODF_SPHERE,
+        sh_order_max=infer_fodf_sh_order(sh_coeffs.shape[-1]),
+        basis_type="descoteaux07",
+        legacy=True,
+    )
+    sf = np.asarray(sf, dtype=np.float32)
+    sf = np.nan_to_num(sf, nan=0.0, posinf=0.0, neginf=0.0)
+    return np.clip(sf, 0.0, None)
 
 
 def make_pixmap(arr: np.ndarray, cmap: str = "gray", symmetric: bool = False, width: int = 240) -> QPixmap:
@@ -495,20 +579,33 @@ def render_tract_overlay(
     return rgba[..., :3].astype(np.float32) / 255.0
 
 
+class ClickableImageLabel(QLabel):
+    clicked = pyqtSignal(object)
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit(event.position().toPoint())
+        super().mousePressEvent(event)
+
+
 class ImagePanel(QGroupBox):
+    image_clicked = pyqtSignal(object)
+
     def __init__(self, title: str):
         super().__init__(title)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(4)
 
-        self.image_label = QLabel("No data")
+        self.display_shape: tuple[int, int] | None = None
+        self.image_label = ClickableImageLabel("No data")
         self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.image_label.setMinimumSize(220, 145)
         self.image_label.setStyleSheet(
             "background: #111; color: #ddd; border: 1px solid #333; font-size: 12px;"
         )
         self.image_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.image_label.clicked.connect(self.image_clicked.emit)
         layout.addWidget(self.image_label, stretch=1)
 
         self.caption_label = QLabel("")
@@ -518,9 +615,142 @@ class ImagePanel(QGroupBox):
         self.caption_label.setMaximumHeight(34)
         layout.addWidget(self.caption_label)
 
-    def set_pixmap(self, pixmap: QPixmap, caption: str) -> None:
+    def set_pixmap(
+        self,
+        pixmap: QPixmap,
+        caption: str,
+        data_shape: tuple[int, int] | None = None,
+    ) -> None:
+        self.display_shape = data_shape
+        self.image_label.setText("")
         self.image_label.setPixmap(pixmap)
         self.caption_label.setText(caption)
+
+    def set_clickable(self, enabled: bool, tooltip: str = "") -> None:
+        self.image_label.setCursor(
+            Qt.CursorShape.PointingHandCursor if enabled else Qt.CursorShape.ArrowCursor
+        )
+        self.image_label.setToolTip(tooltip if enabled else "")
+
+
+class FodfComparisonWindow(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("fODF Comparison")
+        self.resize(1160, 620)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        self.info_label = QLabel("Click an FA panel to inspect the local clean/predicted fODF.")
+        self.info_label.setWordWrap(True)
+        layout.addWidget(self.info_label)
+
+        self.figure = Figure(figsize=(11, 5.5))
+        self.canvas = FigureCanvasQTAgg(self.figure)
+        layout.addWidget(self.canvas, stretch=1)
+
+    def show_message(self, subject: str, voxel: tuple[int, int, int], message: str) -> None:
+        self.setWindowTitle(
+            f"fODF Comparison - {subject} voxel ({voxel[0]}, {voxel[1]}, {voxel[2]})"
+        )
+        self.info_label.setText(message)
+        self.figure.clear()
+        self.figure.text(0.5, 0.5, message, ha="center", va="center", fontsize=12)
+        self.canvas.draw_idle()
+
+    def update_plot(
+        self,
+        subject: str,
+        voxel: tuple[int, int, int],
+        clean_sh: np.ndarray,
+        pred_sh: np.ndarray | None,
+    ) -> None:
+        clean_sf = reconstruct_fodf_sf(clean_sh)
+        pred_sf = reconstruct_fodf_sf(pred_sh) if pred_sh is not None else None
+        shared_max = max(
+            float(np.max(clean_sf)) if clean_sf.size else 0.0,
+            float(np.max(pred_sf)) if pred_sf is not None and pred_sf.size else 0.0,
+            1e-6,
+        )
+        self.setWindowTitle(
+            f"fODF Comparison - {subject} voxel ({voxel[0]}, {voxel[1]}, {voxel[2]})"
+        )
+
+        self.figure.clear()
+        axes = [
+            self.figure.add_subplot(1, 2, 1, projection="3d"),
+            self.figure.add_subplot(1, 2, 2, projection="3d"),
+        ]
+        surfaces = (
+            ("Clean 3D fODF", clean_sf),
+            ("Predicted 3D fODF", pred_sf),
+        )
+        for ax, (title, sf) in zip(axes, surfaces):
+            if sf is None:
+                ax.text2D(0.5, 0.5, "Predicted fODF unavailable", transform=ax.transAxes,
+                          ha="center", va="center")
+                ax.set_title(title)
+                ax.set_xlabel("X")
+                ax.set_ylabel("Y")
+                ax.set_zlabel("Z")
+                ax.set_box_aspect((1.0, 1.0, 1.0))
+                ax.view_init(elev=24, azim=36)
+                continue
+            if float(np.max(sf)) <= 1e-8:
+                ax.text2D(0.5, 0.5, "No fODF signal at this voxel", transform=ax.transAxes,
+                          ha="center", va="center")
+                ax.set_title(title)
+                ax.set_xlabel("X")
+                ax.set_ylabel("Y")
+                ax.set_zlabel("Z")
+                ax.set_xlim(-1.05, 1.05)
+                ax.set_ylim(-1.05, 1.05)
+                ax.set_zlim(-1.05, 1.05)
+                ax.set_box_aspect((1.0, 1.0, 1.0))
+                ax.view_init(elev=24, azim=36)
+                ax.grid(True, alpha=0.25)
+                continue
+
+            radius = sf / shared_max
+            coords = FODF_SPHERE.vertices * radius[:, None]
+
+            # Direction-encoded colours: |direction| * amplitude → DEC convention.
+            face_radii = radius[FODF_SPHERE.faces].mean(axis=1)       # (F,)
+            face_rgb = np.clip(np.abs(FODF_FACE_DIRS) * face_radii[:, None], 0.0, 1.0)
+            face_rgba = np.column_stack(
+                [face_rgb, np.ones(len(face_rgb), dtype=np.float32)]
+            )
+
+            mesh = ax.plot_trisurf(
+                coords[:, 0],
+                coords[:, 1],
+                coords[:, 2],
+                triangles=FODF_SPHERE.faces,
+                linewidth=0.0,
+                antialiased=True,
+                shade=False,
+            )
+            mesh.set_facecolors(face_rgba)
+            ax.set_title(title)
+            ax.set_xlabel("X")
+            ax.set_ylabel("Y")
+            ax.set_zlabel("Z")
+            ax.set_xlim(-1.05, 1.05)
+            ax.set_ylim(-1.05, 1.05)
+            ax.set_zlim(-1.05, 1.05)
+            ax.set_box_aspect((1.0, 1.0, 1.0))
+            ax.view_init(elev=24, azim=36)
+            ax.grid(True, alpha=0.25)
+
+        self.figure.tight_layout()
+        pred_state = "available" if pred_sf is not None else "unavailable"
+        self.info_label.setText(
+            f"Subject: {subject} | voxel: ({voxel[0]}, {voxel[1]}, {voxel[2]}) | "
+            f"predicted fODF: {pred_state}"
+        )
+        self.canvas.draw_idle()
 
 
 def dataset_summary(zarr_path: str) -> str:
@@ -564,6 +794,7 @@ class WorkerSignals(QObject):
     metrics_ready = pyqtSignal(str, str, int, object)   # subject, plane, slice_idx, result
     noisy_metrics_ready = pyqtSignal(object, object)    # noisy_key, result
     prediction_ready = pyqtSignal(object, object)        # pred_key, result
+    fodf_prediction_ready = pyqtSignal(object, object)   # pred_key, fodf_sh_volume
     clean_tracts_ready = pyqtSignal(str, object)         # subject, streamlines
     pred_tracts_ready = pyqtSignal(object, object)       # pred_tract_key, streamlines
 
@@ -624,7 +855,7 @@ class NoisyMetricsWorker(QRunnable):
 
 
 class PredictionWorker(QRunnable):
-    """Runs QSpaceUNet inference for one axial slice off the main thread."""
+    """Runs DTI-model inference for one axial slice off the main thread."""
 
     def __init__(self, pred_key: tuple, subject: str, slice_idx: int,
                  input_slice_nhw: np.ndarray, bvals: np.ndarray, bvecs: np.ndarray,
@@ -686,11 +917,94 @@ class PredictionWorker(QRunnable):
                 with torch.no_grad():
                     pred = self.model(signal_t, bvals_t, bvecs_t, vol_mask_t)
 
-            pred_tensor6 = pred[0].permute(1, 2, 0).cpu().numpy() / self.dti_scale
+            pred_dti, _ = self.model.split_outputs(pred)
+            pred_tensor6 = pred_dti[0].permute(1, 2, 0).cpu().numpy() / self.dti_scale
             result = compute_dti_metrics(pred_tensor6)
+            result["tensor6"] = np.asarray(pred_tensor6, dtype=np.float32)
             self.signals.prediction_ready.emit(self.pred_key, result)
         except Exception as exc:
             print(f"[PredictionWorker] {exc}", file=sys.stderr)
+
+
+class FodfPredictionWorker(QRunnable):
+    """Runs fODF-model inference for one axial slice off the main thread."""
+
+    def __init__(
+        self,
+        pred_key: tuple,
+        subject: str,
+        slice_idx: int,
+        input_slice_nhw: np.ndarray,
+        bvals: np.ndarray,
+        bvecs: np.ndarray,
+        model: QSpaceUNet,
+        device: torch.device,
+        max_bval: float,
+        b0_threshold: float,
+        model_lock: threading.Lock,
+        signals: WorkerSignals,
+    ):
+        super().__init__()
+        self.pred_key = pred_key
+        self.subject = subject
+        self.slice_idx = slice_idx
+        self.input_slice_nhw = np.ascontiguousarray(input_slice_nhw, dtype=np.float32)
+        self.bvals = bvals
+        self.bvecs = bvecs
+        self.model = model
+        self.device = device
+        self.max_bval = max_bval
+        self.b0_threshold = b0_threshold
+        self.model_lock = model_lock
+        self.signals = signals
+        self.setAutoDelete(True)
+
+    def run(self) -> None:
+        try:
+            bvals = self.bvals.copy()
+            bvecs = self.bvecs.copy()
+            n = bvals.shape[0]
+            max_n = self.model.max_n
+
+            bvals_norm = bvals / self.max_bval
+            if n < max_n:
+                pad = max_n - n
+                bvals_norm = np.pad(bvals_norm, (0, pad))
+                bvecs = np.pad(bvecs, ((0, 0), (0, pad)))
+
+            vol_mask = np.zeros(max_n, dtype=np.float32)
+            vol_mask[:n] = 1.0
+
+            bvals_t = torch.from_numpy(bvals_norm).unsqueeze(0).to(self.device)
+            bvecs_t = torch.from_numpy(bvecs.astype(np.float32)).unsqueeze(0).to(self.device)
+            vol_mask_t = torch.from_numpy(vol_mask).unsqueeze(0).to(self.device)
+
+            signal = self.input_slice_nhw
+            if n < max_n:
+                signal = np.pad(signal, ((0, max_n - n), (0, 0), (0, 0)))
+
+            b0_idx = self.bvals < self.b0_threshold
+            if b0_idx.any():
+                b0_slice = self.input_slice_nhw[:n][b0_idx].mean(axis=0)
+            else:
+                b0_slice = self.input_slice_nhw[:n].mean(axis=0)
+            b0_norm = compute_b0_norm(b0_slice)
+            if b0_norm > 0:
+                signal = signal / b0_norm
+
+            signal_t = torch.from_numpy(np.ascontiguousarray(signal)).unsqueeze(0).to(self.device)
+
+            with self.model_lock:
+                with torch.no_grad():
+                    pred = self.model(signal_t, bvals_t, bvecs_t, vol_mask_t)
+
+            _, pred_fodf = self.model.split_outputs(pred)
+            if pred_fodf is None:
+                raise RuntimeError("The selected fODF checkpoint does not provide an fODF head.")
+            fodf_sh = pred_fodf[0].permute(1, 2, 0).cpu().numpy().astype(np.float32)
+            self.signals.fodf_prediction_ready.emit(self.pred_key, fodf_sh)
+        except Exception as exc:
+            print(f"[FodfPredictionWorker] {exc}", file=sys.stderr)
 
 
 class CleanTractWorker(QRunnable):
@@ -785,8 +1099,9 @@ class PredTractWorker(QRunnable):
                         signal = signal / b0_norm
                     signal_t = torch.from_numpy(np.ascontiguousarray(signal)).unsqueeze(0).to(self.device)
                     pred = self.model(signal_t, bvals_t, bvecs_t, vol_mask_t)
+                    pred_dti, _ = self.model.split_outputs(pred)
                     tensor6_volume[:, :, k, :] = (
-                        pred[0].permute(1, 2, 0).cpu().numpy() / self.dti_scale
+                        pred_dti[0].permute(1, 2, 0).cpu().numpy() / self.dti_scale
                     )
 
             tensor6_volume = sanitize_dti6d(tensor6_volume, max_eigenvalue=cfg.MAX_DIFFUSIVITY)
@@ -802,7 +1117,13 @@ class PredTractWorker(QRunnable):
 # ---------------------------------------------------------------------------
 
 class DatasetViewer(QMainWindow):
-    def __init__(self, zarr_path: str, initial_subject: str | None = None, checkpoint_path: str | None = None):
+    def __init__(
+        self,
+        zarr_path: str,
+        initial_subject: str | None = None,
+        dti_checkpoint_path: str | None = None,
+        fodf_checkpoint_path: str | None = None,
+    ):
         super().__init__()
         self.zarr_path = zarr_path
         self.store = zarr.open_group(zarr_path, mode="r")
@@ -810,7 +1131,8 @@ class DatasetViewer(QMainWindow):
         if not all_subjects:
             raise RuntimeError(f"No subjects found in {zarr_path}")
 
-        if checkpoint_path is not None:
+        has_any_checkpoint = dti_checkpoint_path is not None or fodf_checkpoint_path is not None
+        if has_any_checkpoint:
             allowed_ids = set(cfg.TEST_SUBJECTS + cfg.VAL_SUBJECTS)
             self.subjects = [s for s in all_subjects if any(s.startswith(sid) for sid in allowed_ids)]
             if not self.subjects:
@@ -831,39 +1153,77 @@ class DatasetViewer(QMainWindow):
         self.noisy_metric_cache: dict[tuple, dict] = {}
         self.slice_metric_cache: dict[tuple, dict] = {}
         self.pred_cache: dict[tuple, dict] = {}
+        self.fodf_pred_cache: dict[tuple, np.ndarray] = {}
         self.clean_tract_cache: dict[str, list[np.ndarray]] = {}
         self.pred_tract_cache: dict[tuple, list[np.ndarray]] = {}
+        self.pending_fodf_request: dict[str, object] | None = None
+        self.fodf_window: FodfComparisonWindow | None = None
         self._pending_noisy_metrics: set[tuple] = set()
         self._pending_metrics: set[tuple] = set()
         self._pending_predictions: set[tuple] = set()
+        self._pending_fodf_predictions: set[tuple] = set()
         self._pending_clean_tracts: set[str] = set()
         self._pending_pred_tracts: set[tuple] = set()
         self.tracts_enabled = False
 
         self.model: QSpaceUNet | None = None
+        self.fodf_model: QSpaceUNet | None = None
+        self.fodf_channels = 0
         self.dti_scale = 1.0
         self.max_bval = 1000.0
+        self.fodf_max_bval = 1000.0
         self.device = torch.device("cpu")
         self.model_lock = threading.Lock()
 
-        if checkpoint_path is not None:
+        if has_any_checkpoint:
             self.device = get_device()
-            ckpt = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
-            max_n = ckpt["max_n"]
-            feat_dim = ckpt.get("feat_dim", 64)
-            channels = tuple(ckpt.get("channels", [64, 128, 256, 512]))
-            cholesky = ckpt.get("cholesky", False)
-            self.dti_scale = ckpt.get("dti_scale", 1.0)
-            self.max_bval = ckpt.get("max_bval", 1000.0)
-            self.model = QSpaceUNet(max_n=max_n, feat_dim=feat_dim, channels=channels, cholesky=cholesky).to(self.device)
-            self.model.load_state_dict(ckpt["model_state_dict"])
-            self.model.eval()
-            print(f"Model loaded from {checkpoint_path} (epoch {ckpt['epoch']}, device={self.device})")
+        dti_meta: dict[str, object] | None = None
+        resolved_dti = Path(dti_checkpoint_path).resolve() if dti_checkpoint_path else None
+        resolved_fodf = Path(fodf_checkpoint_path).resolve() if fodf_checkpoint_path else None
+
+        if dti_checkpoint_path is not None:
+            self.model, dti_meta = load_checkpoint_model(dti_checkpoint_path, self.device)
+            if int(dti_meta.get("dti_channels", DTI_CHANNELS)) <= 0:
+                raise RuntimeError(
+                    f"{dti_checkpoint_path} has no DTI head (dti_channels=0). "
+                    "Pass it as --fodf_checkpoint instead."
+                )
+            self.dti_scale = float(dti_meta["dti_scale"])
+            self.max_bval = float(dti_meta["max_bval"])
+            print(
+                f"DTI model loaded from {dti_checkpoint_path} "
+                f"(epoch {dti_meta['epoch']}, device={self.device})"
+            )
+
+        if fodf_checkpoint_path is not None:
+            if resolved_dti is not None and resolved_fodf == resolved_dti and self.model is not None:
+                self.fodf_model = self.model
+                self.fodf_channels = int(dti_meta["fodf_channels"]) if dti_meta is not None else 0
+                self.fodf_max_bval = float(dti_meta["max_bval"]) if dti_meta is not None else self.max_bval
+                if self.fodf_channels > 0:
+                    print(f"Reusing {fodf_checkpoint_path} for predicted fODFs.")
+            else:
+                self.fodf_model, fodf_meta = load_checkpoint_model(fodf_checkpoint_path, self.device)
+                self.fodf_channels = int(fodf_meta["fodf_channels"])
+                self.fodf_max_bval = float(fodf_meta["max_bval"])
+                if self.fodf_channels > 0:
+                    print(
+                        f"fODF model loaded from {fodf_checkpoint_path} "
+                        f"(epoch {fodf_meta['epoch']}, device={self.device})"
+                    )
+                else:
+                    print(
+                        f"[visualizer] {fodf_checkpoint_path} has no fODF head; "
+                        "predicted fODF visualization is disabled.",
+                        file=sys.stderr,
+                    )
+                    self.fodf_model = None
 
         self.worker_signals = WorkerSignals()
         self.worker_signals.metrics_ready.connect(self._on_metrics_ready)
         self.worker_signals.noisy_metrics_ready.connect(self._on_noisy_metrics_ready)
         self.worker_signals.prediction_ready.connect(self._on_prediction_ready)
+        self.worker_signals.fodf_prediction_ready.connect(self._on_fodf_prediction_ready)
         self.worker_signals.clean_tracts_ready.connect(self._on_clean_tracts_ready)
         self.worker_signals.pred_tracts_ready.connect(self._on_pred_tracts_ready)
         self.thread_pool = QThreadPool()
@@ -955,6 +1315,21 @@ class DatasetViewer(QMainWindow):
             rows_container.addWidget(row_widget, stretch=1)
             if row_key == "tracts":
                 row_widget.setVisible(False)  # hidden until user enables tract panels
+
+        if self.fodf_model is not None and self.fodf_channels > 0:
+            fa_click_tooltip = "Click to open the clean vs predicted 3D fODF for the selected voxel."
+        else:
+            fa_click_tooltip = "Click to open the clean 3D fODF for the selected voxel."
+        if "FA Map" in self.panels:
+            self.panels["FA Map"].set_clickable(True, fa_click_tooltip)
+            self.panels["FA Map"].image_clicked.connect(
+                lambda pos, panel_name="FA Map": self._handle_fa_panel_click(panel_name, pos)
+            )
+        if "Predicted FA" in self.panels:
+            self.panels["Predicted FA"].set_clickable(True, fa_click_tooltip)
+            self.panels["Predicted FA"].image_clicked.connect(
+                lambda pos, panel_name="Predicted FA": self._handle_fa_panel_click(panel_name, pos)
+            )
 
         # ── Right panel ───────────────────────────────────────────────────
         info_box = QGroupBox("Subject Summary")
@@ -1059,6 +1434,10 @@ class DatasetViewer(QMainWindow):
             "absolute fiber direction). Computation runs once per subject "
             "(clean) or per (subject, keep, noise) (predicted). "
         )
+        if self.fodf_model is not None and self.fodf_channels > 0:
+            help_text += "Click an FA panel to inspect the clean and predicted 3D fODF at that voxel. "
+        else:
+            help_text += "Click an FA panel to inspect the clean 3D fODF at that voxel. "
         help_text += "The Brain Mask panel shows the stored Zarr mask slice when present; otherwise the viewer falls back to DIPY median_otsu. "
         help_text += "Noisy, DTI, and NN panels are masked to the target-side brain mask. "
         help_text += "Noisy DTI, ground-truth DTI, and NN panels load in the background — the GUI stays responsive."
@@ -1095,9 +1474,12 @@ class DatasetViewer(QMainWindow):
         self.degraded_slice_cache.clear()
         self.noisy_metric_cache.clear()
         self.pred_cache.clear()
+        self.fodf_pred_cache.clear()
         self.pred_tract_cache.clear()
+        self.pending_fodf_request = None
         self._pending_noisy_metrics.clear()
         self._pending_predictions.clear()
+        self._pending_fodf_predictions.clear()
         self._pending_pred_tracts.clear()
         self._update_view()
 
@@ -1107,6 +1489,164 @@ class DatasetViewer(QMainWindow):
     @property
     def plane(self) -> str:
         return self.plane_combo.currentText()
+
+    def _prediction_result(self, axial_slice_idx: int) -> dict | None:
+        return self.pred_cache.get(self._prediction_key(axial_slice_idx))
+
+    def _fodf_prediction_result(self, axial_slice_idx: int) -> np.ndarray | None:
+        return self.fodf_pred_cache.get(self._prediction_key(axial_slice_idx))
+
+    def _start_prediction_worker(self, axial_slice_idx: int, update_panels: bool = False) -> None:
+        if self.model is None:
+            return
+        pred_key = self._prediction_key(axial_slice_idx)
+        if pred_key in self._pending_predictions or self._degradation_slider_active():
+            return
+
+        input_nhw = self._get_degraded_slice_nhw("Axial", axial_slice_idx)
+        self._pending_predictions.add(pred_key)
+        if update_panels:
+            for p in ("Predicted FA", "Predicted MD", "Predicted Color FA"):
+                self.panels[p].image_label.setPixmap(QPixmap())
+                self.panels[p].image_label.setText("Computing…")
+                self.panels[p].caption_label.setText("")
+        self.thread_pool.start(
+            PredictionWorker(
+                pred_key,
+                self.current_subject, axial_slice_idx,
+                input_nhw,
+                self.current_bvals.copy(), self.current_bvecs.copy(),
+                self.model, self.device,
+                self.dti_scale, self.max_bval, cfg.B0_THRESHOLD,
+                self.model_lock, self.worker_signals,
+            )
+        )
+
+    def _start_fodf_prediction_worker(self, axial_slice_idx: int) -> None:
+        if self.fodf_model is None or self.fodf_channels <= 0:
+            return
+        pred_key = self._prediction_key(axial_slice_idx)
+        if pred_key in self._pending_fodf_predictions or self._degradation_slider_active():
+            return
+
+        input_nhw = self._get_degraded_slice_nhw("Axial", axial_slice_idx)
+        self._pending_fodf_predictions.add(pred_key)
+        self.thread_pool.start(
+            FodfPredictionWorker(
+                pred_key,
+                self.current_subject,
+                axial_slice_idx,
+                input_nhw,
+                self.current_bvals.copy(),
+                self.current_bvecs.copy(),
+                self.fodf_model,
+                self.device,
+                self.fodf_max_bval,
+                cfg.B0_THRESHOLD,
+                self.model_lock,
+                self.worker_signals,
+            )
+        )
+
+    def _ensure_fodf_window(self) -> FodfComparisonWindow:
+        if self.fodf_window is None:
+            self.fodf_window = FodfComparisonWindow()
+        self.fodf_window.show()
+        self.fodf_window.raise_()
+        self.fodf_window.activateWindow()
+        return self.fodf_window
+
+    def _panel_voxel_from_click(self, panel_name: str, pos) -> tuple[int, int, int] | None:
+        panel = self.panels.get(panel_name)
+        if panel is None or panel.display_shape is None:
+            return None
+        pixmap = panel.image_label.pixmap()
+        if pixmap is None or pixmap.isNull():
+            return None
+
+        rect = panel.image_label.contentsRect()
+        pixmap_w = pixmap.width()
+        pixmap_h = pixmap.height()
+        x0 = rect.x() + max(0.0, (rect.width() - pixmap_w) / 2.0)
+        y0 = rect.y() + max(0.0, (rect.height() - pixmap_h) / 2.0)
+        rel_x = float(pos.x()) - x0
+        rel_y = float(pos.y()) - y0
+        if rel_x < 0.0 or rel_y < 0.0 or rel_x >= pixmap_w or rel_y >= pixmap_h:
+            return None
+
+        axis_a, axis_b = panel.display_shape
+        disp_col = min(int(rel_x * axis_a / max(pixmap_w, 1)), axis_a - 1)
+        disp_row = min(int(rel_y * axis_b / max(pixmap_h, 1)), axis_b - 1)
+        slice_row = int(np.clip(disp_col, 0, axis_a - 1))
+        slice_col = int(np.clip((axis_b - 1) - disp_row, 0, axis_b - 1))
+        slice_idx = self.slice_slider.value()
+
+        if self.plane == "Axial":
+            return slice_row, slice_col, slice_idx
+        if self.plane == "Coronal":
+            return slice_row, slice_idx, slice_col
+        return slice_idx, slice_row, slice_col
+
+    def _get_clean_fodf_sh(self, subject: str, voxel: tuple[int, int, int]) -> np.ndarray | None:
+        group = self.store[subject]
+        if "target_fodf_sh" not in set(group.array_keys()):
+            return None
+        x, y, z = voxel
+        return np.asarray(group["target_fodf_sh"][x, y, z, :], dtype=np.float32)
+
+    def _render_fodf_request(self, request: dict[str, object]) -> None:
+        subject = str(request["subject"])
+        voxel = tuple(int(v) for v in request["voxel"])
+        clean_sh = self._get_clean_fodf_sh(subject, voxel)
+        window = self._ensure_fodf_window()
+        if clean_sh is None:
+            window.show_message(subject, voxel, "Clean fODF SH coefficients are unavailable in this dataset.")
+            return
+
+        pred_sh = self.fodf_pred_cache.get(tuple(request["fodf_key"]))
+        if pred_sh is not None:
+            x, y, z = voxel
+            pred_sh = np.asarray(pred_sh[x, y, :], dtype=np.float32)
+        window.update_plot(subject, voxel, clean_sh, pred_sh)
+
+    def _show_fodf_for_voxel(self, voxel: tuple[int, int, int]) -> None:
+        subject = self.current_subject
+        window = self._ensure_fodf_window()
+        clean_sh = self._get_clean_fodf_sh(subject, voxel)
+        if clean_sh is None:
+            window.show_message(subject, voxel, "Clean fODF SH coefficients are unavailable in this dataset.")
+            return
+
+        request = {
+            "subject": subject,
+            "voxel": voxel,
+            "fodf_key": self._prediction_key(voxel[2]),
+        }
+        self.pending_fodf_request = request
+
+        if self.fodf_model is None:
+            window.update_plot(subject, voxel, clean_sh, pred_sh=None)
+            return
+        if self.fodf_channels <= 0:
+            window.update_plot(subject, voxel, clean_sh, pred_sh=None)
+            return
+        if self._degradation_slider_active():
+            window.show_message(subject, voxel, "Release the degradation slider to compute the predicted fODF.")
+            return
+
+        pred_result = self._fodf_prediction_result(voxel[2])
+        if pred_result is not None:
+            self._render_fodf_request(request)
+            return
+
+        window.show_message(subject, voxel, "Computing predicted fODF for the selected voxel…")
+        self._start_fodf_prediction_worker(voxel[2])
+
+    def _handle_fa_panel_click(self, panel_name: str, pos) -> None:
+        voxel = self._panel_voxel_from_click(panel_name, pos)
+        if voxel is None:
+            return
+        self._show_fodf_for_voxel(voxel)
 
     def _load_subject_by_name(self, subject_name: str) -> None:
         if subject_name not in self.subjects:
@@ -1123,10 +1663,13 @@ class DatasetViewer(QMainWindow):
         self.noisy_metric_cache.clear()
         self.slice_metric_cache.clear()
         self.pred_cache.clear()
+        self.fodf_pred_cache.clear()
         self.pred_tract_cache.clear()
+        self.pending_fodf_request = None
         self._pending_noisy_metrics.clear()
         self._pending_metrics.clear()
         self._pending_predictions.clear()
+        self._pending_fodf_predictions.clear()
         self._pending_pred_tracts.clear()
 
         subject_index = self.subjects.index(subject_name)
@@ -1351,22 +1894,7 @@ class DatasetViewer(QMainWindow):
                         self.panels[p].image_label.setText("Release slider to update")
                         self.panels[p].caption_label.setText("")
                 elif pred_key not in self._pending_predictions:
-                    self._pending_predictions.add(pred_key)
-                    for p in ("Predicted FA", "Predicted MD", "Predicted Color FA"):
-                        self.panels[p].image_label.setPixmap(QPixmap())
-                        self.panels[p].image_label.setText("Computing…")
-                        self.panels[p].caption_label.setText("")
-                    self.thread_pool.start(
-                        PredictionWorker(
-                            pred_key,
-                            self.current_subject, slice_idx,
-                            input_nhw,
-                            self.current_bvals.copy(), self.current_bvecs.copy(),
-                            self.model, self.device,
-                            self.dti_scale, self.max_bval, cfg.B0_THRESHOLD,
-                            self.model_lock, self.worker_signals,
-                        )
-                    )
+                    self._start_prediction_worker(slice_idx, update_panels=True)
 
         # ── Fiber tracts: only compute when the user has the tract row visible
         self._update_tract_panels(slice_idx)
@@ -1523,6 +2051,7 @@ class DatasetViewer(QMainWindow):
         self.panels["FA Map"].set_pixmap(
             make_pixmap(fa_display, cmap="viridis"),
             f"brain mean={format_float(fa_mean)}  max={format_float(fa_max)}",
+            data_shape=metrics["fa"].shape,
         )
         self.panels["MD Map"].set_pixmap(
             make_pixmap(md_display, cmap="plasma"),
@@ -1544,6 +2073,7 @@ class DatasetViewer(QMainWindow):
         self.panels["Predicted FA"].set_pixmap(
             make_pixmap(fa_display, cmap="viridis"),
             f"brain mean={format_float(fa_mean)}  max={format_float(fa_max)}",
+            data_shape=pred_metrics["fa"].shape,
         )
         self.panels["Predicted MD"].set_pixmap(
             make_pixmap(md_display, cmap="plasma"),
@@ -1578,6 +2108,13 @@ class DatasetViewer(QMainWindow):
                 and self.plane == "Axial"):
             self._apply_predictions(result)
 
+    @pyqtSlot(object, object)
+    def _on_fodf_prediction_ready(self, pred_key: tuple, fodf_sh: np.ndarray) -> None:
+        self._pending_fodf_predictions.discard(pred_key)
+        self.fodf_pred_cache[pred_key] = np.asarray(fodf_sh, dtype=np.float32)
+        if self.pending_fodf_request is not None and pred_key == tuple(self.pending_fodf_request["fodf_key"]):
+            self._render_fodf_request(self.pending_fodf_request)
+
     @pyqtSlot(str, object)
     def _on_clean_tracts_ready(self, subject: str, streamlines: list) -> None:
         self._pending_clean_tracts.discard(subject)
@@ -1606,8 +2143,19 @@ def main() -> None:
         print(dataset_summary(args.zarr_path))
         return
 
+    dti_checkpoint = args.dti_checkpoint
+    fodf_checkpoint = args.fodf_checkpoint
+    if args.checkpoint is not None and dti_checkpoint is None and fodf_checkpoint is None:
+        dti_checkpoint = args.checkpoint
+        fodf_checkpoint = args.checkpoint
+
     app = QApplication(sys.argv)
-    viewer = DatasetViewer(args.zarr_path, initial_subject=args.subject, checkpoint_path=args.checkpoint)
+    viewer = DatasetViewer(
+        args.zarr_path,
+        initial_subject=args.subject,
+        dti_checkpoint_path=dti_checkpoint,
+        fodf_checkpoint_path=fodf_checkpoint,
+    )
     viewer.show()
     sys.exit(app.exec())
 
