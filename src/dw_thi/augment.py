@@ -130,14 +130,29 @@ def gpu_degrade_dwi_batch(
 
     Parameters
     ----------
-    signal : (B, N, H, W) float32, on device
+    signal : (B, N, H, W) or (B, N, D, H, W) float32, on device
     keep_fraction : (B,) float32 — fraction of each spatial axis kept around DC
     noise_level : (B,) float32 — rel_noise_level per sample
 
     Returns
     -------
-    degraded : (B, N, H, W) float32
+    degraded : same shape as ``signal`` float32
     """
+    if signal.ndim == 5:
+        b, n, d, h, w = signal.shape
+        flat = signal.permute(0, 2, 1, 3, 4).reshape(b * d, n, h, w)
+        flat_kf = keep_fraction.repeat_interleave(d)
+        flat_nl = noise_level.repeat_interleave(d)
+        flat = gpu_degrade_dwi_batch(flat, flat_kf, flat_nl)
+        return (
+            flat.reshape(b, d, n, h, w)
+            .permute(0, 2, 1, 3, 4)
+            .contiguous()
+        )
+    if signal.ndim != 4:
+        raise ValueError(
+            f"gpu_degrade_dwi_batch expected 4D or 5D signal, got {tuple(signal.shape)}."
+        )
     B, N, H, W = signal.shape
 
     k = torch.fft.rfft2(signal, dim=(-2, -1))  # (B, N, H, W//2+1) complex
@@ -172,13 +187,27 @@ def gpu_b0_normalize_batch(
 
     Parameters
     ----------
-    signal : (B, N, H, W) float32
+    signal : (B, N, H, W) or (B, N, D, H, W) float32
     b0_mask : (B, N) bool — True for b0 volumes (bval < threshold)
 
     Returns
     -------
-    normalized : (B, N, H, W) float32
+    normalized : same shape as ``signal`` float32
     """
+    if signal.ndim == 5:
+        b, n, d, h, w = signal.shape
+        flat = signal.permute(0, 2, 1, 3, 4).reshape(b * d, n, h, w)
+        flat_b0 = b0_mask[:, None, :].expand(b, d, n).reshape(b * d, n)
+        flat = gpu_b0_normalize_batch(flat, flat_b0)
+        return (
+            flat.reshape(b, d, n, h, w)
+            .permute(0, 2, 1, 3, 4)
+            .contiguous()
+        )
+    if signal.ndim != 4:
+        raise ValueError(
+            f"gpu_b0_normalize_batch expected 4D or 5D signal, got {tuple(signal.shape)}."
+        )
     B, N, H, W = signal.shape
     b0_float = b0_mask.to(dtype=signal.dtype)                           # (B, N)
     n_b0 = b0_float.sum(dim=1).clamp(min=1.0)                          # (B,)

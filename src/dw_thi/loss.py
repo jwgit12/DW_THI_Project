@@ -3,9 +3,14 @@
 Terms (all masked to brain voxels when a mask is supplied):
 
 - ``fodf_loss``       Charbonnier on the SH coefficient residual.
+- ``fodf_band_loss``  Band-balanced Charbonnier on SH coefficients. Each
+                      even-l band is normalized by its target RMS so high
+                      orders cannot disappear behind the l=0/l=2 terms.
 - ``fodf_corr_loss``  1 - mean cosine-similarity between predicted/target
                       coefficient vectors. Captures the angular fit
                       independent of magnitude.
+- ``fodf_aniso_corr_loss`` Cosine loss over higher-order SH coefficients only,
+                      targeting angular shape rather than isotropic baseline.
 - ``fodf_sf_loss``    Charbonnier on sphere-sampled values, with each
                       direction weighted by the (normalized) target lobe
                       amplitude. Concentrates capacity on real fiber
@@ -69,7 +74,9 @@ class FodfLoss(nn.Module):
     def __init__(
         self,
         lambda_fodf: float = cfg.LAMBDA_FODF,
+        lambda_fodf_band: float = cfg.LAMBDA_FODF_BAND,
         lambda_fodf_corr: float = cfg.LAMBDA_FODF_CORR,
+        lambda_fodf_aniso_corr: float = cfg.LAMBDA_FODF_ANISO_CORR,
         lambda_fodf_sf: float = cfg.LAMBDA_FODF_SF,
         lambda_fodf_peak: float = cfg.LAMBDA_FODF_PEAK,
         lambda_fodf_nonneg: float = cfg.LAMBDA_FODF_NONNEG,
@@ -80,11 +87,18 @@ class FodfLoss(nn.Module):
         fodf_peak_weight: float = cfg.FODF_PEAK_WEIGHT,
         fodf_peak_gamma: float = cfg.FODF_PEAK_GAMMA,
         fodf_peak_rel_threshold: float = cfg.FODF_PEAK_REL_THRESHOLD,
+        fodf_band_weight_gamma: float = cfg.FODF_BAND_WEIGHT_GAMMA,
+        fodf_power_weight_gamma: float = cfg.FODF_POWER_WEIGHT_GAMMA,
+        fodf_band_scale_floor: float = cfg.FODF_BAND_SCALE_FLOOR,
+        fodf_power_scale_floor: float = cfg.FODF_POWER_SCALE_FLOOR,
+        fodf_aniso_min_l: int = cfg.FODF_ANISO_MIN_L,
         charbonnier_eps: float = 1e-3,
     ):
         super().__init__()
         self.lambda_fodf = lambda_fodf
+        self.lambda_fodf_band = lambda_fodf_band
         self.lambda_fodf_corr = lambda_fodf_corr
+        self.lambda_fodf_aniso_corr = lambda_fodf_aniso_corr
         self.lambda_fodf_sf = lambda_fodf_sf
         self.lambda_fodf_peak = lambda_fodf_peak
         self.lambda_fodf_nonneg = lambda_fodf_nonneg
@@ -95,6 +109,11 @@ class FodfLoss(nn.Module):
         self.fodf_peak_weight = fodf_peak_weight
         self.fodf_peak_gamma = fodf_peak_gamma
         self.fodf_peak_rel_threshold = fodf_peak_rel_threshold
+        self.fodf_band_weight_gamma = fodf_band_weight_gamma
+        self.fodf_power_weight_gamma = fodf_power_weight_gamma
+        self.fodf_band_scale_floor = max(float(fodf_band_scale_floor), 1e-8)
+        self.fodf_power_scale_floor = max(float(fodf_power_scale_floor), 1e-8)
+        self.fodf_aniso_min_l = max(0, int(fodf_aniso_min_l))
         self.charbonnier_eps = charbonnier_eps
         self._fodf_sf_n_coeffs = 0
         self._band_slices: list[tuple[int, int]] = []
@@ -140,6 +159,48 @@ class FodfLoss(nn.Module):
             self._band_slices = _sh_band_slices(n_coeffs)
             self._band_n_coeffs = n_coeffs
         return self._band_slices
+
+    def _band_weights(
+        self,
+        n_coeffs: int,
+        *,
+        gamma: float,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        bands = self._bands_for(n_coeffs)
+        weights = torch.as_tensor(
+            [(2 * idx + 1) ** float(gamma) for idx in range(len(bands))],
+            device=device,
+            dtype=dtype,
+        )
+        return weights / weights.mean().clamp_min(1e-8)
+
+    @staticmethod
+    def _masked_scalar_mean(value: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
+        if mask is None:
+            return value.mean()
+        mask_4d = mask.unsqueeze(1).to(dtype=value.dtype)
+        return (value * mask_4d).sum() / (mask_4d.sum() * value.shape[1]).clamp(min=1)
+
+    def _target_band_rms(
+        self,
+        target_fodf: torch.Tensor,
+        start: int,
+        end: int,
+        mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        power = target_fodf[:, start:end].detach() ** 2
+        rms = torch.sqrt(self._masked_scalar_mean(power, mask).clamp_min(1e-12))
+        return rms.clamp_min(self.fodf_band_scale_floor)
+
+    def _target_power_scale(
+        self,
+        target_norm: torch.Tensor,
+        mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        scale = self._masked_scalar_mean(target_norm.detach(), mask)
+        return scale.clamp_min(self.fodf_power_scale_floor)
 
     def _target_topk_sf(
         self,
@@ -264,27 +325,95 @@ class FodfLoss(nn.Module):
         target_fodf: torch.Tensor,
         mask: torch.Tensor | None,
     ) -> torch.Tensor:
-        """Charbonnier on per-ℓ-band sqrt-power differences.
+        """Relative Charbonnier on per-ℓ-band sqrt-power differences.
 
         Power per band ℓ is ``sum_m c_{ℓ,m}^2`` — invariant under sphere
         rotations. Matching it pushes the model to reproduce the target's
         angular sharpness/dispersion without penalizing small orientation
-        errors that the coefficient-space loss already handles.
+        errors that the coefficient-space loss already handles. Normalizing
+        each band by its target RMS prevents high-order power from being a
+        numerically cheap thing to drop.
         """
         bands = self._bands_for(pred_fodf.shape[1])
+        weights = self._band_weights(
+            pred_fodf.shape[1],
+            gamma=self.fodf_power_weight_gamma,
+            device=pred_fodf.device,
+            dtype=pred_fodf.dtype,
+        )
         eps = self.charbonnier_eps
         eps_sq = eps * eps
 
-        per_band = []
-        for start, end in bands:
+        per_band_losses = []
+        for band_idx, (start, end) in enumerate(bands):
             pred_p = (pred_fodf[:, start:end] ** 2).sum(dim=1, keepdim=True)
             tgt_p = (target_fodf[:, start:end] ** 2).sum(dim=1, keepdim=True)
             pred_norm = torch.sqrt(pred_p + eps_sq)
             tgt_norm = torch.sqrt(tgt_p + eps_sq)
-            per_band.append(pred_norm - tgt_norm)
-        residual = torch.cat(per_band, dim=1)  # (B, n_bands, H, W)
+            scale = self._target_power_scale(tgt_norm, mask)
+            residual = (pred_norm - tgt_norm) / scale
+            band_loss = _masked_channel_mean(_charbonnier(residual, eps), mask)
+            per_band_losses.append(weights[band_idx] * band_loss)
 
-        return _masked_channel_mean(_charbonnier(residual, eps), mask)
+        return torch.stack(per_band_losses).mean()
+
+    def _band_balanced_coeff_loss(
+        self,
+        pred_fodf: torch.Tensor,
+        target_fodf: torch.Tensor,
+        mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        bands = self._bands_for(pred_fodf.shape[1])
+        weights = self._band_weights(
+            pred_fodf.shape[1],
+            gamma=self.fodf_band_weight_gamma,
+            device=pred_fodf.device,
+            dtype=pred_fodf.dtype,
+        )
+
+        per_band_losses = []
+        for band_idx, (start, end) in enumerate(bands):
+            scale = self._target_band_rms(target_fodf, start, end, mask)
+            residual = (pred_fodf[:, start:end] - target_fodf[:, start:end]) / scale
+            band_loss = _masked_channel_mean(
+                _charbonnier(residual, self.charbonnier_eps),
+                mask,
+            )
+            per_band_losses.append(weights[band_idx] * band_loss)
+        return torch.stack(per_band_losses).mean()
+
+    def _anisotropic_corr_loss(
+        self,
+        pred_fodf: torch.Tensor,
+        target_fodf: torch.Tensor,
+        mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        bands = self._bands_for(pred_fodf.shape[1])
+        start_idx = None
+        for band_idx, (start, _end) in enumerate(bands):
+            ell = 2 * band_idx
+            if ell >= self.fodf_aniso_min_l:
+                start_idx = start
+                break
+        if start_idx is None or start_idx >= pred_fodf.shape[1]:
+            return pred_fodf.new_zeros(())
+
+        pred_vox = pred_fodf[:, start_idx:].permute(0, 2, 3, 1).reshape(
+            -1,
+            pred_fodf.shape[1] - start_idx,
+        )
+        tgt_vox = target_fodf[:, start_idx:].permute(0, 2, 3, 1).reshape(
+            -1,
+            target_fodf.shape[1] - start_idx,
+        )
+        valid = tgt_vox.norm(dim=1) > 1e-8
+        if mask is not None:
+            valid = valid & (mask.reshape(-1) > 0.5)
+
+        if not valid.any():
+            return pred_fodf.new_zeros(())
+        cosine = F.cosine_similarity(pred_vox[valid], tgt_vox[valid], dim=1, eps=1e-8)
+        return 1.0 - cosine.mean()
 
     def forward(
         self,
@@ -306,8 +435,10 @@ class FodfLoss(nn.Module):
         metrics = {
             "fodf_loss": metric_value(fodf_loss),
             "fodf_mse": metric_value(fodf_mse_val),
+            "fodf_band_loss": metric_value(pred_fodf.new_zeros(())),
             "fodf_acc": metric_value(pred_fodf.new_zeros(())),
             "fodf_corr_loss": metric_value(pred_fodf.new_zeros(())),
+            "fodf_aniso_corr_loss": metric_value(pred_fodf.new_zeros(())),
             "fodf_sf_loss": metric_value(pred_fodf.new_zeros(())),
             "fodf_sf_mae": metric_value(pred_fodf.new_zeros(())),
             "fodf_peak_loss": metric_value(pred_fodf.new_zeros(())),
@@ -321,6 +452,12 @@ class FodfLoss(nn.Module):
         active_loss_term = False
         if self.lambda_fodf > 0:
             total = total + self.lambda_fodf * fodf_loss
+            active_loss_term = True
+
+        if self.lambda_fodf_band > 0:
+            band_loss = self._band_balanced_coeff_loss(pred_fodf, target_fodf, mask)
+            metrics["fodf_band_loss"] = metric_value(band_loss)
+            total = total + self.lambda_fodf_band * band_loss
             active_loss_term = True
 
         # Cosine similarity in coefficient space (angular fit, scale-free).
@@ -342,6 +479,12 @@ class FodfLoss(nn.Module):
         metrics["fodf_corr_loss"] = metric_value(fodf_corr_loss)
         if self.lambda_fodf_corr > 0:
             total = total + self.lambda_fodf_corr * fodf_corr_loss
+            active_loss_term = True
+
+        if self.lambda_fodf_aniso_corr > 0:
+            aniso_corr_loss = self._anisotropic_corr_loss(pred_fodf, target_fodf, mask)
+            metrics["fodf_aniso_corr_loss"] = metric_value(aniso_corr_loss)
+            total = total + self.lambda_fodf_aniso_corr * aniso_corr_loss
             active_loss_term = True
 
         if (
@@ -376,7 +519,8 @@ class FodfLoss(nn.Module):
         if not active_loss_term:
             raise ValueError(
                 "No active fODF loss is configured. Enable at least one of "
-                "lambda_fodf, lambda_fodf_corr, lambda_fodf_sf, lambda_fodf_peak, "
+                "lambda_fodf, lambda_fodf_band, lambda_fodf_corr, "
+                "lambda_fodf_aniso_corr, lambda_fodf_sf, lambda_fodf_peak, "
                 "lambda_fodf_nonneg, or lambda_fodf_power."
             )
 

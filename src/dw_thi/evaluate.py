@@ -175,13 +175,29 @@ def predict_subject(
 
     model.eval()
     batch_size = max(1, int(batch_size))
-    fodf_channels = getattr(model, "fodf_channels", getattr(model, "_orig_mod", model).fodf_channels)
+    base_model = getattr(model, "_orig_mod", model)
+    fodf_channels = getattr(model, "fodf_channels", base_model.fodf_channels)
+    context_slices = int(getattr(model, "context_slices", getattr(base_model, "context_slices", 1)))
+    context_radius = context_slices // 2
     with torch.inference_mode(), autocast_context(
         device, enabled=amp_enabled, dtype=amp_dtype,
     ):
         for start in range(0, Z, batch_size):
             end = min(start + batch_size, Z)
-            signal_t = torch.from_numpy(signals[start:end]).to(
+            batch_signal = signals[start:end]
+            if context_slices > 1:
+                context = []
+                for z in range(start, end):
+                    idx = [
+                        min(max(z + offset, 0), Z - 1)
+                        for offset in range(-context_radius, context_radius + 1)
+                    ]
+                    context.append(signals[idx])  # (D, N, H, W)
+                batch_signal = np.ascontiguousarray(
+                    np.stack(context, axis=0).transpose(0, 2, 1, 3, 4),
+                    dtype=np.float32,
+                )
+            signal_t = torch.from_numpy(batch_signal).to(
                 device, non_blocking=non_blocking,
             )
             signal_t = maybe_channels_last(signal_t, channels_last)
@@ -1042,8 +1058,11 @@ def main(args):
     max_n = ckpt["max_n"]
     feat_dim = ckpt.get("feat_dim", 64)
     channels = tuple(ckpt.get("channels", [64, 128, 256, 512]))
+    context_slices = int(ckpt.get("context_slices", 1))
+    context_fusion_layers = int(ckpt.get("context_fusion_layers", 2))
     cholesky = ckpt.get("cholesky", False)
     fodf_channels = ckpt.get("fodf_channels", 0)
+    dti_channels = int(ckpt.get("dti_channels", DTI_CHANNELS))
     dti_scale = ckpt.get("dti_scale", 1.0)
     max_bval = ckpt.get("max_bval", 1000.0)
     log.info(
@@ -1053,6 +1072,9 @@ def main(args):
         cholesky,
         fodf_channels,
     )
+    if channels_last and context_slices > 1:
+        log.info("Disabling channels_last for %d-slice context model.", context_slices)
+        channels_last = False
 
     raw_model = QSpaceUNet(
         max_n=max_n,
@@ -1060,6 +1082,9 @@ def main(args):
         channels=channels,
         cholesky=cholesky,
         fodf_channels=fodf_channels,
+        dti_channels=dti_channels,
+        context_slices=context_slices,
+        context_fusion_layers=context_fusion_layers,
     ).to(device)
     raw_model.load_state_dict(ckpt["model_state_dict"])
     if channels_last:

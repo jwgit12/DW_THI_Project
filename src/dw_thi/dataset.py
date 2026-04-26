@@ -67,11 +67,115 @@ def _flip_bvecs(bvecs_3n: np.ndarray, world_axis: int) -> np.ndarray:
     return out
 
 
+def _spatial_slice(array: np.ndarray, axis: int, index: int) -> np.ndarray:
+    """Return a 2D spatial slice from a 3D/4D volume."""
+    if axis == 0:
+        return array[index]
+    if axis == 1:
+        return array[:, index]
+    return array[:, :, index]
+
+
+def _context_indices(center: int, n_slices: int, depth: int) -> list[int]:
+    radius = depth // 2
+    return [
+        min(max(center + offset, 0), n_slices - 1)
+        for offset in range(-radius, radius + 1)
+    ]
+
+
+def _extract_dwi_context(
+    dwi_xyzn: np.ndarray,
+    axis: int,
+    center: int,
+    depth: int,
+) -> np.ndarray:
+    """Return central DWI slice or an edge-clamped context stack."""
+    if depth == 1:
+        return _spatial_slice(dwi_xyzn, axis, center).copy()
+    indices = _context_indices(center, dwi_xyzn.shape[axis], depth)
+    slices = [_spatial_slice(dwi_xyzn, axis, idx) for idx in indices]
+    return np.stack(slices, axis=2).copy()
+
+
+def _dwi_to_model_layout(clean: np.ndarray) -> np.ndarray:
+    """Convert ``(H, W, N)`` or ``(H, W, D, N)`` DWI to model layout."""
+    if clean.ndim == 3:
+        return np.ascontiguousarray(clean.transpose(2, 0, 1))
+    if clean.ndim == 4:
+        return np.ascontiguousarray(clean.transpose(3, 2, 0, 1))
+    raise ValueError(f"Unexpected DWI slice/context shape: {clean.shape}")
+
+
+def _degrade_model_signal(
+    signal: np.ndarray,
+    keep_fraction: float,
+    noise_level: float,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    if signal.ndim == 3:
+        return degrade_dwi_slice(signal, keep_fraction, noise_level, rng)
+    if signal.ndim == 4:
+        n, d, h, w = signal.shape
+        degraded = degrade_dwi_slice(signal.reshape(n * d, h, w), keep_fraction, noise_level, rng)
+        return degraded.reshape(n, d, h, w)
+    raise ValueError(f"Unexpected model signal shape: {signal.shape}")
+
+
+def _b0_normalize_model_signal(signal: np.ndarray, b0_idx: np.ndarray) -> np.ndarray:
+    if not b0_idx.any():
+        return signal
+    if signal.ndim == 3:
+        mean_b0 = signal[b0_idx].mean(axis=0)
+        b0_norm = compute_b0_norm(mean_b0)
+        if b0_norm > 0:
+            signal = signal / b0_norm
+        return signal
+    if signal.ndim == 4:
+        for depth_idx in range(signal.shape[1]):
+            mean_b0 = signal[b0_idx, depth_idx].mean(axis=0)
+            b0_norm = compute_b0_norm(mean_b0)
+            if b0_norm > 0:
+                signal[:, depth_idx] = signal[:, depth_idx] / b0_norm
+        return signal
+    raise ValueError(f"Unexpected model signal shape: {signal.shape}")
+
+
+def _pad_signal_n(signal: np.ndarray, pad: int) -> np.ndarray:
+    if signal.ndim == 3:
+        return np.pad(signal, ((0, pad), (0, 0), (0, 0)))
+    if signal.ndim == 4:
+        return np.pad(signal, ((0, pad), (0, 0), (0, 0), (0, 0)))
+    raise ValueError(f"Unexpected model signal shape: {signal.shape}")
+
+
+def _pad_signal_hw(signal: np.ndarray, ph: int, pw: int) -> np.ndarray:
+    if signal.ndim == 3:
+        return np.pad(signal, ((0, 0), (0, ph), (0, pw)))
+    if signal.ndim == 4:
+        return np.pad(signal, ((0, 0), (0, 0), (0, ph), (0, pw)))
+    raise ValueError(f"Unexpected model signal shape: {signal.shape}")
+
+
+def _sh_n_coeffs(order: int) -> int:
+    if order < 0 or order % 2 != 0:
+        raise ValueError(f"fODF SH order must be a non-negative even integer, got {order}.")
+    return (order + 1) * (order + 2) // 2
+
+
+def _infer_sh_order(n_coeffs: int) -> int:
+    for order in range(0, 32, 2):
+        if _sh_n_coeffs(order) == int(n_coeffs):
+            return order
+    raise ValueError(f"Unsupported fODF SH coefficient count: {n_coeffs}")
+
+
 class DWISliceDataset(Dataset):
     """Loads 2D DWI slices and degrades them on the fly.
 
     Each sample returns:
-        input:        (max_n, H, W)   padded noisy DWI (generated on the fly)
+        input:        (max_n, H, W) or (max_n, D, H, W)
+                                      padded noisy DWI (generated on the fly)
         target:       (6, H, W)       6D DTI tensor, scaled by dti_scale
         target_fodf:  (C, H, W)       optional fODF SH coefficients
         bvals:        (max_n,)        normalised b-values
@@ -104,6 +208,8 @@ class DWISliceDataset(Dataset):
         eval_noise_level: float = cfg.EVAL_NOISE_LEVEL,
         eval_seed: int = cfg.EVAL_DEGRADE_SEED,
         gpu_degrade: bool = False,
+        context_slices: int = 1,
+        target_fodf_sh_order: int | None = None,
     ):
         self.zarr_path = path_str(zarr_path)
         self.subject_keys = list(subject_keys)
@@ -122,6 +228,9 @@ class DWISliceDataset(Dataset):
         self.eval_keep_fraction = float(eval_keep_fraction)
         self.eval_noise_level = float(eval_noise_level)
         self.eval_seed = int(eval_seed)
+        self.context_slices = int(context_slices)
+        if self.context_slices < 1 or self.context_slices % 2 == 0:
+            raise ValueError("context_slices must be a positive odd integer.")
         # GPU degrade: skip CPU FFT in __getitem__; batch dict carries kf/nl/b0_mask
         # for run_epoch to apply cuFFT on the full batch (>50x faster on CUDA).
         # Disabled in eval_mode to keep deterministic per-sample degradation.
@@ -140,6 +249,8 @@ class DWISliceDataset(Dataset):
         self.samples: list[tuple[str, int, int]] = []  # (key, axis, slice_index)
         self.has_fodf = False
         self.fodf_n_coeffs = 0
+        self.stored_fodf_n_coeffs = 0
+        self.target_fodf_sh_order = target_fodf_sh_order
 
         self.max_n = 0
         global_max_bval = 0.0
@@ -218,7 +329,28 @@ class DWISliceDataset(Dataset):
             tuple(canonical_hw) if canonical_hw is not None else (max_h, max_w)
         )
         self.has_fodf = expected_fodf_n_coeffs is not None
-        self.fodf_n_coeffs = expected_fodf_n_coeffs or 0
+        self.stored_fodf_n_coeffs = expected_fodf_n_coeffs or 0
+        self.fodf_n_coeffs = self.stored_fodf_n_coeffs
+        if self.has_fodf:
+            stored_order = _infer_sh_order(self.stored_fodf_n_coeffs)
+            if self.target_fodf_sh_order is None:
+                self.target_fodf_sh_order = stored_order
+            else:
+                requested_coeffs = _sh_n_coeffs(int(self.target_fodf_sh_order))
+                if requested_coeffs > self.stored_fodf_n_coeffs:
+                    raise ValueError(
+                        f"Requested fODF training order l={self.target_fodf_sh_order} "
+                        f"requires {requested_coeffs} coefficients, but the dataset only "
+                        f"stores {self.stored_fodf_n_coeffs} (l={stored_order})."
+                    )
+                self.fodf_n_coeffs = requested_coeffs
+                if self.fodf_n_coeffs < self.stored_fodf_n_coeffs:
+                    log.info(
+                        "Training on truncated fODF SH order l=%d (%d/%d coeffs).",
+                        self.target_fodf_sh_order,
+                        self.fodf_n_coeffs,
+                        self.stored_fodf_n_coeffs,
+                    )
         if self.has_fodf and self.augment and self.aug_flip:
             log.warning(
                 "Disabling aug_flip for %s because mirrored fODF SH targets would "
@@ -259,62 +391,44 @@ class DWISliceDataset(Dataset):
             arr_dwi  = preloaded[key]["target_dwi"]
             arr_dti  = preloaded[key]["target_dti_6d"]
             arr_fodf = preloaded[key].get("target_fodf_sh")
-            if axis == 0:
-                clean = arr_dwi[s].copy()                 # (Y, Z, N)
-                tgt   = arr_dti[s].copy()                 # (Y, Z, 6)
-                bmask = bmask_3d[s] if bmask_3d is not None else None
-                if self.has_fodf and arr_fodf is not None:
-                    tgt_fodf = arr_fodf[s].copy()         # (Y, Z, C)
-            elif axis == 1:
-                clean = arr_dwi[:, s].copy()              # (X, Z, N)
-                tgt   = arr_dti[:, s].copy()              # (X, Z, 6)
-                bmask = bmask_3d[:, s] if bmask_3d is not None else None
-                if self.has_fodf and arr_fodf is not None:
-                    tgt_fodf = arr_fodf[:, s].copy()      # (X, Z, C)
-            else:
-                clean = arr_dwi[:, :, s].copy()           # (X, Y, N)
-                tgt   = arr_dti[:, :, s].copy()           # (X, Y, 6)
-                bmask = bmask_3d[:, :, s] if bmask_3d is not None else None
-                if self.has_fodf and arr_fodf is not None:
-                    tgt_fodf = arr_fodf[:, :, s].copy()   # (X, Y, C)
+            clean = _extract_dwi_context(arr_dwi, axis, s, self.context_slices)
+            tgt = _spatial_slice(arr_dti, axis, s).copy()
+            bmask = _spatial_slice(bmask_3d, axis, s) if bmask_3d is not None else None
+            if self.has_fodf and arr_fodf is not None:
+                tgt_fodf = _spatial_slice(arr_fodf, axis, s).copy()
         else:
             # ── Lazy-load the required 2D slice from zarr ──────────────────
             # _get_zarr_group caches the store handle per process, so each
             # DataLoader worker opens the store once and reuses it.
             grp = _get_zarr_group(self.zarr_path)[key]
-            if axis == 0:
-                clean = np.asarray(grp["target_dwi"][s], dtype=np.float32)        # (Y, Z, N)
-                tgt   = np.asarray(grp["target_dti_6d"][s], dtype=np.float32)     # (Y, Z, 6)
-                bmask = bmask_3d[s] if bmask_3d is not None else None
-            elif axis == 1:
-                clean = np.asarray(grp["target_dwi"][:, s], dtype=np.float32)     # (X, Z, N)
-                tgt   = np.asarray(grp["target_dti_6d"][:, s], dtype=np.float32)  # (X, Z, 6)
-                bmask = bmask_3d[:, s] if bmask_3d is not None else None
+            if self.context_slices == 1:
+                clean = np.asarray(_spatial_slice(grp["target_dwi"], axis, s), dtype=np.float32)
             else:
-                clean = np.asarray(grp["target_dwi"][:, :, s], dtype=np.float32)     # (X, Y, N)
-                tgt   = np.asarray(grp["target_dti_6d"][:, :, s], dtype=np.float32)  # (X, Y, 6)
-                bmask = bmask_3d[:, :, s] if bmask_3d is not None else None
+                context = [
+                    np.asarray(_spatial_slice(grp["target_dwi"], axis, si), dtype=np.float32)
+                    for si in _context_indices(s, grp["target_dwi"].shape[axis], self.context_slices)
+                ]
+                clean = np.stack(context, axis=2)
+            tgt = np.asarray(_spatial_slice(grp["target_dti_6d"], axis, s), dtype=np.float32)
+            bmask = _spatial_slice(bmask_3d, axis, s) if bmask_3d is not None else None
 
         if self.has_fodf and tgt_fodf is None:
             grp = _get_zarr_group(self.zarr_path)[key]
-            if axis == 0:
-                tgt_fodf = np.asarray(grp["target_fodf_sh"][s], dtype=np.float32)
-            elif axis == 1:
-                tgt_fodf = np.asarray(grp["target_fodf_sh"][:, s], dtype=np.float32)
-            else:
-                tgt_fodf = np.asarray(grp["target_fodf_sh"][:, :, s], dtype=np.float32)
+            tgt_fodf = np.asarray(_spatial_slice(grp["target_fodf_sh"], axis, s), dtype=np.float32)
 
         # (H, W, C) -> (C, H, W) channel-first; contiguous for later in-place ops.
-        clean_nhw = np.ascontiguousarray(clean.transpose(2, 0, 1))     # (N, H, W)
+        clean_signal = _dwi_to_model_layout(clean)                    # (N, H, W) or (N, D, H, W)
         tgt_chw = np.ascontiguousarray(tgt.transpose(2, 0, 1))         # (6, H, W)
         if tgt_fodf is not None:
             tgt_fodf_chw = np.ascontiguousarray(tgt_fodf.transpose(2, 0, 1))
+            if self.fodf_n_coeffs > 0:
+                tgt_fodf_chw = tgt_fodf_chw[: self.fodf_n_coeffs]
         else:
             tgt_fodf_chw = None
         if bmask is not None:
             bmask_hw = np.ascontiguousarray(bmask.astype(np.float32))
         else:
-            bmask_hw = np.ones(clean_nhw.shape[1:], dtype=np.float32)
+            bmask_hw = np.ones(clean_signal.shape[-2:], dtype=np.float32)
 
         N = bvals.shape[0]
         bvals_n = bvals.copy()
@@ -328,20 +442,20 @@ class DWISliceDataset(Dataset):
                 kf = self.eval_keep_fraction
                 nl = self.eval_noise_level
                 rng = np.random.default_rng(self.eval_seed + idx)
-                input_nhw = degrade_dwi_slice(clean_nhw, kf, nl, rng)
+                input_signal = _degrade_model_signal(clean_signal, kf, nl, rng)
             elif self.gpu_degrade:
                 # Degradation deferred to GPU in run_epoch (cuFFT, ~50x faster).
                 # Return clean signal here; batch dict carries the params needed.
                 degrade_kf = float(np.random.uniform(*self.keep_fraction_range))
                 degrade_nl = float(np.random.uniform(*self.noise_range))
-                input_nhw = clean_nhw.copy()
+                input_signal = clean_signal.copy()
             else:
                 kf = float(np.random.uniform(*self.keep_fraction_range))
                 nl = float(np.random.uniform(*self.noise_range))
                 rng = np.random.default_rng()
-                input_nhw = degrade_dwi_slice(clean_nhw, kf, nl, rng)
+                input_signal = _degrade_model_signal(clean_signal, kf, nl, rng)
         else:
-            input_nhw = clean_nhw.copy()
+            input_signal = clean_signal.copy()
 
         # ── Scale DTI to O(1) range for balanced training ───────────────────
         tgt_chw = np.clip(tgt_chw * self.dti_scale, -3.0, 3.0).astype(np.float32)
@@ -350,11 +464,7 @@ class DWISliceDataset(Dataset):
         # Skipped in gpu_degrade mode: run_epoch applies gpu_b0_normalize_batch
         # after cuFFT degradation so normalization is over the degraded signal.
         if not self.gpu_degrade:
-            if b0_idx.any():
-                mean_b0 = input_nhw[b0_idx].mean(axis=0)
-                b0_norm = compute_b0_norm(mean_b0)
-                if b0_norm > 0:
-                    input_nhw = input_nhw / b0_norm
+            input_signal = _b0_normalize_model_signal(input_signal, b0_idx)
 
         bvals_norm = bvals_n / self.max_bval
 
@@ -373,29 +483,35 @@ class DWISliceDataset(Dataset):
                 }
                 h_world, w_world = world_axes_by_slice[axis]
                 if random.random() > 0.5:
-                    input_nhw = input_nhw[:, ::-1, :]
+                    if input_signal.ndim == 3:
+                        input_signal = input_signal[:, ::-1, :]
+                    else:
+                        input_signal = input_signal[:, :, ::-1, :]
                     tgt_chw = tgt_chw[:, ::-1, :]
                     bmask_hw = bmask_hw[::-1, :]
                     tgt_chw = _flip_dti6d_sign(tgt_chw, world_axis=h_world)
                     bvecs_n = _flip_bvecs(bvecs_n, world_axis=h_world)
                 if random.random() > 0.5:
-                    input_nhw = input_nhw[:, :, ::-1]
+                    if input_signal.ndim == 3:
+                        input_signal = input_signal[:, :, ::-1]
+                    else:
+                        input_signal = input_signal[:, :, :, ::-1]
                     tgt_chw = tgt_chw[:, :, ::-1]
                     bmask_hw = bmask_hw[:, ::-1]
                     tgt_chw = _flip_dti6d_sign(tgt_chw, world_axis=w_world)
                     bvecs_n = _flip_bvecs(bvecs_n, world_axis=w_world)
-                input_nhw = np.ascontiguousarray(input_nhw)
+                input_signal = np.ascontiguousarray(input_signal)
                 tgt_chw = np.ascontiguousarray(tgt_chw)
                 bmask_hw = np.ascontiguousarray(bmask_hw)
             if self.aug_intensity > 0.0:
                 scale = 1.0 + np.random.uniform(
                     -self.aug_intensity, self.aug_intensity,
                 )
-                input_nhw = input_nhw * np.float32(scale)
+                input_signal = input_signal * np.float32(scale)
             if self.aug_volume_dropout > 0.0:
                 drop = np.random.random(N) < self.aug_volume_dropout
                 if drop.any():
-                    input_nhw[drop] = 0.0
+                    input_signal[drop] = 0.0
                     # vol_mask is built later from N; record drop mask
                     dropped_volumes = drop
                 else:
@@ -408,7 +524,7 @@ class DWISliceDataset(Dataset):
         # ── Pad diffusion dimension to max_n (variable across subjects) ─────
         if N < self.max_n:
             pad = self.max_n - N
-            input_nhw = np.pad(input_nhw, ((0, pad), (0, 0), (0, 0)))
+            input_signal = _pad_signal_n(input_signal, pad)
             bvals_norm = np.pad(bvals_norm, (0, pad))
             bvecs_n = np.pad(bvecs_n, ((0, 0), (0, pad)))
 
@@ -419,18 +535,18 @@ class DWISliceDataset(Dataset):
 
         # ── Pad spatial dims to canonical (H, W) so batches stack ───────────
         ch, cw = self.canonical_hw
-        h, w = input_nhw.shape[1:]
+        h, w = input_signal.shape[-2:]
         if (h, w) != (ch, cw):
             ph = ch - h
             pw = cw - w
-            input_nhw = np.pad(input_nhw, ((0, 0), (0, ph), (0, pw)))
+            input_signal = _pad_signal_hw(input_signal, ph, pw)
             tgt_chw = np.pad(tgt_chw, ((0, 0), (0, ph), (0, pw)))
             if tgt_fodf_chw is not None:
                 tgt_fodf_chw = np.pad(tgt_fodf_chw, ((0, 0), (0, ph), (0, pw)))
             bmask_hw = np.pad(bmask_hw, ((0, ph), (0, pw)))
 
         result = {
-            "input": torch.from_numpy(np.ascontiguousarray(input_nhw)),
+            "input": torch.from_numpy(np.ascontiguousarray(input_signal)),
             "target": torch.from_numpy(np.ascontiguousarray(tgt_chw)),
             "bvals": torch.from_numpy(bvals_norm.astype(np.float32)),
             "bvecs": torch.from_numpy(bvecs_n.astype(np.float32)),

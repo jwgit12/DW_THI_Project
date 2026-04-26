@@ -78,8 +78,10 @@ FODF_METRIC_KEYS = (
     "loss",
     "fodf_loss",
     "fodf_mse",
+    "fodf_band_loss",
     "fodf_acc",
     "fodf_corr_loss",
+    "fodf_aniso_corr_loss",
     "fodf_sf_loss",
     "fodf_peak_loss",
     "fodf_peak_mae",
@@ -618,16 +620,22 @@ def build_run_config(
         "max_n": train_ds.max_n,
         "max_bval": train_ds.max_bval,
         "fodf_channels": train_ds.fodf_n_coeffs,
+        "stored_fodf_channels": train_ds.stored_fodf_n_coeffs,
+        "train_fodf_sh_order": args.train_fodf_sh_order,
         "dti_channels": 0,
         "canonical_hw": list(train_ds.canonical_hw),
         "feat_dim": args.feat_dim,
         "channels": list(args.channels),
+        "context_slices": args.context_slices,
+        "context_fusion_layers": args.context_fusion_layers,
         "batch_size": args.batch_size,
         "epochs": args.epochs,
         "lr": args.lr,
         "weight_decay": args.weight_decay,
         "lambda_fodf": args.lambda_fodf,
+        "lambda_fodf_band": args.lambda_fodf_band,
         "lambda_fodf_corr": args.lambda_fodf_corr,
+        "lambda_fodf_aniso_corr": args.lambda_fodf_aniso_corr,
         "lambda_fodf_sf": args.lambda_fodf_sf,
         "lambda_fodf_peak": args.lambda_fodf_peak,
         "lambda_fodf_nonneg": args.lambda_fodf_nonneg,
@@ -638,6 +646,11 @@ def build_run_config(
         "fodf_peak_weight": args.fodf_peak_weight,
         "fodf_peak_gamma": args.fodf_peak_gamma,
         "fodf_peak_rel_threshold": args.fodf_peak_rel_threshold,
+        "fodf_band_weight_gamma": args.fodf_band_weight_gamma,
+        "fodf_power_weight_gamma": args.fodf_power_weight_gamma,
+        "fodf_band_scale_floor": args.fodf_band_scale_floor,
+        "fodf_power_scale_floor": args.fodf_power_scale_floor,
+        "fodf_aniso_min_l": args.fodf_aniso_min_l,
         "warmup_epochs": args.warmup_epochs,
         "patience": args.patience,
         "use_brain_mask": not args.no_brain_mask,
@@ -711,6 +724,10 @@ def save_checkpoint(
             "max_n": train_ds.max_n,
             "feat_dim": args.feat_dim,
             "channels": list(args.channels),
+            "context_slices": args.context_slices,
+            "context_fusion_layers": args.context_fusion_layers,
+            "train_fodf_sh_order": args.train_fodf_sh_order,
+            "stored_fodf_channels": train_ds.stored_fodf_n_coeffs,
             "cholesky": False,
             "fodf_channels": train_ds.fodf_n_coeffs,
             "dti_channels": 0,
@@ -746,6 +763,9 @@ def main(args: argparse.Namespace) -> None:
     amp_dtype = amp_dtype_from_name(device, args.amp_dtype)
     amp_enabled = bool(args.amp and amp_dtype is not None)
     channels_last = bool(args.channels_last and device.type == "cuda")
+    if channels_last and args.context_slices > 1:
+        log.info("Disabling channels_last for %d-slice context model.", args.context_slices)
+        channels_last = False
     num_workers = default_num_workers(args.num_workers)
     pin_memory = should_pin_memory(device, requested=args.pin_memory, num_workers=num_workers)
     non_blocking_cuda = pin_memory
@@ -784,6 +804,8 @@ def main(args: argparse.Namespace) -> None:
         aug_intensity=args.aug_intensity,
         aug_volume_dropout=args.aug_volume_dropout,
         gpu_degrade=device.type == "cuda",
+        context_slices=args.context_slices,
+        target_fodf_sh_order=args.train_fodf_sh_order,
     )
     val_ds = DWISliceDataset(
         zarr_path,
@@ -795,6 +817,8 @@ def main(args: argparse.Namespace) -> None:
         eval_keep_fraction=args.eval_keep_fraction,
         eval_noise_level=args.eval_noise_level,
         eval_seed=args.eval_seed,
+        context_slices=args.context_slices,
+        target_fodf_sh_order=args.train_fodf_sh_order,
     )
 
     if train_ds.fodf_n_coeffs <= 0:
@@ -851,12 +875,14 @@ def main(args: argparse.Namespace) -> None:
         train_ds.gpu_degrade,
     )
     log.info(
-        "Train slices: %d Val slices: %d max_n: %d max_bval: %.0f fodf_channels: %d",
+        "Train slices: %d Val slices: %d max_n: %d max_bval: %.0f fodf_channels: %d/%d context_slices: %d",
         len(train_ds),
         len(val_ds),
         global_max_n,
         train_ds.max_bval,
         train_ds.fodf_n_coeffs,
+        train_ds.stored_fodf_n_coeffs,
+        args.context_slices,
     )
 
     raw_model = QSpaceUNet(
@@ -867,6 +893,8 @@ def main(args: argparse.Namespace) -> None:
         fodf_channels=train_ds.fodf_n_coeffs,
         dti_channels=0,
         dropout=args.dropout,
+        context_slices=args.context_slices,
+        context_fusion_layers=args.context_fusion_layers,
     ).to(device)
     if channels_last:
         raw_model = raw_model.to(memory_format=torch.channels_last)
@@ -883,7 +911,9 @@ def main(args: argparse.Namespace) -> None:
 
     criterion = FodfLoss(
         lambda_fodf=args.lambda_fodf,
+        lambda_fodf_band=args.lambda_fodf_band,
         lambda_fodf_corr=args.lambda_fodf_corr,
+        lambda_fodf_aniso_corr=args.lambda_fodf_aniso_corr,
         lambda_fodf_sf=args.lambda_fodf_sf,
         lambda_fodf_peak=args.lambda_fodf_peak,
         lambda_fodf_nonneg=args.lambda_fodf_nonneg,
@@ -894,6 +924,11 @@ def main(args: argparse.Namespace) -> None:
         fodf_peak_weight=args.fodf_peak_weight,
         fodf_peak_gamma=args.fodf_peak_gamma,
         fodf_peak_rel_threshold=args.fodf_peak_rel_threshold,
+        fodf_band_weight_gamma=args.fodf_band_weight_gamma,
+        fodf_power_weight_gamma=args.fodf_power_weight_gamma,
+        fodf_band_scale_floor=args.fodf_band_scale_floor,
+        fodf_power_scale_floor=args.fodf_power_scale_floor,
+        fodf_aniso_min_l=args.fodf_aniso_min_l,
     ).to(device)
 
     fused_adamw = bool(args.fused_adamw and device.type == "cuda")
@@ -1072,17 +1107,20 @@ def main(args: argparse.Namespace) -> None:
 
                 marker = "*" if improved else ""
                 log.info(
-                    "Epoch %3d/%d train=%.6f val=%.6f fodf=%.6f sf=%.6f peak=%.6f "
-                    "p_ratio=%.3f acc=%.4f power=%.6f lr=%.2e %.1fs %s",
+                    "Epoch %3d/%d train=%.6f val=%.6f fodf=%.6f band=%.6f "
+                    "sf=%.6f peak=%.6f p_ratio=%.3f acc=%.4f aniso=%.6f "
+                    "power=%.6f lr=%.2e %.1fs %s",
                     epoch,
                     args.epochs,
                     train_metrics["loss"],
                     val_metrics["loss"],
                     val_metrics["fodf_loss"],
+                    val_metrics["fodf_band_loss"],
                     val_metrics["fodf_sf_loss"],
                     val_metrics["fodf_peak_loss"],
                     val_metrics["fodf_peak_ratio"],
                     val_metrics["fodf_acc"],
+                    val_metrics["fodf_aniso_corr_loss"],
                     val_metrics["fodf_power_loss"],
                     lr,
                     elapsed,
@@ -1145,6 +1183,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--feat_dim", type=int, default=cfg.FEAT_DIM)
     parser.add_argument("--channels", type=int, nargs="+", default=cfg.UNET_CHANNELS)
+    parser.add_argument("--context_slices", type=int, default=cfg.CONTEXT_SLICES)
+    parser.add_argument("--context_fusion_layers", type=int, default=cfg.CONTEXT_FUSION_LAYERS)
+    parser.add_argument("--train_fodf_sh_order", type=int, default=cfg.TRAIN_FODF_SH_ORDER)
     parser.add_argument("--dropout", type=float, default=cfg.DROPOUT)
 
     parser.add_argument("--epochs", type=int, default=cfg.EPOCHS)
@@ -1152,7 +1193,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lr", type=float, default=cfg.LEARNING_RATE)
     parser.add_argument("--weight_decay", type=float, default=cfg.WEIGHT_DECAY)
     parser.add_argument("--lambda_fodf", type=float, default=cfg.LAMBDA_FODF)
+    parser.add_argument("--lambda_fodf_band", type=float, default=cfg.LAMBDA_FODF_BAND)
     parser.add_argument("--lambda_fodf_corr", type=float, default=cfg.LAMBDA_FODF_CORR)
+    parser.add_argument("--lambda_fodf_aniso_corr", type=float, default=cfg.LAMBDA_FODF_ANISO_CORR)
     parser.add_argument("--lambda_fodf_sf", type=float, default=cfg.LAMBDA_FODF_SF)
     parser.add_argument("--lambda_fodf_peak", type=float, default=cfg.LAMBDA_FODF_PEAK)
     parser.add_argument("--lambda_fodf_nonneg", type=float, default=cfg.LAMBDA_FODF_NONNEG)
@@ -1167,6 +1210,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=cfg.FODF_PEAK_REL_THRESHOLD,
     )
+    parser.add_argument("--fodf_band_weight_gamma", type=float, default=cfg.FODF_BAND_WEIGHT_GAMMA)
+    parser.add_argument("--fodf_power_weight_gamma", type=float, default=cfg.FODF_POWER_WEIGHT_GAMMA)
+    parser.add_argument("--fodf_band_scale_floor", type=float, default=cfg.FODF_BAND_SCALE_FLOOR)
+    parser.add_argument("--fodf_power_scale_floor", type=float, default=cfg.FODF_POWER_SCALE_FLOOR)
+    parser.add_argument("--fodf_aniso_min_l", type=int, default=cfg.FODF_ANISO_MIN_L)
     parser.add_argument("--warmup_epochs", type=int, default=cfg.WARMUP_EPOCHS)
     parser.add_argument("--patience", type=int, default=cfg.PATIENCE)
     parser.add_argument("--vis_every", type=int, default=cfg.VIS_EVERY)

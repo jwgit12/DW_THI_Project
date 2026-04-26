@@ -9,7 +9,7 @@ the same constants.  CLI argument defaults should reference these too.
 # ─────────────────────────────────────────────────────────────────────────────
 DATASET_ZARR_PATH = "dataset/default_odf.zarr"
 DATASET_QC_DIR = "dataset/default_clean_qc"
-TRAIN_OUT_DIR = "runs/production_fodf_2"
+TRAIN_OUT_DIR = "runs/production_fodf_context_l6"
 EVAL_OUT_DIR = "runs/evaluation_multitask"
 SEED = 42
 
@@ -18,10 +18,10 @@ SEED = 42
 # sees different noise and k-space cutouts for the same clean slice. The
 # dataset build stores only the clean DWI; there is no pre-degraded array.
 # ─────────────────────────────────────────────────────────────────────────────
-NOISE_MIN = 0.05              # minimum relative Gaussian noise level
-NOISE_MAX = 0.25              # maximum relative Gaussian noise level
-KEEP_FRACTION_MIN = 0.4       # min central k-space fraction kept
-KEEP_FRACTION_MAX = 0.6      # max central k-space fraction kept
+NOISE_MIN = 0.02              # minimum relative Gaussian noise level
+NOISE_MAX = 0.12              # maximum relative Gaussian noise level
+KEEP_FRACTION_MIN = 0.5       # min central k-space fraction kept
+KEEP_FRACTION_MAX = 0.75      # max central k-space fraction kept
 
 # Deterministic single-value defaults used at eval time (and as a back-compat
 # scalar when callers expect the legacy ``KEEP_FRACTION`` / Zarr attrs).
@@ -40,11 +40,11 @@ EVAL_INFER_BATCH_SIZE = 16
 # ─────────────────────────────────────────────────────────────────────────────
 # Training-time augmentation
 # ─────────────────────────────────────────────────────────────────────────────
-RANDOM_SLICE_AXIS = True      # randomly slice along X (sagittal), Y (coronal), or Z (axial)
-SLICE_AXES = (0, 1, 2)        # axes to sample from when RANDOM_SLICE_AXIS is True
+RANDOM_SLICE_AXIS = False     # quality-first fODF training: match axial validation/inference view
+SLICE_AXES = (2,)             # axes to sample from when RANDOM_SLICE_AXIS is True
 AUG_FLIP = True               # random physical-mirror flips: signal + tensor + bvecs transform together
 AUG_INTENSITY = 0.1           # uniform multiplicative jitter on the input (0 disables)
-AUG_VOLUME_DROPOUT = 0.1      # per-volume dropout probability on the input (0 disables)
+AUG_VOLUME_DROPOUT = 0.02     # per-volume dropout probability on the input (0 disables)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DWI / DTI shared constants
@@ -67,6 +67,7 @@ BRAIN_MASK_FINALIZE = True
 # 6→28, 8→45, 10→66).
 # ─────────────────────────────────────────────────────────────────────────────
 FODF_SH_ORDER = 8
+TRAIN_FODF_SH_ORDER = 6             # cap training target/order from stored SH coeffs (use 8 for full dataset)
 FODF_RESPONSE_ROI_RADII = 10        # ROI radius for auto_response_ssst (voxels)
 FODF_RESPONSE_FA_THR = 0.7          # FA threshold for response-function ROI
 FODF_SINGLE_SHELL_TOL = 100.0       # b-value tolerance for "single shell" check
@@ -80,41 +81,50 @@ VAL_SUBJECTS = ["sub-05", "sub-11"]
 # ─────────────────────────────────────────────────────────────────────────────
 # Model architecture
 # ─────────────────────────────────────────────────────────────────────────────
-FEAT_DIM = 64                # q-space encoder feature dimension (matches channels[0])
-UNET_CHANNELS = [64, 128, 256, 512]  # 4 encoder levels; factor=16 fits (132, 130) via padding
-DROPOUT = 0.1                # spatial dropout rate in U-Net conv blocks
-LAMBDA_FODF = 0.5            # weight for fODF SH-coefficient reconstruction
-LAMBDA_FODF_CORR = 0.5       # weight for fODF angular-correlation surrogate
-LAMBDA_FODF_SF = 1.5         # weight for sphere-sampled fODF reconstruction
-LAMBDA_FODF_PEAK = 1.0       # extra supervision at the target's strongest fODF lobes
-LAMBDA_FODF_NONNEG = 0.05    # discourage physically implausible negative fODF values
-LAMBDA_FODF_POWER = 0.5      # rotation-invariant per-ℓ-band SH power-spectrum match
-FODF_LOSS_SPHERE = "repulsion100"  # small sphere keeps peak-aware training affordable
-FODF_SF_CHUNK_SIZE = 25      # directions per loss chunk; lower if GPU memory is tight
-FODF_PEAK_TOPK = 3           # number of target peak directions supervised per voxel
-FODF_PEAK_WEIGHT = 8.0       # surface-loss multiplier near high target fODF values
+FEAT_DIM = 128                # q-space encoder feature dimension (matches channels[0])
+UNET_CHANNELS = [128, 256, 512]  # 3 encoder levels; factor=8 fits (132, 130) via padding
+CONTEXT_SLICES = 5            # odd axial slice stack for fODF shape context (1 disables 2.5D)
+CONTEXT_FUSION_LAYERS = 2     # residual 3D blocks before collapsing back to the central slice
+DROPOUT = 0.05               # spatial dropout rate in U-Net conv blocks
+LAMBDA_FODF = 0.25           # raw SH coefficient anchor; kept low so l=0/l=2 do not dominate
+LAMBDA_FODF_BAND = 0.75      # band-balanced SH coefficient reconstruction
+LAMBDA_FODF_CORR = 0.25      # full-coefficient cosine surrogate
+LAMBDA_FODF_ANISO_CORR = 0.5 # high-order cosine term for angular shape, ignoring isotropic baseline
+LAMBDA_FODF_SF = 2.0         # sphere-sampled fODF reconstruction
+LAMBDA_FODF_PEAK = 1.5       # extra supervision at the target's strongest fODF lobes
+LAMBDA_FODF_NONNEG = 0.1     # discourage physically implausible negative fODF values
+LAMBDA_FODF_POWER = 0.75     # relative per-ℓ-band SH power-spectrum match
+FODF_LOSS_SPHERE = "repulsion724"  # denser sphere improves peak supervision on RTX 4090
+FODF_SF_CHUNK_SIZE = 100     # directions per loss chunk; lower if GPU memory is tight
+FODF_PEAK_TOPK = 5           # number of target peak directions supervised per voxel
+FODF_PEAK_WEIGHT = 12.0      # surface-loss multiplier near high target fODF values
 FODF_PEAK_GAMMA = 2.0        # sharper weighting toward large fODF peaks
-FODF_PEAK_REL_THRESHOLD = 0.25  # ignore tiny top-k directions below this relative height
+FODF_PEAK_REL_THRESHOLD = 0.15  # ignore tiny top-k directions below this relative height
+FODF_BAND_WEIGHT_GAMMA = 0.5 # >0 softly upweights high-ℓ detail bands
+FODF_POWER_WEIGHT_GAMMA = 0.5
+FODF_BAND_SCALE_FLOOR = 0.02 # denominator floor for per-band relative coefficient losses
+FODF_POWER_SCALE_FLOOR = 0.02
+FODF_ANISO_MIN_L = 4         # high-order cosine uses ℓ >= this value
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Training
 # ─────────────────────────────────────────────────────────────────────────────
-EPOCHS = 150
-BATCH_SIZE = 32
-LEARNING_RATE = 1e-3
-WEIGHT_DECAY = 1e-4
-PATIENCE = 25                # early stopping patience (epochs)
+EPOCHS = 220
+BATCH_SIZE = 8
+LEARNING_RATE = 7e-4
+WEIGHT_DECAY = 5e-5
+PATIENCE = 40                # early stopping patience (epochs)
 GRAD_CLIP = 1.0              # gradient norm clipping value
-WARMUP_EPOCHS = 5            # linear LR warmup before cosine annealing
+WARMUP_EPOCHS = 8            # linear LR warmup before cosine annealing
 VIS_EVERY = 1                # TensorBoard validation figure cadence
-NUM_WORKERS = 2            # -1 = OS-aware auto
+NUM_WORKERS = 4              # fast worker-side preload for context stacks; lower if system RAM is tight
 PREFETCH_FACTOR = 4          # DataLoader prefetch per worker
-PIN_MEMORY = True            # auto-disabled on Windows when worker processes are active
+PIN_MEMORY = True
 PRELOAD_FODF = True          # cache target_fodf_sh in worker RAM; set False if RAM is tight
 AMP = True
 AMP_DTYPE = "auto"           # 'auto' | 'bf16' | 'fp16'
 CHANNELS_LAST = True         # CUDA-only channels-last conv layout
-COMPILE = "on"               # 'off' | 'auto' | 'on'
+COMPILE = "auto"             # 'off' | 'auto' | 'on'
 COMPILE_MODE = "reduce-overhead"
 FUSED_ADAMW = True           # CUDA-only fused optimizer when available
 DETERMINISTIC = False

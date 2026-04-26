@@ -194,6 +194,8 @@ def load_checkpoint_model(
     max_n = int(ckpt["max_n"])
     feat_dim = int(ckpt.get("feat_dim", 64))
     channels = tuple(ckpt.get("channels", [64, 128, 256, 512]))
+    context_slices = int(ckpt.get("context_slices", 1))
+    context_fusion_layers = int(ckpt.get("context_fusion_layers", 2))
     cholesky = bool(ckpt.get("cholesky", False))
     fodf_channels = int(ckpt.get("fodf_channels", 0))
     # Older DTI/multitask checkpoints predate the dti_channels metadata; default
@@ -201,6 +203,9 @@ def load_checkpoint_model(
     dti_channels = int(ckpt.get("dti_channels", DTI_CHANNELS))
     dti_scale = float(ckpt.get("dti_scale", 1.0))
     max_bval = float(ckpt.get("max_bval", 1000.0))
+    train_fodf_sh_order = ckpt.get("train_fodf_sh_order")
+    if train_fodf_sh_order is None and fodf_channels > 0:
+        train_fodf_sh_order = infer_fodf_sh_order(fodf_channels)
 
     model = QSpaceUNet(
         max_n=max_n,
@@ -209,6 +214,8 @@ def load_checkpoint_model(
         cholesky=cholesky,
         fodf_channels=fodf_channels,
         dti_channels=dti_channels,
+        context_slices=context_slices,
+        context_fusion_layers=context_fusion_layers,
     ).to(device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
@@ -217,6 +224,9 @@ def load_checkpoint_model(
         "max_n": max_n,
         "fodf_channels": fodf_channels,
         "dti_channels": dti_channels,
+        "context_slices": context_slices,
+        "context_fusion_layers": context_fusion_layers,
+        "train_fodf_sh_order": train_fodf_sh_order,
         "dti_scale": dti_scale,
         "max_bval": max_bval,
     }
@@ -280,12 +290,41 @@ def infer_fodf_sh_order(n_coeffs: int) -> int:
     raise ValueError(f"Unsupported fODF SH coefficient count: {n_coeffs}")
 
 
-def reconstruct_fodf_sf(sh_coeffs: np.ndarray) -> np.ndarray:
+def fodf_n_coeffs_for_order(sh_order: int) -> int:
+    sh_order = int(sh_order)
+    if sh_order < 0 or sh_order % 2 != 0:
+        raise ValueError(f"fODF SH order must be a non-negative even integer, got {sh_order}.")
+    return (sh_order + 1) * (sh_order + 2) // 2
+
+
+def fodf_sh_for_order(
+    sh_coeffs: np.ndarray,
+    sh_order_max: int | None = None,
+) -> tuple[np.ndarray, int]:
     sh_coeffs = np.asarray(sh_coeffs, dtype=np.float32)
+    available_order = infer_fodf_sh_order(sh_coeffs.shape[-1])
+    if sh_order_max is None:
+        return sh_coeffs, available_order
+
+    sh_order_max = int(sh_order_max)
+    n_coeffs = fodf_n_coeffs_for_order(sh_order_max)
+    if n_coeffs > sh_coeffs.shape[-1]:
+        raise ValueError(
+            f"Requested fODF SH order l={sh_order_max} needs {n_coeffs} coefficients, "
+            f"but only {sh_coeffs.shape[-1]} are available (l={available_order})."
+        )
+    return np.ascontiguousarray(sh_coeffs[..., :n_coeffs]), sh_order_max
+
+
+def reconstruct_fodf_sf(
+    sh_coeffs: np.ndarray,
+    sh_order_max: int | None = None,
+) -> np.ndarray:
+    sh_coeffs, used_order = fodf_sh_for_order(sh_coeffs, sh_order_max)
     sf = sh_to_sf(
         sh_coeffs,
         FODF_SPHERE,
-        sh_order_max=infer_fodf_sh_order(sh_coeffs.shape[-1]),
+        sh_order_max=used_order,
         basis_type="descoteaux07",
         legacy=True,
     )
@@ -339,6 +378,14 @@ def extract_dwi_slice_nhw(array: zarr.Array, plane: str, slice_idx: int) -> np.n
     else:
         clean_hwn = np.asarray(array[slice_idx, :, :, :], dtype=np.float32)
     return np.ascontiguousarray(clean_hwn.transpose(2, 0, 1))
+
+
+def context_indices(center: int, n_slices: int, depth: int) -> list[int]:
+    radius = depth // 2
+    return [
+        min(max(center + offset, 0), n_slices - 1)
+        for offset in range(-radius, radius + 1)
+    ]
 
 
 def extract_tensor_slice(array: zarr.Array, plane: str, slice_idx: int) -> np.ndarray:
@@ -666,9 +713,16 @@ class FodfComparisonWindow(QWidget):
         voxel: tuple[int, int, int],
         clean_sh: np.ndarray,
         pred_sh: np.ndarray | None,
+        sh_order_max: int | None = None,
     ) -> None:
-        clean_sf = reconstruct_fodf_sf(clean_sh)
-        pred_sf = reconstruct_fodf_sf(pred_sh) if pred_sh is not None else None
+        clean_sf = reconstruct_fodf_sf(clean_sh, sh_order_max=sh_order_max)
+        pred_sf = reconstruct_fodf_sf(pred_sh, sh_order_max=sh_order_max) if pred_sh is not None else None
+        clean_order = sh_order_max if sh_order_max is not None else infer_fodf_sh_order(clean_sh.shape[-1])
+        pred_order = (
+            sh_order_max
+            if pred_sh is not None and sh_order_max is not None
+            else infer_fodf_sh_order(pred_sh.shape[-1]) if pred_sh is not None else None
+        )
         shared_max = max(
             float(np.max(clean_sf)) if clean_sf.size else 0.0,
             float(np.max(pred_sf)) if pred_sf is not None and pred_sf.size else 0.0,
@@ -684,8 +738,8 @@ class FodfComparisonWindow(QWidget):
             self.figure.add_subplot(1, 2, 2, projection="3d"),
         ]
         surfaces = (
-            ("Clean 3D fODF", clean_sf),
-            ("Predicted 3D fODF", pred_sf),
+            (f"Clean 3D fODF (l={clean_order})", clean_sf),
+            (f"Predicted 3D fODF (l={pred_order})" if pred_order is not None else "Predicted 3D fODF", pred_sf),
         )
         for ax, (title, sf) in zip(axes, surfaces):
             if sf is None:
@@ -748,7 +802,7 @@ class FodfComparisonWindow(QWidget):
         pred_state = "available" if pred_sf is not None else "unavailable"
         self.info_label.setText(
             f"Subject: {subject} | voxel: ({voxel[0]}, {voxel[1]}, {voxel[2]}) | "
-            f"predicted fODF: {pred_state}"
+            f"SH order: l={clean_order} | predicted fODF: {pred_state}"
         )
         self.canvas.draw_idle()
 
@@ -934,7 +988,7 @@ class FodfPredictionWorker(QRunnable):
         pred_key: tuple,
         subject: str,
         slice_idx: int,
-        input_slice_nhw: np.ndarray,
+        input_signal: np.ndarray,
         bvals: np.ndarray,
         bvecs: np.ndarray,
         model: QSpaceUNet,
@@ -948,7 +1002,7 @@ class FodfPredictionWorker(QRunnable):
         self.pred_key = pred_key
         self.subject = subject
         self.slice_idx = slice_idx
-        self.input_slice_nhw = np.ascontiguousarray(input_slice_nhw, dtype=np.float32)
+        self.input_signal = np.ascontiguousarray(input_signal, dtype=np.float32)
         self.bvals = bvals
         self.bvecs = bvecs
         self.model = model
@@ -979,18 +1033,33 @@ class FodfPredictionWorker(QRunnable):
             bvecs_t = torch.from_numpy(bvecs.astype(np.float32)).unsqueeze(0).to(self.device)
             vol_mask_t = torch.from_numpy(vol_mask).unsqueeze(0).to(self.device)
 
-            signal = self.input_slice_nhw
+            signal = self.input_signal.copy()
             if n < max_n:
-                signal = np.pad(signal, ((0, max_n - n), (0, 0), (0, 0)))
+                if signal.ndim == 3:
+                    signal = np.pad(signal, ((0, max_n - n), (0, 0), (0, 0)))
+                elif signal.ndim == 4:
+                    signal = np.pad(signal, ((0, max_n - n), (0, 0), (0, 0), (0, 0)))
+                else:
+                    raise ValueError(f"Unexpected fODF input signal shape: {signal.shape}")
 
             b0_idx = self.bvals < self.b0_threshold
-            if b0_idx.any():
-                b0_slice = self.input_slice_nhw[:n][b0_idx].mean(axis=0)
+            if signal.ndim == 3:
+                if b0_idx.any():
+                    b0_slice = self.input_signal[:n][b0_idx].mean(axis=0)
+                else:
+                    b0_slice = self.input_signal[:n].mean(axis=0)
+                b0_norm = compute_b0_norm(b0_slice)
+                if b0_norm > 0:
+                    signal = signal / b0_norm
             else:
-                b0_slice = self.input_slice_nhw[:n].mean(axis=0)
-            b0_norm = compute_b0_norm(b0_slice)
-            if b0_norm > 0:
-                signal = signal / b0_norm
+                for depth_idx in range(signal.shape[1]):
+                    if b0_idx.any():
+                        b0_slice = self.input_signal[:n, depth_idx][b0_idx].mean(axis=0)
+                    else:
+                        b0_slice = self.input_signal[:n, depth_idx].mean(axis=0)
+                    b0_norm = compute_b0_norm(b0_slice)
+                    if b0_norm > 0:
+                        signal[:, depth_idx] = signal[:, depth_idx] / b0_norm
 
             signal_t = torch.from_numpy(np.ascontiguousarray(signal)).unsqueeze(0).to(self.device)
 
@@ -1169,6 +1238,7 @@ class DatasetViewer(QMainWindow):
         self.model: QSpaceUNet | None = None
         self.fodf_model: QSpaceUNet | None = None
         self.fodf_channels = 0
+        self.fodf_sh_order = cfg.TRAIN_FODF_SH_ORDER
         self.dti_scale = 1.0
         self.max_bval = 1000.0
         self.fodf_max_bval = 1000.0
@@ -1192,7 +1262,7 @@ class DatasetViewer(QMainWindow):
             self.max_bval = float(dti_meta["max_bval"])
             print(
                 f"DTI model loaded from {dti_checkpoint_path} "
-                f"(epoch {dti_meta['epoch']}, device={self.device})"
+                f"(epoch {dti_meta['epoch']}, context={dti_meta['context_slices']}, device={self.device})"
             )
 
         if fodf_checkpoint_path is not None:
@@ -1201,15 +1271,26 @@ class DatasetViewer(QMainWindow):
                 self.fodf_channels = int(dti_meta["fodf_channels"]) if dti_meta is not None else 0
                 self.fodf_max_bval = float(dti_meta["max_bval"]) if dti_meta is not None else self.max_bval
                 if self.fodf_channels > 0:
-                    print(f"Reusing {fodf_checkpoint_path} for predicted fODFs.")
+                    self.fodf_sh_order = (
+                        int(dti_meta["train_fodf_sh_order"])
+                        if dti_meta is not None and dti_meta.get("train_fodf_sh_order") is not None
+                        else infer_fodf_sh_order(self.fodf_channels)
+                    )
+                    print(f"Reusing {fodf_checkpoint_path} for predicted fODFs (l={self.fodf_sh_order}).")
             else:
                 self.fodf_model, fodf_meta = load_checkpoint_model(fodf_checkpoint_path, self.device)
                 self.fodf_channels = int(fodf_meta["fodf_channels"])
                 self.fodf_max_bval = float(fodf_meta["max_bval"])
                 if self.fodf_channels > 0:
+                    self.fodf_sh_order = (
+                        int(fodf_meta["train_fodf_sh_order"])
+                        if fodf_meta.get("train_fodf_sh_order") is not None
+                        else infer_fodf_sh_order(self.fodf_channels)
+                    )
                     print(
                         f"fODF model loaded from {fodf_checkpoint_path} "
-                        f"(epoch {fodf_meta['epoch']}, device={self.device})"
+                        f"(epoch {fodf_meta['epoch']}, l={self.fodf_sh_order}, "
+                        f"context={fodf_meta['context_slices']}, device={self.device})"
                     )
                 else:
                     print(
@@ -1529,14 +1610,15 @@ class DatasetViewer(QMainWindow):
         if pred_key in self._pending_fodf_predictions or self._degradation_slider_active():
             return
 
-        input_nhw = self._get_degraded_slice_nhw("Axial", axial_slice_idx)
+        context_slices = int(getattr(self.fodf_model, "context_slices", 1))
+        input_signal = self._get_degraded_axial_context_ndhw(axial_slice_idx, context_slices)
         self._pending_fodf_predictions.add(pred_key)
         self.thread_pool.start(
             FodfPredictionWorker(
                 pred_key,
                 self.current_subject,
                 axial_slice_idx,
-                input_nhw,
+                input_signal,
                 self.current_bvals.copy(),
                 self.current_bvecs.copy(),
                 self.fodf_model,
@@ -1607,7 +1689,13 @@ class DatasetViewer(QMainWindow):
         if pred_sh is not None:
             x, y, z = voxel
             pred_sh = np.asarray(pred_sh[x, y, :], dtype=np.float32)
-        window.update_plot(subject, voxel, clean_sh, pred_sh)
+        window.update_plot(
+            subject,
+            voxel,
+            clean_sh,
+            pred_sh,
+            sh_order_max=self.fodf_sh_order,
+        )
 
     def _show_fodf_for_voxel(self, voxel: tuple[int, int, int]) -> None:
         subject = self.current_subject
@@ -1625,10 +1713,22 @@ class DatasetViewer(QMainWindow):
         self.pending_fodf_request = request
 
         if self.fodf_model is None:
-            window.update_plot(subject, voxel, clean_sh, pred_sh=None)
+            window.update_plot(
+                subject,
+                voxel,
+                clean_sh,
+                pred_sh=None,
+                sh_order_max=self.fodf_sh_order,
+            )
             return
         if self.fodf_channels <= 0:
-            window.update_plot(subject, voxel, clean_sh, pred_sh=None)
+            window.update_plot(
+                subject,
+                voxel,
+                clean_sh,
+                pred_sh=None,
+                sh_order_max=self.fodf_sh_order,
+            )
             return
         if self._degradation_slider_active():
             window.show_message(subject, voxel, "Release the degradation slider to compute the predicted fODF.")
@@ -1777,6 +1877,21 @@ class DatasetViewer(QMainWindow):
         degraded = degrade_dwi_slice(clean_nhw, self.keep_fraction, self.noise_level, rng)
         self.degraded_slice_cache[key] = degraded
         return degraded
+
+    def _get_degraded_axial_context_ndhw(
+        self,
+        slice_idx: int,
+        context_slices: int,
+    ) -> np.ndarray:
+        if context_slices <= 1:
+            return self._get_degraded_slice_nhw("Axial", slice_idx)
+        z_slices = self.current_shape[2]
+        indices = context_indices(slice_idx, z_slices, context_slices)
+        stack = [
+            self._get_degraded_slice_nhw("Axial", context_idx)
+            for context_idx in indices
+        ]
+        return np.ascontiguousarray(np.stack(stack, axis=1), dtype=np.float32)
 
     def _current_mask_slice(self) -> np.ndarray | None:
         if self.current_brain_mask is None:
