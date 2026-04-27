@@ -27,11 +27,11 @@ import pandas as pd
 import torch
 import zarr
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from .utils import (
+from ..utils import (
     dti6d_to_scalar_maps,
     fit_dti_to_6d,
     sanitize_dti6d,
@@ -41,10 +41,10 @@ from .utils import (
     _robust_limits,
     _symmetric_limits,
 )
-from .preprocessing import compute_b0_norm, compute_brain_mask_from_dwi
-from .augment import degrade_dwi_volume
-from .model import QSpaceUNet
-from .runtime import (
+from ..preprocessing import compute_b0_norm, compute_brain_mask_from_dwi
+from ..augment import degrade_dwi_volume
+from .model import DTI_CHANNELS, QSpaceUNet
+from ..runtime import (
     amp_dtype_from_name,
     autocast_context,
     configure_torch_runtime,
@@ -55,7 +55,7 @@ from .runtime import (
     require_cuda_if_requested,
     resolve_project_path,
 )
-import config as cfg
+from . import defaults as cfg
 
 
 def _load_input_dwi(
@@ -77,6 +77,15 @@ def _load_input_dwi(
     return degrade_dwi_volume(
         clean, keep_fraction=keep_fraction, rel_noise_level=noise_level, seed=seed,
     )
+
+
+def _split_prediction_channels(
+    pred: torch.Tensor,
+    fodf_channels: int,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    dti = pred[:, :DTI_CHANNELS]
+    fodf = pred[:, DTI_CHANNELS:] if fodf_channels > 0 else None
+    return dti, fodf
 
 logging.basicConfig(
     level=logging.INFO,
@@ -166,24 +175,42 @@ def predict_subject(
 
     model.eval()
     batch_size = max(1, int(batch_size))
+    base_model = getattr(model, "_orig_mod", model)
+    fodf_channels = getattr(model, "fodf_channels", base_model.fodf_channels)
+    context_slices = int(getattr(model, "context_slices", getattr(base_model, "context_slices", 1)))
+    context_radius = context_slices // 2
     with torch.inference_mode(), autocast_context(
         device, enabled=amp_enabled, dtype=amp_dtype,
     ):
         for start in range(0, Z, batch_size):
             end = min(start + batch_size, Z)
-            signal_t = torch.from_numpy(signals[start:end]).to(
+            batch_signal = signals[start:end]
+            if context_slices > 1:
+                context = []
+                for z in range(start, end):
+                    idx = [
+                        min(max(z + offset, 0), Z - 1)
+                        for offset in range(-context_radius, context_radius + 1)
+                    ]
+                    context.append(signals[idx])  # (D, N, H, W)
+                batch_signal = np.ascontiguousarray(
+                    np.stack(context, axis=0).transpose(0, 2, 1, 3, 4),
+                    dtype=np.float32,
+                )
+            signal_t = torch.from_numpy(batch_signal).to(
                 device, non_blocking=non_blocking,
             )
             signal_t = maybe_channels_last(signal_t, channels_last)
             n_batch = end - start
-            pred = model(
+            pred_all = model(
                 signal_t,
                 bvals_t.expand(n_batch, -1),
                 bvecs_t.expand(n_batch, -1, -1),
                 vol_mask_t.expand(n_batch, -1),
-            )  # (B, 6, H, W)
+            )  # (B, 6 + fodf_channels, H, W)
+            pred, _ = _split_prediction_channels(pred_all.float(), fodf_channels)
             pred_dti[:, :, start:end, :] = (
-                pred.permute(2, 3, 0, 1).float().cpu().numpy()
+                pred.permute(2, 3, 0, 1).cpu().numpy()
             )
 
     # Unscale from training range back to physical units
@@ -1031,12 +1058,34 @@ def main(args):
     max_n = ckpt["max_n"]
     feat_dim = ckpt.get("feat_dim", 64)
     channels = tuple(ckpt.get("channels", [64, 128, 256, 512]))
+    context_slices = int(ckpt.get("context_slices", 1))
+    context_fusion_layers = int(ckpt.get("context_fusion_layers", 2))
     cholesky = ckpt.get("cholesky", False)
+    fodf_channels = ckpt.get("fodf_channels", 0)
+    dti_channels = int(ckpt.get("dti_channels", DTI_CHANNELS))
     dti_scale = ckpt.get("dti_scale", 1.0)
     max_bval = ckpt.get("max_bval", 1000.0)
-    log.info("DTI scale factor: %.4f, max_bval: %.1f, cholesky: %s", dti_scale, max_bval, cholesky)
+    log.info(
+        "DTI scale factor: %.4f, max_bval: %.1f, cholesky: %s, fodf_channels: %d",
+        dti_scale,
+        max_bval,
+        cholesky,
+        fodf_channels,
+    )
+    if channels_last and context_slices > 1:
+        log.info("Disabling channels_last for %d-slice context model.", context_slices)
+        channels_last = False
 
-    raw_model = QSpaceUNet(max_n=max_n, feat_dim=feat_dim, channels=channels, cholesky=cholesky).to(device)
+    raw_model = QSpaceUNet(
+        max_n=max_n,
+        feat_dim=feat_dim,
+        channels=channels,
+        cholesky=cholesky,
+        fodf_channels=fodf_channels,
+        dti_channels=dti_channels,
+        context_slices=context_slices,
+        context_fusion_layers=context_fusion_layers,
+    ).to(device)
     raw_model.load_state_dict(ckpt["model_state_dict"])
     if channels_last:
         raw_model = raw_model.to(memory_format=torch.channels_last)

@@ -1,8 +1,8 @@
 """Preprocessing and dataset-building utilities.
 
 The production Zarr dataset stores clean DWI, fitted clean DTI targets,
-gradients, and a precomputed 3D brain mask. The brain mask is generated from
-the mean b0 image with DIPY's median_otsu in build_pretext_dataset.py.
+gradients, and a precomputed 3D brain mask. The fODF build path uses the same
+implementation and additionally stores CSD spherical-harmonic targets.
 """
 
 from __future__ import annotations
@@ -137,7 +137,7 @@ def _detect_single_shell_bval(
     b0_threshold: float = cfg.B0_THRESHOLD,
     tol: float = cfg.FODF_SINGLE_SHELL_TOL,
 ) -> float:
-    """Return the (single) non-zero b-value, or raise if multiple shells exist."""
+    """Return the single non-b0 shell, or raise when multiple shells exist."""
     bvals = np.asarray(bvals, dtype=np.float32)
     nonzero = bvals[bvals >= b0_threshold]
     if nonzero.size == 0:
@@ -155,17 +155,18 @@ def compute_fodf_sh(
     data: np.ndarray,
     gtab,
     mask: np.ndarray | None = None,
+    *,
     sh_order: int = cfg.FODF_SH_ORDER,
     roi_radii: int = cfg.FODF_RESPONSE_ROI_RADII,
     fa_thr: float = cfg.FODF_RESPONSE_FA_THR,
+    single_shell_tol: float = cfg.FODF_SINGLE_SHELL_TOL,
 ) -> tuple[np.ndarray, dict[str, object]]:
-    """Fit single-shell CSD and return SH coefficients ``(X, Y, Z, n_coeffs)``.
-
-    Uses ``auto_response_ssst`` to estimate the white-matter response function,
-    then ``ConstrainedSphericalDeconvModel`` to fit the fODF. SH coefficients
-    are returned in DIPY's default ``descoteaux07`` basis.
-    """
-    _detect_single_shell_bval(np.asarray(gtab.bvals))
+    """Fit single-shell CSD and return SH coefficients ``(X, Y, Z, n_coeffs)``."""
+    _detect_single_shell_bval(
+        np.asarray(gtab.bvals),
+        b0_threshold=cfg.B0_THRESHOLD,
+        tol=single_shell_tol,
+    )
 
     response, ratio = auto_response_ssst(
         gtab,
@@ -347,16 +348,11 @@ def save_qc_plot(
     plt.close(fig)
 
 
-def validate_store(store: zarr.Group) -> None:
+def validate_store(store: zarr.Group, *, include_fodf: bool = False) -> None:
     """Validate the production Zarr contract."""
-    required_keys = {
-        "target_dwi",
-        "target_dti_6d",
-        "target_fodf_sh",
-        "bvals",
-        "bvecs",
-        "brain_mask",
-    }
+    required_keys = {"target_dwi", "target_dti_6d", "bvals", "bvecs", "brain_mask"}
+    if include_fodf:
+        required_keys.add("target_fodf_sh")
     for subject_id in sorted(store.group_keys()):
         group = store[subject_id]
         missing = required_keys.difference(set(group.array_keys()))
@@ -365,13 +361,14 @@ def validate_store(store: zarr.Group) -> None:
 
         target_shape = group["target_dwi"].shape
         tensor_shape = group["target_dti_6d"].shape
-        fodf_shape = group["target_fodf_sh"].shape
         mask_shape = group["brain_mask"].shape
 
         if len(tensor_shape) != 4 or tensor_shape[:3] != target_shape[:3] or tensor_shape[-1:] != (6,):
             raise ValueError(f"{subject_id} invalid target_dti_6d shape: {tensor_shape}")
-        if len(fodf_shape) != 4 or fodf_shape[:3] != target_shape[:3] or fodf_shape[-1] < 1:
-            raise ValueError(f"{subject_id} invalid target_fodf_sh shape: {fodf_shape}")
+        if include_fodf:
+            fodf_shape = group["target_fodf_sh"].shape
+            if len(fodf_shape) != 4 or fodf_shape[:3] != target_shape[:3] or fodf_shape[-1] < 1:
+                raise ValueError(f"{subject_id} invalid target_fodf_sh shape: {fodf_shape}")
         if mask_shape != target_shape[:3]:
             raise ValueError(f"{subject_id} invalid brain_mask shape: {mask_shape}")
 
@@ -399,7 +396,12 @@ def validate_unique_subject_keys(entries: list[dict[str, str]]) -> None:
     raise ValueError("\n".join(lines))
 
 
-def build_pretext_dataset(args: argparse.Namespace) -> dict[str, object]:
+def build_pretext_dataset(
+    args: argparse.Namespace,
+    *,
+    settings=cfg,
+    include_fodf: bool = False,
+) -> dict[str, object]:
     """Build the clean production Zarr dataset from raw DWI files."""
     entries = sorted(find_dwi_datasets(args.data_dir), key=lambda d: d["dwi"])
     if args.max_subjects is not None:
@@ -419,23 +421,24 @@ def build_pretext_dataset(args: argparse.Namespace) -> dict[str, object]:
     store.attrs["brain_mask"] = {
         "source": "mean_b0",
         "method": "dipy.segment.mask.median_otsu",
-        "median_radius": cfg.BRAIN_MASK_MEDIAN_RADIUS,
-        "numpass": cfg.BRAIN_MASK_NUMPASS,
-        "dilate": cfg.BRAIN_MASK_DILATE,
-        "finalize_mask": cfg.BRAIN_MASK_FINALIZE,
+        "median_radius": settings.BRAIN_MASK_MEDIAN_RADIUS,
+        "numpass": settings.BRAIN_MASK_NUMPASS,
+        "dilate": settings.BRAIN_MASK_DILATE,
+        "finalize_mask": settings.BRAIN_MASK_FINALIZE,
     }
-    store.attrs["fodf"] = {
-        "method": "dipy.reconst.csdeconv.ConstrainedSphericalDeconvModel",
-        "response": "auto_response_ssst",
-        "sh_order": cfg.FODF_SH_ORDER,
-        "sh_basis": "descoteaux07",
-        "roi_radii": cfg.FODF_RESPONSE_ROI_RADII,
-        "fa_thr": cfg.FODF_RESPONSE_FA_THR,
-        "single_shell_only": True,
-    }
+    if include_fodf:
+        store.attrs["fodf"] = {
+            "method": "dipy.reconst.csdeconv.ConstrainedSphericalDeconvModel",
+            "response": "auto_response_ssst",
+            "sh_order": settings.FODF_SH_ORDER,
+            "sh_basis": "descoteaux07",
+            "roi_radii": settings.FODF_RESPONSE_ROI_RADII,
+            "fa_thr": settings.FODF_RESPONSE_FA_THR,
+            "single_shell_only": True,
+        }
     store.attrs["degradation_ranges"] = {
-        "keep_fraction": [cfg.KEEP_FRACTION_MIN, cfg.KEEP_FRACTION_MAX],
-        "noise_level": [cfg.NOISE_MIN, cfg.NOISE_MAX],
+        "keep_fraction": [settings.KEEP_FRACTION_MIN, settings.KEEP_FRACTION_MAX],
+        "noise_level": [settings.NOISE_MIN, settings.NOISE_MAX],
     }
 
     print(f"Found {len(entries)} subject entries")
@@ -447,7 +450,18 @@ def build_pretext_dataset(args: argparse.Namespace) -> dict[str, object]:
 
         brain_mask = compute_brain_mask_from_dwi(clean_dwi, bvals)
         tensor_clean_6d = tensor_to_6d(compute_dti(clean_dwi, sample["gtab"], mask=brain_mask))
-        fodf_sh, fodf_info = compute_fodf_sh(clean_dwi, sample["gtab"], mask=brain_mask)
+        fodf_sh = None
+        fodf_info = None
+        if include_fodf:
+            fodf_sh, fodf_info = compute_fodf_sh(
+                clean_dwi,
+                sample["gtab"],
+                mask=brain_mask,
+                sh_order=settings.FODF_SH_ORDER,
+                roi_radii=settings.FODF_RESPONSE_ROI_RADII,
+                fa_thr=settings.FODF_RESPONSE_FA_THR,
+                single_shell_tol=settings.FODF_SINGLE_SHELL_TOL,
+            )
 
         subject_id = entry["key"]
         group = store.create_group(subject_id)
@@ -455,11 +469,13 @@ def build_pretext_dataset(args: argparse.Namespace) -> dict[str, object]:
         group.attrs["original_subject"] = entry["subject"]
         group.attrs["original_session"] = entry["session"]
         group.attrs["original_run"] = entry["run"]
-        group.attrs["fodf"] = fodf_info
+        if fodf_info is not None:
+            group.attrs["fodf"] = fodf_info
 
         group.create_array("target_dwi", data=clean_dwi)
         group.create_array("target_dti_6d", data=tensor_clean_6d)
-        group.create_array("target_fodf_sh", data=fodf_sh)
+        if fodf_sh is not None:
+            group.create_array("target_fodf_sh", data=fodf_sh)
         group.create_array("brain_mask", data=brain_mask.astype(np.uint8))
         group.create_array("bvals", data=bvals)
         group.create_array("bvecs", data=bvecs)
@@ -469,7 +485,7 @@ def build_pretext_dataset(args: argparse.Namespace) -> dict[str, object]:
                 clean_dwi,
                 keep_fraction=args.plot_keep_fraction,
                 rel_noise_level=args.plot_noise_level,
-                seed=cfg.EVAL_DEGRADE_SEED,
+                seed=settings.EVAL_DEGRADE_SEED,
             )
             save_qc_plot(
                 subject_id=subject_id,
@@ -482,33 +498,44 @@ def build_pretext_dataset(args: argparse.Namespace) -> dict[str, object]:
                 noise_level=args.plot_noise_level,
             )
 
-    validate_store(store)
+    validate_store(store, include_fodf=include_fodf)
 
     summary = {
         "output": str(output_path.resolve()),
         "subjects": len(list(store.group_keys())),
         "qc_plot_dir": str(Path(args.plot_dir).resolve()) if args.plot_subjects > 0 else None,
+        "include_fodf": include_fodf,
     }
     print("Build complete")
     print(json.dumps(summary, indent=2))
     return summary
 
 
-def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Build the clean production Zarr dataset.")
+def build_fodf_dataset(args: argparse.Namespace, *, settings=cfg) -> dict[str, object]:
+    """Build the fODF Zarr dataset from raw DWI files."""
+    return build_pretext_dataset(args, settings=settings, include_fodf=True)
+
+
+def build_arg_parser(*, settings=cfg, include_fodf: bool = False) -> argparse.ArgumentParser:
+    description = (
+        "Build the fODF Zarr dataset with DTI and SH targets."
+        if include_fodf
+        else "Build the clean production Zarr dataset."
+    )
+    parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--data_dir", type=str, required=True, help="Directory containing DWI NIfTI + bval/bvec files")
-    parser.add_argument("--output", type=str, default=cfg.DATASET_ZARR_PATH, help="Output Zarr path")
+    parser.add_argument("--output", type=str, default=settings.DATASET_ZARR_PATH, help="Output Zarr path")
     parser.add_argument("--plot_subjects", type=int, default=3, help="Number of first subjects to export QC plots for")
-    parser.add_argument("--plot_dir", type=str, default=cfg.DATASET_QC_DIR, help="Directory to store QC plot PNGs")
-    parser.add_argument("--plot_keep_fraction", type=float, default=cfg.EVAL_KEEP_FRACTION)
-    parser.add_argument("--plot_noise_level", type=float, default=cfg.EVAL_NOISE_LEVEL)
+    parser.add_argument("--plot_dir", type=str, default=settings.DATASET_QC_DIR, help="Directory to store QC plot PNGs")
+    parser.add_argument("--plot_keep_fraction", type=float, default=settings.EVAL_KEEP_FRACTION)
+    parser.add_argument("--plot_noise_level", type=float, default=settings.EVAL_NOISE_LEVEL)
     parser.add_argument("--max_subjects", type=int, default=None, help="Optional cap for quick test runs")
     return parser
 
 
-def main(argv: list[str] | None = None) -> None:
-    args = build_arg_parser().parse_args(argv)
-    build_pretext_dataset(args)
+def main(argv: list[str] | None = None, *, settings=cfg, include_fodf: bool = False) -> None:
+    args = build_arg_parser(settings=settings, include_fodf=include_fodf).parse_args(argv)
+    build_pretext_dataset(args, settings=settings, include_fodf=include_fodf)
 
 
 if __name__ == "__main__":

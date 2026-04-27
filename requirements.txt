@@ -4,12 +4,9 @@ scikit-image
 pandas
 nibabel
 dipy
-opencv-python
 matplotlib
 PyQt6
-joblib
 zarr
 torch
-torchvision
 tensorboard
 tqdm
