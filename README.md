@@ -8,14 +8,14 @@ preprocessing, training, evaluation, and visualization.
 
 ## Pipeline
 
-For a paper-style visual walkthrough of the production flow, see
-[`src/pipeline.md`](src/pipeline.md).
+For the fODF-specific reference flow, see
+[`f-odf/Pipeline.md`](f-odf/Pipeline.md).
 
 ```text
 Raw DWI NIfTI + bval/bvec
-  -> build_pretext_dataset.py
+  -> build_dataset.py
   -> dataset/default_clean.zarr
-  -> train.py
+  -> train.py --training standard
   -> evaluate.py
 ```
 
@@ -39,12 +39,12 @@ evaluation. No degraded DWI is stored.
 ## Build The Dataset
 
 ```bash
-python build_pretext_dataset.py \
+python build_dataset.py \
   --data_dir dataset/dataset_v1 \
   --output dataset/default_clean.zarr
 ```
 
-`build_pretext_dataset.py` computes `brain_mask` with
+`build_dataset.py` computes `brain_mask` with
 `dipy.segment.mask.median_otsu` on the mean b0 volume and stores it in Zarr.
 Older Zarr stores without `brain_mask` still run, but training will recompute
 the mask at startup and warn you to rebuild for production.
@@ -53,6 +53,8 @@ the mask at startup and warn you to rebuild for production.
 
 ```bash
 python train.py
+python train.py --training standard
+python train.py --training f-odf
 ```
 
 Defaults come from `config.py`, including:
@@ -67,6 +69,7 @@ Useful overrides:
 
 ```bash
 python train.py --epochs 200 --batch_size 8 --out_dir runs/my_run
+python train.py --training f-odf --epochs 220 --batch_size 8
 tensorboard --logdir runs/production/tb
 ```
 
@@ -96,6 +99,8 @@ python evaluate.py --no-patch2self
 
 All production defaults live in `config.py`. CLI arguments reference those
 defaults and are meant for temporary overrides, not as a second config system.
+The standard FA/MD path uses the unprefixed defaults; fODF uses the `FODF_*`
+section through `src/dw_thi/f_odf/defaults.py`.
 
 Key sections:
 
@@ -119,7 +124,8 @@ src/dw_thi/
   evaluate.py       # Evaluation and baselines
   runtime.py        # CUDA/MPS/runtime helpers
   utils.py          # Metrics and plotting helpers
+  f_odf/            # fODF-specific dataset, model, loss, train, eval, visualizer
 ```
 
-Root scripts (`build_pretext_dataset.py`, `train.py`, `evaluate.py`) are thin
-entry points into this package.
+Root scripts (`build_dataset.py`, `train.py`, `evaluate.py`) are thin entry
+points into the standard package. fODF wrappers and notes live in `f-odf/`.

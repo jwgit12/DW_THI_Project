@@ -43,14 +43,17 @@ def configure_torch_runtime(
     matmul_precision: str = "high",
     deterministic: bool = False,
 ) -> None:
-    """Enable the fast CUDA defaults that matter for RTX 40-series GPUs."""
-    if device.type != "cuda":
-        return
-
+    """Enable accelerator-specific runtime defaults."""
     try:
         torch.set_float32_matmul_precision(matmul_precision)
     except Exception as exc:
         log.debug("Could not set float32 matmul precision: %s", exc)
+
+    if device.type == "mps":
+        log.info("MPS backend active")
+        return
+    if device.type != "cuda":
+        return
 
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -98,14 +101,37 @@ def default_num_workers(requested: int | None) -> int:
     return min(4, max(1, cpu_count // 2))
 
 
+def should_pin_memory(
+    device: torch.device,
+    *,
+    requested: bool,
+    num_workers: int,
+) -> bool:
+    """Return whether DataLoader pinning should stay enabled for this runtime."""
+    if device.type != "cuda" or not requested:
+        return False
+    if platform.system() == "Windows" and num_workers > 0:
+        log.warning(
+            "Disabling DataLoader pin_memory on Windows when num_workers=%d to "
+            "avoid CUDA 'resource already mapped' failures in the pin-memory thread.",
+            num_workers,
+        )
+        return False
+    return True
+
+
 def amp_dtype_from_name(device: torch.device, name: str) -> torch.dtype | None:
-    if device.type != "cuda":
+    if device.type not in {"cuda", "mps"}:
         return None
 
     normalized = name.lower()
     if normalized == "auto":
+        if device.type == "mps":
+            return torch.bfloat16
         return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     if normalized == "bf16":
+        if device.type == "mps":
+            return torch.bfloat16
         if torch.cuda.is_bf16_supported():
             return torch.bfloat16
         log.warning("bf16 AMP requested but unsupported; falling back to fp16")
