@@ -22,7 +22,7 @@ from torch.utils.data import Dataset
 import zarr
 
 import config as cfg
-from .augment import degrade_dwi_slice
+from .augment import degrade_dwi_slice, flip_bvecs, flip_dti6d_sign
 from .preprocessing import compute_b0_norm, compute_brain_mask_from_dwi
 from .runtime import path_str
 
@@ -39,32 +39,6 @@ def _get_zarr_group(zarr_path: str) -> zarr.Group:
     if zarr_path not in _process_zarr_stores:
         _process_zarr_stores[zarr_path] = zarr.open_group(zarr_path, mode="r")
     return _process_zarr_stores[zarr_path]
-
-
-# Order of channels in the stored 6D tensor: Dxx, Dxy, Dyy, Dxz, Dyz, Dzz.
-# When the image is mirrored along world axis a, the tensor transforms as
-# D' = F_a D F_a^T, which flips the sign of every off-diagonal that touches a.
-_DTI6D_OFFDIAG_SIGN = {
-    # world_axis -> list of (channel_index_to_negate,)
-    0: (1, 3),  # x-flip: Dxy, Dxz
-    1: (1, 4),  # y-flip: Dxy, Dyz
-    2: (3, 4),  # z-flip: Dxz, Dyz
-}
-
-
-def _flip_dti6d_sign(tgt_chw: np.ndarray, world_axis: int) -> np.ndarray:
-    """Return a copy of ``tgt_chw`` with off-diagonals sign-flipped for axis."""
-    out = tgt_chw.copy()
-    for c in _DTI6D_OFFDIAG_SIGN[world_axis]:
-        out[c] = -out[c]
-    return out
-
-
-def _flip_bvecs(bvecs_3n: np.ndarray, world_axis: int) -> np.ndarray:
-    """Negate the component of ``bvecs`` that matches the flipped world axis."""
-    out = bvecs_3n.copy()
-    out[world_axis] = -out[world_axis]
-    return out
 
 
 class DWISliceDataset(Dataset):
@@ -327,14 +301,14 @@ class DWISliceDataset(Dataset):
                     input_nhw = input_nhw[:, ::-1, :]
                     tgt_chw = tgt_chw[:, ::-1, :]
                     bmask_hw = bmask_hw[::-1, :]
-                    tgt_chw = _flip_dti6d_sign(tgt_chw, world_axis=h_world)
-                    bvecs_n = _flip_bvecs(bvecs_n, world_axis=h_world)
+                    tgt_chw = flip_dti6d_sign(tgt_chw, world_axis=h_world)
+                    bvecs_n = flip_bvecs(bvecs_n, world_axis=h_world)
                 if random.random() > 0.5:
                     input_nhw = input_nhw[:, :, ::-1]
                     tgt_chw = tgt_chw[:, :, ::-1]
                     bmask_hw = bmask_hw[:, ::-1]
-                    tgt_chw = _flip_dti6d_sign(tgt_chw, world_axis=w_world)
-                    bvecs_n = _flip_bvecs(bvecs_n, world_axis=w_world)
+                    tgt_chw = flip_dti6d_sign(tgt_chw, world_axis=w_world)
+                    bvecs_n = flip_bvecs(bvecs_n, world_axis=w_world)
                 input_nhw = np.ascontiguousarray(input_nhw)
                 tgt_chw = np.ascontiguousarray(tgt_chw)
                 bmask_hw = np.ascontiguousarray(bmask_hw)

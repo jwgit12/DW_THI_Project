@@ -114,6 +114,36 @@ def degrade_dwi_volume(
 
 
 # ---------------------------------------------------------------------------
+# Spatial-flip transforms (shared by the standard and fODF datasets)
+# ---------------------------------------------------------------------------
+
+# Order of channels in the stored 6D tensor: Dxx, Dxy, Dyy, Dxz, Dyz, Dzz.
+# When the image is mirrored along world axis a, the tensor transforms as
+# D' = F_a D F_a^T, which flips the sign of every off-diagonal that touches a.
+DTI6D_OFFDIAG_SIGN = {
+    # world_axis -> tuple of channel indices to negate
+    0: (1, 3),  # x-flip: Dxy, Dxz
+    1: (1, 4),  # y-flip: Dxy, Dyz
+    2: (3, 4),  # z-flip: Dxz, Dyz
+}
+
+
+def flip_dti6d_sign(tgt_chw: np.ndarray, world_axis: int) -> np.ndarray:
+    """Return a copy of ``tgt_chw`` with off-diagonals sign-flipped for axis."""
+    out = tgt_chw.copy()
+    for c in DTI6D_OFFDIAG_SIGN[world_axis]:
+        out[c] = -out[c]
+    return out
+
+
+def flip_bvecs(bvecs_3n: np.ndarray, world_axis: int) -> np.ndarray:
+    """Negate the component of ``bvecs`` that matches the flipped world axis."""
+    out = bvecs_3n.copy()
+    out[world_axis] = -out[world_axis]
+    return out
+
+
+# ---------------------------------------------------------------------------
 # GPU degradation helpers (cuFFT — ~50× faster than CPU scipy path)
 # ---------------------------------------------------------------------------
 

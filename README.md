@@ -1,22 +1,27 @@
 # DW_THI_Project
 
-Production-ready DWI preprocessing, QSpaceUNet training, and evaluation for
-clean DWI -> 6D DTI tensor prediction.
+DWI preprocessing, QSpaceUNet training, and evaluation. Two pipelines share
+the same Zarr dataset format and on-the-fly degradation:
 
-The stable pipeline lives in `src/dw_thi/`, with thin root entry points for
-preprocessing, training, evaluation, and visualization.
+- **Standard FA/MD** — predict the 6D DTI tensor (`src/dw_thi/`)
+- **fODF** — predict single-shell CSD SH coefficients (`src/fodf/`)
+
+Shared infrastructure (preprocessing, augmentation, runtime helpers, metric
+utilities) lives in `src/dw_thi/` and is imported by both packages. Root-level
+entry points dispatch to the requested pipeline.
 
 ## Pipeline
 
 For the fODF-specific reference flow, see
-[`f-odf/Pipeline.md`](f-odf/Pipeline.md).
+[`src/fodf/Pipeline.md`](src/fodf/Pipeline.md).
 
 ```text
 Raw DWI NIfTI + bval/bvec
-  -> build_dataset.py
+  -> build_dataset.py            # standard target_dti_6d
+  -> build_fodf_dataset.py       # standard target + target_fodf_sh
   -> dataset/default_clean.zarr
-  -> train.py --training standard
-  -> evaluate.py
+  -> train.py --training {standard,f-odf}
+  -> evaluate.py --training {standard,f-odf}
 ```
 
 ## Dataset Contract
@@ -39,9 +44,15 @@ evaluation. No degraded DWI is stored.
 ## Build The Dataset
 
 ```bash
+# Standard FA/MD targets only
 python build_dataset.py \
   --data_dir dataset/dataset_v1 \
   --output dataset/default_clean.zarr
+
+# fODF: same DTI targets plus single-shell CSD SH coefficients
+python build_fodf_dataset.py \
+  --data_dir dataset/dataset_v1 \
+  --output dataset/default_odf.zarr
 ```
 
 `build_dataset.py` computes `brain_mask` with
@@ -84,10 +95,15 @@ GPU-side k-space degradation.
 python evaluate.py \
   --checkpoint runs/production/best_model.pt \
   --zarr_path dataset/default_clean.zarr
+
+python evaluate.py --training f-odf \
+  --checkpoint runs/production_fodf_context_l4/best_model.pt \
+  --zarr_path dataset/default_odf.zarr
 ```
 
-Evaluation writes CSV metrics and plots to `runs/evaluation` by default. It
-can run QSpaceUNet alone or include Patch2Self and MP-PCA baselines:
+Evaluation writes CSV metrics and plots to `runs/evaluation` (standard) or
+`runs/evaluation_fodf` (fODF) by default. Both pipelines support comparison
+against Patch2Self and MP-PCA baselines:
 
 ```bash
 python evaluate.py --skip_baselines
@@ -100,7 +116,7 @@ python evaluate.py --no-patch2self
 All production defaults live in `config.py`. CLI arguments reference those
 defaults and are meant for temporary overrides, not as a second config system.
 The standard FA/MD path uses the unprefixed defaults; fODF uses the `FODF_*`
-section through `src/dw_thi/f_odf/defaults.py`.
+section through `src/fodf/defaults.py`.
 
 Key sections:
 
@@ -114,18 +130,33 @@ Key sections:
 ## Source Layout
 
 ```text
-src/dw_thi/
-  preprocessing.py  # DWI discovery/loading, DTI targets, median_otsu masks, Zarr build
-  dataset.py        # Zarr-backed PyTorch slice dataset
-  augment.py        # CPU/GPU k-space degradation
-  model.py          # QSpaceUNet
-  loss.py           # Masked tensor + FA/MD/edge loss
-  train.py          # TensorBoard training loop
-  evaluate.py       # Evaluation and baselines
-  runtime.py        # CUDA/MPS/runtime helpers
-  utils.py          # Metrics and plotting helpers
-  f_odf/            # fODF-specific dataset, model, loss, train, eval, visualizer
+src/dw_thi/                     # standard FA/MD pipeline + shared infra
+  preprocessing.py              # DWI discovery/loading, DTI/SH targets, masks, Zarr build
+  dataset.py                    # Zarr-backed PyTorch slice dataset
+  augment.py                    # CPU/GPU k-space degradation (shared)
+  runtime.py                    # CUDA/MPS/runtime helpers (shared)
+  utils.py                      # DTI metrics + plotting helpers (shared)
+  model.py                      # QSpaceUNet (DTI head)
+  loss.py                       # Charbonnier tensor + FA/MD + edge loss
+  train.py                      # TensorBoard training loop
+  evaluate.py                   # Evaluation and baselines
+
+src/fodf/                       # fODF pipeline (sibling of dw_thi)
+  defaults.py                   # Reads FODF_* knobs from config.py
+  dataset.py                    # 2.5D context slices + fODF SH targets
+  model.py                      # QSpaceUNet variant emitting SH coefficients
+  loss.py                       # Band/peak/anisotropic correlation losses
+  train.py                      # fODF training loop
+  evaluate.py                   # fODF eval + MRtrix CSD baseline
+  Pipeline.md                   # Detailed transformation reference
 ```
 
-Root scripts (`build_dataset.py`, `train.py`, `evaluate.py`) are thin entry
-points into the standard package. fODF wrappers and notes live in `f-odf/`.
+Root scripts dispatch to the right package:
+
+| Script | Notes |
+|---|---|
+| `build_dataset.py` | Standard build (clean DWI + DTI targets + brain mask) |
+| `build_fodf_dataset.py` | Same plus single-shell CSD SH targets |
+| `train.py` | Dispatcher: `--training {standard,f-odf}` |
+| `evaluate.py` | Dispatcher: `--training {standard,f-odf}` |
+| `visualizer.py` | Unified Qt viewer (handles standard, fODF, or both — pass `--checkpoint` for auto-routing or `--dti_checkpoint`/`--fodf_checkpoint` explicitly) |

@@ -516,7 +516,7 @@ def build_fodf_dataset(args: argparse.Namespace, *, settings=cfg) -> dict[str, o
     return build_pretext_dataset(args, settings=settings, include_fodf=True)
 
 
-def build_arg_parser(*, settings=cfg, include_fodf: bool = False) -> argparse.ArgumentParser:
+def build_arg_parser(*, settings=cfg, include_fodf: bool = True) -> argparse.ArgumentParser:
     description = (
         "Build the fODF Zarr dataset with DTI and SH targets."
         if include_fodf

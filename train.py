@@ -20,9 +20,9 @@ TRAINING_MODULES = {
     "fa-md": "dw_thi.train",
     "fa_md": "dw_thi.train",
     "famd": "dw_thi.train",
-    "f-odf": "dw_thi.f_odf.train",
-    "f_odf": "dw_thi.f_odf.train",
-    "fodf": "dw_thi.f_odf.train",
+    "f-odf": "fodf.train",
+    "f_odf": "fodf.train",
+    "fodf": "fodf.train",
 }
 
 

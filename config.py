@@ -9,7 +9,7 @@ the same constants.  CLI argument defaults should reference these too.
 # ─────────────────────────────────────────────────────────────────────────────
 DATASET_ZARR_PATH = "dataset/default_clean.zarr"
 DATASET_QC_DIR = "dataset/default_clean_qc"
-TRAIN_OUT_DIR = "runs/production"
+TRAIN_OUT_DIR = "runs/production_6d"
 EVAL_OUT_DIR = "runs/evaluation"
 SEED = 42
 
@@ -18,8 +18,8 @@ SEED = 42
 # sees different noise and k-space cutouts for the same clean slice. The
 # dataset build stores only the clean DWI; there is no pre-degraded array.
 # ─────────────────────────────────────────────────────────────────────────────
-NOISE_MIN = 0.01              # minimum relative Gaussian noise level
-NOISE_MAX = 0.10              # maximum relative Gaussian noise level
+NOISE_MIN = 0.05              # minimum relative Gaussian noise level
+NOISE_MAX = 0.25              # maximum relative Gaussian noise level
 KEEP_FRACTION_MIN = 0.5       # min central k-space fraction kept
 KEEP_FRACTION_MAX = 0.7       # max central k-space fraction kept
 
@@ -70,8 +70,8 @@ VAL_SUBJECTS = ["sub-05", "sub-11"]
 # ─────────────────────────────────────────────────────────────────────────────
 # Model architecture
 # ─────────────────────────────────────────────────────────────────────────────
-FEAT_DIM = 128                # q-space encoder feature dimension (matches channels[0])
-UNET_CHANNELS = [128, 256, 512]  # 3 encoder levels; factor=8 fits (132, 130) easily
+FEAT_DIM = 64                # q-space encoder feature dimension (matches channels[0])
+UNET_CHANNELS = [64, 128, 256]  # 3 encoder levels; factor=8 fits (132, 130) easily
 DROPOUT = 0.1                # spatial dropout rate in U-Net conv blocks
 LAMBDA_SCALAR = 0.3          # weight for FA/MD auxiliary loss
 LAMBDA_EDGE = 0.1            # weight for FA spatial-gradient (edge) loss
@@ -80,18 +80,18 @@ LAMBDA_EDGE = 0.1            # weight for FA spatial-gradient (edge) loss
 # Training
 # ─────────────────────────────────────────────────────────────────────────────
 EPOCHS = 150
-BATCH_SIZE = 32
+BATCH_SIZE = 16
 LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 1e-4
 PATIENCE = 25                # early stopping patience (epochs)
 GRAD_CLIP = 1.0              # gradient norm clipping value
 WARMUP_EPOCHS = 5            # linear LR warmup before cosine annealing
 VIS_EVERY = 1                # TensorBoard validation figure cadence
-NUM_WORKERS = 4            # -1 = OS-aware auto
+NUM_WORKERS = 0            # -1 = OS-aware auto
 PREFETCH_FACTOR = 2          # DataLoader prefetch per worker
-AMP = True
+AMP = False
 AMP_DTYPE = "auto"           # 'auto' | 'bf16' | 'fp16'
-CHANNELS_LAST = True         # CUDA-only channels-last conv layout
+CHANNELS_LAST = False         # CUDA-only channels-last conv layout
 COMPILE = "auto"             # 'off' | 'auto' | 'on'
 COMPILE_MODE = "max-autotune"
 FUSED_ADAMW = True           # CUDA-only fused optimizer when available
@@ -117,11 +117,11 @@ PROFILE_EXIT_AFTER_CAPTURE = False
 # fODF training mode
 # ─────────────────────────────────────────────────────────────────────────────
 # The standard FA/MD path uses the unprefixed values above. The isolated
-# ``dw_thi.f_odf`` package reads these FODF_* values through
-# ``dw_thi.f_odf.defaults`` so both modes still share this single config file.
+# ``fodf`` package reads these FODF_* values through ``fodf.defaults`` so both
+# modes still share this single config file.
 FODF_DATASET_ZARR_PATH = "dataset/default_odf.zarr"
 FODF_DATASET_QC_DIR = "dataset/default_odf_qc"
-FODF_TRAIN_OUT_DIR = "runs/production_fodf_context_l4"
+FODF_TRAIN_OUT_DIR = "runs/production_fodf"
 FODF_EVAL_OUT_DIR = "runs/evaluation_fodf"
 
 FODF_NOISE_MIN = 0.02
@@ -146,7 +146,7 @@ FODF_AUG_FLIP = True
 FODF_AUG_INTENSITY = 0.1
 FODF_AUG_VOLUME_DROPOUT = 0.02
 
-FODF_SH_ORDER = 8
+FODF_SH_ORDER = 4
 FODF_TRAIN_SH_ORDER = 4
 FODF_RESPONSE_ROI_RADII = 10
 FODF_RESPONSE_FA_THR = 0.7

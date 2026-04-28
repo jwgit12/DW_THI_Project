@@ -31,20 +31,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from ..utils import (
-    dti6d_to_scalar_maps,
-    fit_dti_to_6d,
-    sanitize_dti6d,
-    scalar_map_metrics,
-    save_prediction_slice_plot,
-    select_plot_indices,
-    _robust_limits,
-    _symmetric_limits,
-)
-from ..preprocessing import compute_b0_norm, compute_brain_mask_from_dwi
-from ..augment import degrade_dwi_volume
-from .model import DTI_CHANNELS, QSpaceUNet
-from ..runtime import (
+from dw_thi.augment import degrade_dwi_volume
+from dw_thi.preprocessing import compute_b0_norm, compute_brain_mask_from_dwi
+from dw_thi.runtime import (
     amp_dtype_from_name,
     autocast_context,
     configure_torch_runtime,
@@ -55,7 +44,19 @@ from ..runtime import (
     require_cuda_if_requested,
     resolve_project_path,
 )
+from dw_thi.utils import (
+    dti6d_to_scalar_maps,
+    fit_dti_to_6d,
+    sanitize_dti6d,
+    scalar_map_metrics,
+    save_prediction_slice_plot,
+    select_plot_indices,
+    _robust_limits,
+    _symmetric_limits,
+)
+
 from . import defaults as cfg
+from .model import DTI_CHANNELS, QSpaceUNet
 
 
 def _load_input_dwi(

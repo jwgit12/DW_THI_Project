@@ -47,12 +47,8 @@ try:
 except ImportError:  # pragma: no cover - exercised only in incomplete envs
     SummaryWriter = None
 
-from . import defaults as cfg
-from ..augment import gpu_b0_normalize_batch, gpu_degrade_dwi_batch
-from .dataset import DWISliceDataset, dwi_worker_init
-from .loss import FodfLoss
-from .model import QSpaceUNet
-from ..runtime import (
+from dw_thi.augment import gpu_b0_normalize_batch, gpu_degrade_dwi_batch
+from dw_thi.runtime import (
     amp_dtype_from_name,
     autocast_context,
     configure_torch_runtime,
@@ -65,6 +61,11 @@ from ..runtime import (
     resolve_project_path,
     should_pin_memory,
 )
+
+from . import defaults as cfg
+from .dataset import DWISliceDataset, dwi_worker_init
+from .loss import FodfLoss
+from .model import QSpaceUNet
 
 logging.basicConfig(
     level=logging.INFO,
