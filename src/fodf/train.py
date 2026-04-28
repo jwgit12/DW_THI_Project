@@ -859,6 +859,13 @@ def main(args: argparse.Namespace) -> None:
     }
     if num_workers > 0:
         loader_kwargs["prefetch_factor"] = args.prefetch_factor
+    else:
+        # Single-process loading (MPS / debugging) — preload subjects into the
+        # main process so __getitem__ avoids per-slice zarr chunk reads.
+        from .dataset import preload_dataset_in_worker
+        log.info("Preloading dataset into main process (num_workers=0)")
+        preload_dataset_in_worker(train_ds, preload_fodf=cfg.PRELOAD_FODF)
+        preload_dataset_in_worker(val_ds, preload_fodf=cfg.PRELOAD_FODF)
 
     train_loader = DataLoader(
         train_ds,

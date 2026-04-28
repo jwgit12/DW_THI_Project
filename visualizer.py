@@ -62,7 +62,11 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from dw_thi.augment import degrade_dwi_slice, degrade_dwi_volume
-from dw_thi.preprocessing import compute_b0_norm, compute_brain_mask_from_dwi
+from dw_thi.preprocessing import (
+    compute_b0_norm,
+    compute_brain_mask_from_dwi,
+    load_or_fit_target_dti_6d,
+)
 from dw_thi.runtime import get_device
 from dw_thi.utils import (
     compute_fa_from_tensor6,
@@ -909,21 +913,25 @@ class WorkerSignals(QObject):
 
 
 class MetricsWorker(QRunnable):
-    """Loads a DTI tensor slice from zarr and computes FA/MD/ColorFA off the main thread."""
+    """Computes FA/MD/ColorFA for one slice of a preloaded DTI volume.
+
+    The volume is loaded (or fitted on the fly for fODF-only stores) once per
+    subject and passed in here so each slice request just indexes the cache.
+    """
 
     def __init__(self, subject: str, plane: str, slice_idx: int,
-                 zarr_group, signals: WorkerSignals):
+                 target_dti_6d: np.ndarray, signals: WorkerSignals):
         super().__init__()
         self.subject = subject
         self.plane = plane
         self.slice_idx = slice_idx
-        self.zarr_group = zarr_group
+        self.target_dti_6d = target_dti_6d
         self.signals = signals
         self.setAutoDelete(True)
 
     def run(self) -> None:
         try:
-            tensor6 = extract_tensor_slice(self.zarr_group["target_dti_6d"], self.plane, self.slice_idx)
+            tensor6 = extract_tensor_slice(self.target_dti_6d, self.plane, self.slice_idx)
             result = compute_dti_metrics(tensor6)
             self.signals.metrics_ready.emit(self.subject, self.plane, self.slice_idx, result)
         except Exception as exc:
@@ -1274,6 +1282,9 @@ class DatasetViewer(QMainWindow):
         self.current_brain_mask_source = ""
         self.brain_mask_cache: dict[str, np.ndarray] = {}
         self.brain_mask_source_cache: dict[str, str] = {}
+        # Cached full-volume DTI 6D per subject — also fitted on the fly when
+        # a fODF-only store omits target_dti_6d.
+        self.target_dti_6d_cache: dict[str, np.ndarray] = {}
         self.degraded_slice_cache: dict[tuple, np.ndarray] = {}
         self.noisy_metric_cache: dict[tuple, dict] = {}
         self.slice_metric_cache: dict[tuple, dict] = {}
@@ -1838,6 +1849,21 @@ class DatasetViewer(QMainWindow):
         self._update_subject_summary()
         self._update_view()
 
+    def _get_target_dti_6d(self, subject_name: str) -> np.ndarray:
+        cached = self.target_dti_6d_cache.get(subject_name)
+        if cached is not None:
+            return cached
+        group = self.store[subject_name]
+        if "target_dti_6d" not in set(group.array_keys()):
+            print(
+                f"[visualizer] {subject_name} has no stored target_dti_6d; "
+                "fitting on the fly from clean DWI (this can take a few seconds).",
+                file=sys.stderr,
+            )
+        volume = load_or_fit_target_dti_6d(group, b0_threshold=cfg.B0_THRESHOLD)
+        self.target_dti_6d_cache[subject_name] = volume
+        return volume
+
     def _get_brain_mask(self, subject_name: str) -> np.ndarray:
         if subject_name in self.brain_mask_cache:
             return self.brain_mask_cache[subject_name]
@@ -2044,7 +2070,8 @@ class DatasetViewer(QMainWindow):
             self.thread_pool.start(
                 MetricsWorker(
                     self.current_subject, self.plane, slice_idx,
-                    self.current_group, self.worker_signals,
+                    self._get_target_dti_6d(self.current_subject),
+                    self.worker_signals,
                 )
             )
 
@@ -2086,8 +2113,10 @@ class DatasetViewer(QMainWindow):
         cached = self.slice_metric_cache.get(metrics_key)
         if cached is not None:
             return cached["fa"]
-        # Fallback: compute on demand from the target tensor slice.
-        tensor6 = extract_tensor_slice(self.current_group["target_dti_6d"], self.plane, slice_idx)
+        # Fallback: compute on demand from the cached/fitted DTI volume.
+        tensor6 = extract_tensor_slice(
+            self._get_target_dti_6d(self.current_subject), self.plane, slice_idx,
+        )
         return np.asarray(compute_fa_from_tensor6(tensor6), dtype=np.float32)
 
     def _placeholder_panel(self, name: str, message: str) -> None:
@@ -2112,9 +2141,7 @@ class DatasetViewer(QMainWindow):
             elif self.current_subject not in self._pending_clean_tracts:
                 self._pending_clean_tracts.add(self.current_subject)
                 self._placeholder_panel("Tracts (Clean)", "Tracking…")
-                tensor6_volume = np.asarray(
-                    self.current_group["target_dti_6d"][:], dtype=np.float32
-                )
+                tensor6_volume = self._get_target_dti_6d(self.current_subject)
                 self.thread_pool.start(
                     CleanTractWorker(
                         self.current_subject, tensor6_volume,

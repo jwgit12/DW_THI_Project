@@ -1,8 +1,8 @@
 """DWI slice dataset with on-the-fly degradation and multi-axis slicing.
 
 The Zarr store holds only clean data (`target_dwi`, `target_dti_6d`,
-`bvals`, `bvecs`, `brain_mask`). The noisy model input is synthesized on the fly in
-`__getitem__`, so every epoch sees a different noise realisation and a
+`bvals`, `bvecs`, `brain_mask`). The noisy model input is synthesized on the
+fly in `__getitem__`, so every epoch sees a different noise realisation and a
 different k-space cutout for the same underlying slice.
 
 Slices can be drawn from any of the three spatial axes; padding to a
@@ -29,8 +29,8 @@ from .runtime import path_str
 log = logging.getLogger(__name__)
 
 # Process-local zarr store cache — one open store per (process, path).
-# Each DataLoader worker (spawned process on Windows) gets its own entry
-# on first __getitem__ call, so we never pickle the large zarr store object.
+# Each DataLoader worker (spawned process on Windows) gets its own entry on
+# first __getitem__ call, so we never pickle the large zarr store object.
 _process_zarr_stores: dict[str, zarr.Group] = {}
 
 
@@ -39,6 +39,25 @@ def _get_zarr_group(zarr_path: str) -> zarr.Group:
     if zarr_path not in _process_zarr_stores:
         _process_zarr_stores[zarr_path] = zarr.open_group(zarr_path, mode="r")
     return _process_zarr_stores[zarr_path]
+
+
+def _spatial_slice(array, axis: int, index: int):
+    if axis == 0:
+        return array[index]
+    if axis == 1:
+        return array[:, index]
+    return array[:, :, index]
+
+
+def _slice_to_chw(arr, axis: int, index: int) -> np.ndarray:
+    """Slice ``(X, Y, Z, C)`` along ``axis`` → contiguous ``(C, H, W)`` float32.
+
+    Folds slice + transpose + contiguous-copy into a single allocation. Works
+    with both numpy arrays and zarr Arrays (zarr's ``__getitem__`` already
+    materialises a numpy view).
+    """
+    sl = _spatial_slice(arr, axis, index)
+    return np.ascontiguousarray(np.asarray(sl).transpose(2, 0, 1), dtype=np.float32)
 
 
 class DWISliceDataset(Dataset):
@@ -77,6 +96,7 @@ class DWISliceDataset(Dataset):
         eval_noise_level: float = cfg.EVAL_NOISE_LEVEL,
         eval_seed: int = cfg.EVAL_DEGRADE_SEED,
         gpu_degrade: bool = False,
+        preload: bool = False,
     ):
         self.zarr_path = path_str(zarr_path)
         self.subject_keys = list(subject_keys)
@@ -124,11 +144,7 @@ class DWISliceDataset(Dataset):
             bvals = np.asarray(grp["bvals"][:], dtype=np.float32)
             bvecs = np.asarray(grp["bvecs"][:], dtype=np.float32)
 
-            # Only keep the small arrays; large DWI/DTI arrays are freed below.
-            self._data[key] = {
-                "bvals": bvals,
-                "bvecs": bvecs,
-            }
+            self._data[key] = {"bvals": bvals, "bvecs": bvecs}
 
             target_dwi_for_mask = None
             if self.use_brain_mask and "brain_mask" in set(grp.array_keys()):
@@ -163,8 +179,6 @@ class DWISliceDataset(Dataset):
                 max_h = max(max_h, other[0])
                 max_w = max(max_w, other[1])
 
-            # Free the large arrays immediately — they are loaded lazily per
-            # slice in __getitem__ so there is no need to keep them in RAM.
             del target_dti
             if target_dwi_for_mask is not None:
                 del target_dwi_for_mask
@@ -179,6 +193,9 @@ class DWISliceDataset(Dataset):
             self.dti_scale = float(1.0 / np.percentile(pooled, 99))
         else:
             self.dti_scale = 1.0
+
+        if preload:
+            preload_dataset_in_worker(self)
 
     # -------------------------------------------------------------------------
     # Dataset protocol
@@ -200,48 +217,28 @@ class DWISliceDataset(Dataset):
         preloaded = getattr(self, "_preloaded", None)
 
         if preloaded is not None:
-            # ── In-worker RAM path (fast) ───────────────────────────────────
             arr_dwi = preloaded[key]["target_dwi"]
             arr_dti = preloaded[key]["target_dti_6d"]
-            if axis == 0:
-                clean = arr_dwi[s].copy()                 # (Y, Z, N)
-                tgt   = arr_dti[s].copy()                 # (Y, Z, 6)
-                bmask = bmask_3d[s] if bmask_3d is not None else None
-            elif axis == 1:
-                clean = arr_dwi[:, s].copy()              # (X, Z, N)
-                tgt   = arr_dti[:, s].copy()              # (X, Z, 6)
-                bmask = bmask_3d[:, s] if bmask_3d is not None else None
-            else:
-                clean = arr_dwi[:, :, s].copy()           # (X, Y, N)
-                tgt   = arr_dti[:, :, s].copy()           # (X, Y, 6)
-                bmask = bmask_3d[:, :, s] if bmask_3d is not None else None
+            clean_nhw = _slice_to_chw(arr_dwi, axis, s)
+            tgt_chw = _slice_to_chw(arr_dti, axis, s)
         else:
-            # ── Lazy-load the required 2D slice from zarr ──────────────────
             # _get_zarr_group caches the store handle per process, so each
             # DataLoader worker opens the store once and reuses it.
             grp = _get_zarr_group(self.zarr_path)[key]
-            if axis == 0:
-                clean = np.asarray(grp["target_dwi"][s], dtype=np.float32)        # (Y, Z, N)
-                tgt   = np.asarray(grp["target_dti_6d"][s], dtype=np.float32)     # (Y, Z, 6)
-                bmask = bmask_3d[s] if bmask_3d is not None else None
-            elif axis == 1:
-                clean = np.asarray(grp["target_dwi"][:, s], dtype=np.float32)     # (X, Z, N)
-                tgt   = np.asarray(grp["target_dti_6d"][:, s], dtype=np.float32)  # (X, Z, 6)
-                bmask = bmask_3d[:, s] if bmask_3d is not None else None
-            else:
-                clean = np.asarray(grp["target_dwi"][:, :, s], dtype=np.float32)     # (X, Y, N)
-                tgt   = np.asarray(grp["target_dti_6d"][:, :, s], dtype=np.float32)  # (X, Y, 6)
-                bmask = bmask_3d[:, :, s] if bmask_3d is not None else None
+            clean_nhw = _slice_to_chw(grp["target_dwi"], axis, s)
+            tgt_chw = _slice_to_chw(grp["target_dti_6d"], axis, s)
 
-        # (H, W, C) -> (C, H, W) channel-first; contiguous for later in-place ops.
-        clean_nhw = np.ascontiguousarray(clean.transpose(2, 0, 1))     # (N, H, W)
-        tgt_chw = np.ascontiguousarray(tgt.transpose(2, 0, 1))         # (6, H, W)
+        bmask = (
+            _spatial_slice(bmask_3d, axis, s) if bmask_3d is not None else None
+        )
         if bmask is not None:
-            bmask_hw = np.ascontiguousarray(bmask.astype(np.float32))
+            bmask_hw = np.ascontiguousarray(bmask, dtype=np.float32)
         else:
             bmask_hw = np.ones(clean_nhw.shape[1:], dtype=np.float32)
 
         N = bvals.shape[0]
+        # Cached bvals/bvecs are shared across workers — copy before any
+        # modification so we never alias them in returned tensors.
         bvals_n = bvals.copy()
         bvecs_n = bvecs.copy()
 
@@ -259,27 +256,29 @@ class DWISliceDataset(Dataset):
                 # Return clean signal here; batch dict carries the params needed.
                 degrade_kf = float(np.random.uniform(*self.keep_fraction_range))
                 degrade_nl = float(np.random.uniform(*self.noise_range))
-                input_nhw = clean_nhw.copy()
+                input_nhw = clean_nhw
             else:
                 kf = float(np.random.uniform(*self.keep_fraction_range))
                 nl = float(np.random.uniform(*self.noise_range))
                 rng = np.random.default_rng()
                 input_nhw = degrade_dwi_slice(clean_nhw, kf, nl, rng)
         else:
-            input_nhw = clean_nhw.copy()
+            input_nhw = clean_nhw
 
         # ── Scale DTI to O(1) range for balanced training ───────────────────
-        tgt_chw = np.clip(tgt_chw * self.dti_scale, -3.0, 3.0).astype(np.float32)
+        np.multiply(tgt_chw, np.float32(self.dti_scale), out=tgt_chw)
+        np.clip(tgt_chw, -3.0, 3.0, out=tgt_chw)
 
         # ── Normalise input by the mean-b0 of the (noisy) input ────────────
         # Skipped in gpu_degrade mode: run_epoch applies gpu_b0_normalize_batch
         # after cuFFT degradation so normalization is over the degraded signal.
-        if not self.gpu_degrade:
-            if b0_idx.any():
-                mean_b0 = input_nhw[b0_idx].mean(axis=0)
-                b0_norm = compute_b0_norm(mean_b0)
-                if b0_norm > 0:
-                    input_nhw = input_nhw / b0_norm
+        if not self.gpu_degrade and b0_idx.any():
+            if input_nhw is clean_nhw:
+                input_nhw = clean_nhw.copy()
+            mean_b0 = input_nhw[b0_idx].mean(axis=0)
+            b0_norm = compute_b0_norm(mean_b0)
+            if b0_norm > 0:
+                input_nhw *= np.float32(1.0 / b0_norm)
 
         bvals_norm = bvals_n / self.max_bval
 
@@ -290,38 +289,44 @@ class DWISliceDataset(Dataset):
         # contradictory for ~50% of the training batch.
         if self.augment:
             if self.aug_flip:
-                # Map (slice_axis, flipped_hw_axis) -> world axis (0=x, 1=y, 2=z)
                 world_axes_by_slice = {
                     0: (1, 2),  # sagittal slice: H=Y, W=Z
                     1: (0, 2),  # coronal slice:  H=X, W=Z
                     2: (0, 1),  # axial slice:    H=X, W=Y
                 }
                 h_world, w_world = world_axes_by_slice[axis]
+                flipped = False
                 if random.random() > 0.5:
                     input_nhw = input_nhw[:, ::-1, :]
                     tgt_chw = tgt_chw[:, ::-1, :]
                     bmask_hw = bmask_hw[::-1, :]
                     tgt_chw = flip_dti6d_sign(tgt_chw, world_axis=h_world)
                     bvecs_n = flip_bvecs(bvecs_n, world_axis=h_world)
+                    flipped = True
                 if random.random() > 0.5:
                     input_nhw = input_nhw[:, :, ::-1]
                     tgt_chw = tgt_chw[:, :, ::-1]
                     bmask_hw = bmask_hw[:, ::-1]
                     tgt_chw = flip_dti6d_sign(tgt_chw, world_axis=w_world)
                     bvecs_n = flip_bvecs(bvecs_n, world_axis=w_world)
-                input_nhw = np.ascontiguousarray(input_nhw)
-                tgt_chw = np.ascontiguousarray(tgt_chw)
-                bmask_hw = np.ascontiguousarray(bmask_hw)
+                    flipped = True
+                if flipped:
+                    input_nhw = np.ascontiguousarray(input_nhw)
+                    tgt_chw = np.ascontiguousarray(tgt_chw)
+                    bmask_hw = np.ascontiguousarray(bmask_hw)
             if self.aug_intensity > 0.0:
-                scale = 1.0 + np.random.uniform(
-                    -self.aug_intensity, self.aug_intensity,
+                scale = np.float32(
+                    1.0 + np.random.uniform(-self.aug_intensity, self.aug_intensity)
                 )
-                input_nhw = input_nhw * np.float32(scale)
+                if input_nhw is clean_nhw:
+                    input_nhw = clean_nhw.copy()
+                input_nhw *= scale
             if self.aug_volume_dropout > 0.0:
                 drop = np.random.random(N) < self.aug_volume_dropout
                 if drop.any():
+                    if input_nhw is clean_nhw:
+                        input_nhw = clean_nhw.copy()
                     input_nhw[drop] = 0.0
-                    # vol_mask is built later from N; record drop mask
                     dropped_volumes = drop
                 else:
                     dropped_volumes = None
@@ -330,33 +335,32 @@ class DWISliceDataset(Dataset):
         else:
             dropped_volumes = None
 
-        # ── Pad diffusion dimension to max_n (variable across subjects) ─────
-        if N < self.max_n:
-            pad = self.max_n - N
-            input_nhw = np.pad(input_nhw, ((0, pad), (0, 0), (0, 0)))
-            bvals_norm = np.pad(bvals_norm, (0, pad))
-            bvecs_n = np.pad(bvecs_n, ((0, 0), (0, pad)))
+        # ── Pad diffusion + spatial dims (single allocation per array) ──────
+        n_pad = self.max_n - N
+        ch, cw = self.canonical_hw
+        h, w = input_nhw.shape[1:]
+        ph = ch - h
+        pw = cw - w
+
+        if n_pad > 0 or ph > 0 or pw > 0:
+            input_nhw = np.pad(input_nhw, ((0, n_pad), (0, ph), (0, pw)))
+        if n_pad > 0:
+            bvals_norm = np.pad(bvals_norm, (0, n_pad))
+            bvecs_n = np.pad(bvecs_n, ((0, 0), (0, n_pad)))
+        if ph > 0 or pw > 0:
+            tgt_chw = np.pad(tgt_chw, ((0, 0), (0, ph), (0, pw)))
+            bmask_hw = np.pad(bmask_hw, ((0, ph), (0, pw)))
 
         vol_mask = np.zeros(self.max_n, dtype=np.float32)
         vol_mask[:N] = 1.0
         if dropped_volumes is not None:
             vol_mask[:N][dropped_volumes] = 0.0
 
-        # ── Pad spatial dims to canonical (H, W) so batches stack ───────────
-        ch, cw = self.canonical_hw
-        h, w = input_nhw.shape[1:]
-        if (h, w) != (ch, cw):
-            ph = ch - h
-            pw = cw - w
-            input_nhw = np.pad(input_nhw, ((0, 0), (0, ph), (0, pw)))
-            tgt_chw = np.pad(tgt_chw, ((0, 0), (0, ph), (0, pw)))
-            bmask_hw = np.pad(bmask_hw, ((0, ph), (0, pw)))
-
         result = {
             "input": torch.from_numpy(np.ascontiguousarray(input_nhw)),
             "target": torch.from_numpy(np.ascontiguousarray(tgt_chw)),
-            "bvals": torch.from_numpy(bvals_norm.astype(np.float32)),
-            "bvecs": torch.from_numpy(bvecs_n.astype(np.float32)),
+            "bvals": torch.from_numpy(np.ascontiguousarray(bvals_norm, dtype=np.float32)),
+            "bvecs": torch.from_numpy(np.ascontiguousarray(bvecs_n, dtype=np.float32)),
             "vol_mask": torch.from_numpy(vol_mask),
             "brain_mask": torch.from_numpy(np.ascontiguousarray(bmask_hw)),
         }
@@ -390,21 +394,13 @@ def dwi_worker_init(worker_id: int) -> None:
 
 
 def preload_dataset_in_worker(dataset: DWISliceDataset) -> None:
-    """Load all subject arrays into this worker process's RAM.
+    """Load all subject arrays into this process's RAM.
 
     Call from DataLoader's ``worker_init_fn`` so each worker has in-memory
-    access to the data instead of making zarr chunk reads per sample. The
-    dataset object is tiny when pickled (only bvals/bvecs/brain_masks), so
-    the worker can safely preload on startup without OOM risk from pickling.
-
-    Example usage in the training script::
-
-        def _worker_init(worker_id):
-            info = torch.utils.data.get_worker_info()
-            if info is not None:
-                preload_dataset_in_worker(info.dataset)
-
-        train_loader = DataLoader(train_ds, ..., worker_init_fn=_worker_init)
+    access to the data instead of making zarr chunk reads per sample. Also
+    usable from the main process (``preload=True`` on the dataset) for
+    ``num_workers=0`` runs — most notably MPS, where the GPU degrade path is
+    disabled and CPU FFT throughput dominates loader time.
     """
     store = zarr.open_group(dataset.zarr_path, mode="r")
     preloaded: dict[str, dict[str, np.ndarray]] = {}

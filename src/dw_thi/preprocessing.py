@@ -132,6 +132,35 @@ def tensor_to_6d(tensor: np.ndarray) -> np.ndarray:
     ).astype(np.float32)
 
 
+def load_or_fit_target_dti_6d(
+    group: zarr.Group,
+    *,
+    b0_threshold: float = cfg.B0_THRESHOLD,
+) -> np.ndarray:
+    """Return ``target_dti_6d`` from a zarr group, fitting on the fly if absent.
+
+    The fODF Zarr contract drops ``target_dti_6d`` (the standard pipeline owns
+    that target). Code paths that still need a DTI ground truth — the
+    visualizer's FA/MD panels and the fODF evaluator's DTI metrics — rely on
+    this helper to fit the tensor from the clean DWI when the array is
+    missing.
+    """
+    if "target_dti_6d" in set(group.array_keys()):
+        return np.asarray(group["target_dti_6d"][:], dtype=np.float32)
+
+    clean_dwi = np.asarray(group["target_dwi"][:], dtype=np.float32)
+    bvals = np.asarray(group["bvals"][:], dtype=np.float32)
+    bvecs = np.asarray(group["bvecs"][:], dtype=np.float32)
+    if bvecs.shape[0] != 3:
+        bvecs = bvecs.T
+    gtab = gradient_table(bvals, bvecs=bvecs.T, b0_threshold=b0_threshold)
+    if "brain_mask" in set(group.array_keys()):
+        mask = np.asarray(group["brain_mask"][:], dtype=bool)
+    else:
+        mask = compute_brain_mask_from_dwi(clean_dwi, bvals, b0_threshold)
+    return tensor_to_6d(compute_dti(clean_dwi, gtab, mask=mask))
+
+
 def _detect_single_shell_bval(
     bvals: np.ndarray,
     b0_threshold: float = cfg.B0_THRESHOLD,
@@ -349,10 +378,17 @@ def save_qc_plot(
 
 
 def validate_store(store: zarr.Group, *, include_fodf: bool = False) -> None:
-    """Validate the production Zarr contract."""
-    required_keys = {"target_dwi", "target_dti_6d", "bvals", "bvecs", "brain_mask"}
+    """Validate the production Zarr contract.
+
+    Standard stores must hold target_dti_6d; fODF stores hold target_fodf_sh
+    instead. The two pipelines deliberately diverge so each dataset only
+    carries the targets its training loop consumes.
+    """
+    required_keys = {"target_dwi", "bvals", "bvecs", "brain_mask"}
     if include_fodf:
         required_keys.add("target_fodf_sh")
+    else:
+        required_keys.add("target_dti_6d")
     for subject_id in sorted(store.group_keys()):
         group = store[subject_id]
         missing = required_keys.difference(set(group.array_keys()))
@@ -360,15 +396,16 @@ def validate_store(store: zarr.Group, *, include_fodf: bool = False) -> None:
             raise ValueError(f"{subject_id} missing arrays: {sorted(missing)}")
 
         target_shape = group["target_dwi"].shape
-        tensor_shape = group["target_dti_6d"].shape
         mask_shape = group["brain_mask"].shape
 
-        if len(tensor_shape) != 4 or tensor_shape[:3] != target_shape[:3] or tensor_shape[-1:] != (6,):
-            raise ValueError(f"{subject_id} invalid target_dti_6d shape: {tensor_shape}")
         if include_fodf:
             fodf_shape = group["target_fodf_sh"].shape
             if len(fodf_shape) != 4 or fodf_shape[:3] != target_shape[:3] or fodf_shape[-1] < 1:
                 raise ValueError(f"{subject_id} invalid target_fodf_sh shape: {fodf_shape}")
+        else:
+            tensor_shape = group["target_dti_6d"].shape
+            if len(tensor_shape) != 4 or tensor_shape[:3] != target_shape[:3] or tensor_shape[-1:] != (6,):
+                raise ValueError(f"{subject_id} invalid target_dti_6d shape: {tensor_shape}")
         if mask_shape != target_shape[:3]:
             raise ValueError(f"{subject_id} invalid brain_mask shape: {mask_shape}")
 
@@ -449,7 +486,7 @@ def build_pretext_dataset(
         bvecs = np.asarray(sample["bvecs"], dtype=np.float32)
 
         brain_mask = compute_brain_mask_from_dwi(clean_dwi, bvals)
-        tensor_clean_6d = tensor_to_6d(compute_dti(clean_dwi, sample["gtab"], mask=brain_mask))
+        tensor_clean_6d = None
         fodf_sh = None
         fodf_info = None
         if include_fodf:
@@ -462,6 +499,8 @@ def build_pretext_dataset(
                 fa_thr=settings.FODF_RESPONSE_FA_THR,
                 single_shell_tol=settings.FODF_SINGLE_SHELL_TOL,
             )
+        else:
+            tensor_clean_6d = tensor_to_6d(compute_dti(clean_dwi, sample["gtab"], mask=brain_mask))
 
         subject_id = entry["key"]
         group = store.create_group(subject_id)
@@ -473,7 +512,8 @@ def build_pretext_dataset(
             group.attrs["fodf"] = fodf_info
 
         group.create_array("target_dwi", data=clean_dwi)
-        group.create_array("target_dti_6d", data=tensor_clean_6d)
+        if tensor_clean_6d is not None:
+            group.create_array("target_dti_6d", data=tensor_clean_6d)
         if fodf_sh is not None:
             group.create_array("target_fodf_sh", data=fodf_sh)
         group.create_array("brain_mask", data=brain_mask.astype(np.uint8))

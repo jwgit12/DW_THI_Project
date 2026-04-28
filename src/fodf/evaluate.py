@@ -32,7 +32,11 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from dw_thi.augment import degrade_dwi_volume
-from dw_thi.preprocessing import compute_b0_norm, compute_brain_mask_from_dwi
+from dw_thi.preprocessing import (
+    compute_b0_norm,
+    compute_brain_mask_from_dwi,
+    load_or_fit_target_dti_6d,
+)
 from dw_thi.runtime import (
     amp_dtype_from_name,
     autocast_context,
@@ -354,7 +358,7 @@ def evaluate_subject(
 
     store = zarr.open_group(path_str(zarr_path), mode="r")
     grp = store[subject_key]
-    target_dti6d = np.asarray(grp["target_dti_6d"][:], dtype=np.float32)
+    target_dti6d = load_or_fit_target_dti_6d(grp, b0_threshold=b0_threshold)
     target_dwi = np.asarray(grp["target_dwi"][:], dtype=np.float32)
     input_dwi = degrade_dwi_volume(
         target_dwi,
@@ -880,7 +884,7 @@ def run_patch2self_sweep(
 
     for subject_key in subjects:
         grp = store[subject_key]
-        target_dti6d = np.asarray(grp["target_dti_6d"][:], dtype=np.float32)
+        target_dti6d = load_or_fit_target_dti_6d(grp, b0_threshold=args.b0_threshold)
         target_dwi = np.asarray(grp["target_dwi"][:], dtype=np.float32)
         bvals = np.asarray(grp["bvals"][:], dtype=np.float32)
         bvecs = np.asarray(grp["bvecs"][:], dtype=np.float32)

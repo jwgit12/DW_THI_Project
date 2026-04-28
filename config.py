@@ -9,7 +9,7 @@ the same constants.  CLI argument defaults should reference these too.
 # ─────────────────────────────────────────────────────────────────────────────
 DATASET_ZARR_PATH = "dataset/default_clean.zarr"
 DATASET_QC_DIR = "dataset/default_clean_qc"
-TRAIN_OUT_DIR = "runs/production_6d"
+TRAIN_OUT_DIR = "runs/production_6d_tiny"
 EVAL_OUT_DIR = "runs/evaluation"
 SEED = 42
 
@@ -70,8 +70,8 @@ VAL_SUBJECTS = ["sub-05", "sub-11"]
 # ─────────────────────────────────────────────────────────────────────────────
 # Model architecture
 # ─────────────────────────────────────────────────────────────────────────────
-FEAT_DIM = 64                # q-space encoder feature dimension (matches channels[0])
-UNET_CHANNELS = [64, 128, 256]  # 3 encoder levels; factor=8 fits (132, 130) easily
+FEAT_DIM = 16                # q-space encoder feature dimension (matches channels[0])
+UNET_CHANNELS = [16, 32, 64]  # 3 encoder levels; factor=8 fits (132, 130) easily
 DROPOUT = 0.1                # spatial dropout rate in U-Net conv blocks
 LAMBDA_SCALAR = 0.3          # weight for FA/MD auxiliary loss
 LAMBDA_EDGE = 0.1            # weight for FA spatial-gradient (edge) loss
