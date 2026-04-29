@@ -355,13 +355,23 @@ class DWISliceDataset(Dataset):
 
         if preloaded is not None:
             arr_dwi = preloaded[key]["target_dwi"]
-            arr_fodf = preloaded[key].get("target_fodf_sh")
             clean_signal = _extract_dwi_context_chw(
                 arr_dwi, axis, s, self.context_slices,
             )
-            tgt_fodf_chw = (
-                _slice_to_chw(arr_fodf, axis, s) if arr_fodf is not None else None
-            )
+            arr_fodf = preloaded[key].get("target_fodf_sh")
+            if arr_fodf is not None:
+                tgt_fodf_chw = _slice_to_chw(arr_fodf, axis, s)
+            elif self.has_fodf:
+                # PRELOAD_FODF=False intentionally avoids caching SH targets in RAM.
+                # Fall back to lazy zarr reads so sample dicts still include the
+                # supervision tensor expected by the fODF training loop.
+                tgt_fodf_chw = _slice_to_chw(
+                    _get_zarr_group(self.zarr_path)[key]["target_fodf_sh"],
+                    axis,
+                    s,
+                )
+            else:
+                tgt_fodf_chw = None
         else:
             grp = _get_zarr_group(self.zarr_path)[key]
             clean_signal = _extract_dwi_context_chw(

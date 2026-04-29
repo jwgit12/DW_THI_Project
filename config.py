@@ -119,13 +119,13 @@ PROFILE_EXIT_AFTER_CAPTURE = False
 # The standard FA/MD path uses the unprefixed values above. The isolated
 # ``fodf`` package reads these FODF_* values through ``fodf.defaults`` so both
 # modes still share this single config file.
-FODF_DATASET_ZARR_PATH = "dataset/default_odf.zarr"
+FODF_DATASET_ZARR_PATH = "dataset/default_odf_l4.zarr"
 FODF_DATASET_QC_DIR = "dataset/default_odf_qc"
-FODF_TRAIN_OUT_DIR = "runs/production_fodf"
+FODF_TRAIN_OUT_DIR = "runs/production_fodf_l4_tiny"
 FODF_EVAL_OUT_DIR = "runs/evaluation_fodf"
 
-FODF_NOISE_MIN = 0.02
-FODF_NOISE_MAX = 0.12
+FODF_NOISE_MIN = 0.05
+FODF_NOISE_MAX = 0.25
 FODF_KEEP_FRACTION_MIN = 0.5
 FODF_KEEP_FRACTION_MAX = 0.75
 FODF_KEEP_FRACTION = 0.6
@@ -152,11 +152,11 @@ FODF_RESPONSE_ROI_RADII = 10
 FODF_RESPONSE_FA_THR = 0.7
 FODF_SINGLE_SHELL_TOL = 100.0
 
-FODF_FEAT_DIM = 128
-FODF_UNET_CHANNELS = [128, 256, 512]
+FODF_FEAT_DIM = 32
+FODF_UNET_CHANNELS = [32, 64, 128]
 FODF_CONTEXT_SLICES = 5
 FODF_CONTEXT_FUSION_LAYERS = 2
-FODF_DROPOUT = 0.05
+FODF_DROPOUT = 0.1
 FODF_LAMBDA = 0.25
 FODF_LAMBDA_BAND = 0.75
 FODF_LAMBDA_CORR = 0.25
@@ -179,19 +179,19 @@ FODF_ANISO_MIN_L = 4
 
 FODF_EPOCHS = 220
 FODF_BATCH_SIZE = 8
-FODF_LEARNING_RATE = 7e-4
+FODF_LEARNING_RATE = 1e-3
 FODF_WEIGHT_DECAY = 5e-5
 FODF_PATIENCE = 40
 FODF_GRAD_CLIP = 0.0             # disabled by default on MPS; pass --grad_clip 1.0 if needed
 FODF_WARMUP_EPOCHS = 8
 FODF_VIS_EVERY = 1
-FODF_NUM_WORKERS = 1
-FODF_PREFETCH_FACTOR = 1
-FODF_PIN_MEMORY = True
-FODF_PRELOAD = False
-FODF_AMP = True
+FODF_NUM_WORKERS = 0
+FODF_PREFETCH_FACTOR = 2
+FODF_PIN_MEMORY = False
+FODF_PRELOAD = True
+FODF_AMP = False
 FODF_AMP_DTYPE = "auto"
-FODF_CHANNELS_LAST = True
+FODF_CHANNELS_LAST = False
 FODF_COMPILE = "auto"
 FODF_COMPILE_MODE = "reduce-overhead"
 FODF_FUSED_ADAMW = True

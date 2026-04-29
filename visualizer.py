@@ -14,9 +14,7 @@ Examples:
         --checkpoint runs/production/best_model.pt
 
     # fODF viewer with both DTI and fODF predictions side by side
-    python visualizer.py --zarr_path dataset/default_odf.zarr \\
-        --dti_checkpoint  runs/production/best_model.pt \\
-        --fodf_checkpoint runs/production_fodf_context_l4/best_model.pt
+    python visualizer.py --zarr_path dataset/default_odf.zarr --dti_checkpoint  runs/production_6d_tiny/best_model.pt --fodf_checkpoint runs/production_fodf_l4_tiny/best_model.pt
 """
 
 from __future__ import annotations
