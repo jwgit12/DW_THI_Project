@@ -1,0 +1,69 @@
+Using device: cuda
+
+Loading dataset...
+Loading dataset from: /home/nerkar/data/ds003047
+Found 18 DWI files
+
+
+
+
+
+Total slices: 450
+Dataset size: 450 samples
+
+Initializing model...
+
+Running sanity check...
+Noisy: torch.Size([2, 130, 128, 128])
+Clean: torch.Size([2, 130, 128, 128])
+Tensor: torch.Size([2, 6, 128, 128])
+Sanity check passed!
+
+Starting training...
+
+Epoch [1/3] Batch [0/225] Loss: 33.180260
+Epoch [1/3] Batch [20/225] Loss: 0.004940
+Epoch [1/3] Batch [40/225] Loss: 0.004887
+Epoch [1/3] Batch [60/225] Loss: 0.004862
+Epoch [1/3] Batch [80/225] Loss: 0.004844
+Epoch [1/3] Batch [100/225] Loss: 0.004815
+Epoch [1/3] Batch [120/225] Loss: 0.004795
+Epoch [1/3] Batch [140/225] Loss: 0.004764
+Epoch [1/3] Batch [160/225] Loss: 0.004742
+Epoch [1/3] Batch [180/225] Loss: 0.004722
+Epoch [1/3] Batch [200/225] Loss: 0.004697
+Epoch [1/3] Batch [220/225] Loss: 0.004680
+
+Epoch 1 DONE → Avg Loss: 0.608278
+
+Epoch [2/3] Batch [0/225] Loss: 0.004674
+Epoch [2/3] Batch [20/225] Loss: 0.004653
+Epoch [2/3] Batch [40/225] Loss: 0.004637
+Epoch [2/3] Batch [60/225] Loss: 0.004616
+Epoch [2/3] Batch [80/225] Loss: 0.004599
+Epoch [2/3] Batch [100/225] Loss: 0.004585
+Epoch [2/3] Batch [120/225] Loss: 0.004575
+Epoch [2/3] Batch [140/225] Loss: 0.004560
+Epoch [2/3] Batch [160/225] Loss: 0.004549
+Epoch [2/3] Batch [180/225] Loss: 0.004539
+Epoch [2/3] Batch [200/225] Loss: 0.004532
+Epoch [2/3] Batch [220/225] Loss: 0.004524
+
+Epoch 2 DONE → Avg Loss: 0.004585
+
+Epoch [3/3] Batch [0/225] Loss: 0.004518
+Epoch [3/3] Batch [20/225] Loss: 0.004514
+Epoch [3/3] Batch [40/225] Loss: 0.004501
+Epoch [3/3] Batch [60/225] Loss: 0.004499
+Epoch [3/3] Batch [80/225] Loss: 0.004500
+Epoch [3/3] Batch [100/225] Loss: 0.004487
+Epoch [3/3] Batch [120/225] Loss: 0.004483
+Epoch [3/3] Batch [140/225] Loss: 0.004474
+Epoch [3/3] Batch [160/225] Loss: 0.004476
+Epoch [3/3] Batch [180/225] Loss: 0.004473
+Epoch [3/3] Batch [200/225] Loss: 0.004471
+Epoch [3/3] Batch [220/225] Loss: 0.004470
+
+Epoch 3 DONE → Avg Loss: 0.004487
+
+Training complete!
