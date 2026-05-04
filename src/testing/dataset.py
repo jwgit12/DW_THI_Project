@@ -152,7 +152,7 @@ class DWIDataset2D(Dataset):
                 noisy = resize(noisy)
                 tensor_slice = resize(tensor_slice)
 
-                self.samples.append((noisy, clean, tensor_slice))
+                self.samples.append((noisy, clean, tensor_slice, bvals.astype(np.float32), bvecs.astype(np.float32)))
 
         print(f"Total slices ({mode}): {len(self.samples)}\n")
 

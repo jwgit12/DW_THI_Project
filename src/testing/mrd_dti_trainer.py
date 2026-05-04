@@ -22,7 +22,12 @@ def train():
 
     dataset = DWIDataset2D(mode="train")
 
-    loader = DataLoader(dataset, batch_size=config.BATCH_SIZE, shuffle=True)
+    loader = DataLoader(
+    dataset,
+    batch_size=config.BATCH_SIZE,
+    shuffle=True,
+    collate_fn=custom_collate
+)
 
     model = MRDDenoiser(in_channels=130).to(device)
 
@@ -37,7 +42,7 @@ def train():
 
         total_loss = 0
 
-        for batch_idx, (x_noisy, x_clean, _) in enumerate(loader):
+        for batch_idx, (x_noisy, x_clean, _, _, _) in enumerate(loader):
 
             x_noisy = x_noisy.to(device)
             x_clean = x_clean.to(device)
@@ -71,6 +76,18 @@ def train():
 
     torch.save(model.state_dict(), "mrd_dti_model.pth")
     print("Saved: mrd_dti_model.pth")
+
+
+def custom_collate(batch):
+    noisy = torch.stack([item[0] for item in batch])
+    clean = torch.stack([item[1] for item in batch])
+    tensor = torch.stack([item[2] for item in batch])
+
+    bvals = [item[3] for item in batch]
+    bvecs = [item[4] for item in batch]
+
+    return noisy, clean, tensor, bvals, bvecs
+
 
 
 if __name__ == "__main__":
