@@ -97,6 +97,10 @@ MPPCA_CFG = dict(
     patch_radius=cfg.MPPCA_PATCH_RADIUS, pca_method=cfg.MPPCA_PCA_METHOD,
     b0_threshold=cfg.B0_THRESHOLD, dti_fit_method=cfg.DTI_FIT_METHOD,
 )
+BM4D_CFG = dict(
+    sigma=cfg.BM4D_SIGMA, profile=cfg.BM4D_PROFILE,
+    b0_threshold=cfg.B0_THRESHOLD, dti_fit_method=cfg.DTI_FIT_METHOD,
+)
 
 
 def predict_subject(
@@ -225,6 +229,34 @@ def _run_mppca(noisy: np.ndarray, mask: np.ndarray | None = None) -> np.ndarray:
         ).astype(np.float32)
 
 
+def _run_bm4d(noisy: np.ndarray) -> np.ndarray:
+    """Apply BM4D independently to each 3D DWI volume.
+
+    Sigma is either taken from BM4D_CFG or estimated per-volume via MAD.
+    """
+    from bm4d import bm4d
+    N = noisy.shape[3]
+    denoised = np.empty_like(noisy, dtype=np.float32)
+    sigma_cfg = BM4D_CFG["sigma"]
+    profile = BM4D_CFG["profile"]
+    t_start = time.time()
+    for n in range(N):
+        vol = noisy[:, :, :, n].astype(np.float64)
+        if sigma_cfg is not None:
+            sigma = float(sigma_cfg)
+        else:
+            sigma = float(np.median(np.abs(vol - np.median(vol))) / 0.6745)
+            sigma = max(sigma, 1e-6)
+        print(f"  BM4D  [{n + 1:2d}/{N}]  sigma={sigma:.4f} ...", end="", flush=True)
+        t0 = time.time()
+        denoised[:, :, :, n] = bm4d(vol, sigma, profile=profile).astype(np.float32)
+        vol_elapsed = time.time() - t0
+        total_elapsed = time.time() - t_start
+        remaining = (total_elapsed / (n + 1)) * (N - n - 1)
+        print(f"  {vol_elapsed:.1f}s  (remaining ~{remaining:.0f}s)", flush=True)
+    return denoised
+
+
 def _compute_dti_metrics(
     pred_dti6d: np.ndarray,
     target_dti6d: np.ndarray,
@@ -306,6 +338,7 @@ def evaluate_subject(
     degrade_seed: int = cfg.EVAL_DEGRADE_SEED,
     run_patch2self: bool = True,
     run_mppca: bool = True,
+    run_bm4d: bool = True,
     p2s_cfg: dict | None = None,
     infer_batch_size: int = 16,
     amp_enabled: bool = False,
@@ -317,7 +350,7 @@ def evaluate_subject(
     Returns
     -------
     metrics : dict
-        Keys: 'qspaceunet', and optionally 'patch2self', 'mppca'.
+        Keys: 'qspaceunet', and optionally 'patch2self', 'mppca', 'bm4d'.
         Each value is a dict of scalar metrics plus degradation metadata.
     arrays : dict
         Raw arrays needed for visualization.
@@ -420,6 +453,20 @@ def evaluate_subject(
         all_metrics["mppca"] = mppca_metrics
         arrays["mppca_dti6d"] = mppca_dti6d
 
+    if run_bm4d:
+        t3 = time.time()
+        bm4d_denoised = _run_bm4d(input_dwi)
+        bm4d_metrics, bm4d_dti6d = _baseline_dti_metrics(
+            bm4d_denoised, target_dti6d, bvals, bvecs, b0_threshold,
+            dti_fit_method=BM4D_CFG["dti_fit_method"], mask=mask_3d,
+        )
+        bm4d_metrics.update(row_meta)
+        bm4d_metrics["bm4d_profile"] = BM4D_CFG["profile"]
+        bm4d_metrics["bm4d_sigma"] = BM4D_CFG["sigma"]
+        bm4d_metrics["elapsed_s"] = round(time.time() - t3, 2)
+        all_metrics["bm4d"] = bm4d_metrics
+        arrays["bm4d_dti6d"] = bm4d_dti6d
+
     return all_metrics, arrays
 
 
@@ -470,6 +517,8 @@ def save_comparison_plot(
         methods.append(("Patch2Self", arrays["patch2self_dti6d"]))
     if "mppca_dti6d" in arrays:
         methods.append(("MP-PCA", arrays["mppca_dti6d"]))
+    if "bm4d_dti6d" in arrays:
+        methods.append(("BM4D", arrays["bm4d_dti6d"]))
     methods.append(("QSpaceUNet", arrays["qspaceunet_dti6d"]))
     methods.append(("Target", target_dti6d))
 
@@ -628,8 +677,9 @@ def save_metric_comparison(
         "qspaceunet": "QSpaceUNet",
         "patch2self": "Patch2Self",
         "mppca": "MP-PCA",
+        "bm4d": "BM4D",
     }
-    colors = {"qspaceunet": "#2196F3", "patch2self": "#FF9800", "mppca": "#4CAF50"}
+    colors = {"qspaceunet": "#2196F3", "patch2self": "#FF9800", "mppca": "#4CAF50", "bm4d": "#9C27B0"}
     bar_colors = [colors.get(m, "#9E9E9E") for m in method_names]
 
     for i, metric in enumerate(metric_cols):
@@ -1062,10 +1112,12 @@ def main(args):
 
     run_patch2self = (not args.skip_baselines) and args.patch2self
     run_mppca = (not args.skip_baselines) and args.mppca
+    run_bm4d = (not args.skip_baselines) and args.bm4d
+    BM4D_CFG.update(sigma=args.bm4d_sigma, profile=args.bm4d_profile)
     p2s_cfg = _p2s_cfg_from_args(args)
     log.info(
-        "Evaluating %d subjects x %d repeats  (Patch2Self=%s, MP-PCA=%s)",
-        len(subjects), args.eval_repeats, run_patch2self, run_mppca,
+        "Evaluating %d subjects x %d repeats  (Patch2Self=%s, MP-PCA=%s, BM4D=%s)",
+        len(subjects), args.eval_repeats, run_patch2self, run_mppca, run_bm4d,
     )
     log.info(
         "Eval degradation: keep_fraction=[%.3f, %.3f], noise=[%.3f, %.3f], seed=%d",
@@ -1078,6 +1130,7 @@ def main(args):
     qspaceunet_rows = []
     p2s_rows = []
     mppca_rows = []
+    bm4d_rows = []
     plot_arrays = {}
     eval_rng = np.random.default_rng(args.eval_seed)
 
@@ -1104,6 +1157,7 @@ def main(args):
                     degrade_seed=trial["degrade_seed"],
                     run_patch2self=run_patch2self,
                     run_mppca=run_mppca,
+                    run_bm4d=run_bm4d,
                     p2s_cfg=p2s_cfg,
                     infer_batch_size=args.infer_batch_size,
                     amp_enabled=amp_enabled,
@@ -1136,6 +1190,15 @@ def main(args):
                         all_metrics["mppca"]["fa_rmse"],
                         all_metrics["mppca"]["fa_r2"],
                         all_metrics["mppca"]["elapsed_s"],
+                    )
+                if "bm4d" in all_metrics:
+                    bm4d_rows.append(all_metrics["bm4d"])
+                    log.info(
+                        "  BM4D         tensor_rmse=%.5f  FA[rmse=%.4f r2=%.3f]  (%.1fs)",
+                        all_metrics["bm4d"]["tensor_rmse"],
+                        all_metrics["bm4d"]["fa_rmse"],
+                        all_metrics["bm4d"]["fa_r2"],
+                        all_metrics["bm4d"]["elapsed_s"],
                     )
 
                 if (
@@ -1178,6 +1241,8 @@ def main(args):
         _save_method_csv(p2s_rows, "patch2self")
     if mppca_rows:
         _save_method_csv(mppca_rows, "mppca")
+    if bm4d_rows:
+        _save_method_csv(bm4d_rows, "bm4d")
 
     # Also save the primary model CSV under a generic name for convenience.
     compat_sort_cols = [c for c in ("subject", "repeat") if c in qspaceunet_rows[0]]
@@ -1196,6 +1261,8 @@ def main(args):
         comparison_rows["patch2self"] = p2s_rows
     if mppca_rows:
         comparison_rows["mppca"] = mppca_rows
+    if bm4d_rows:
+        comparison_rows["bm4d"] = bm4d_rows
     if len(comparison_rows) > 1:
         save_metric_comparison(comparison_rows, out_dir)
 
@@ -1224,7 +1291,7 @@ def main(args):
                 log.warning("Could not save prediction plot for %s: %s", plot_subject, exc)
 
             # All-methods comparison plot
-            if "patch2self_dti6d" in arrs or "mppca_dti6d" in arrs:
+            if "patch2self_dti6d" in arrs or "mppca_dti6d" in arrs or "bm4d_dti6d" in arrs:
                 comp_path = out_dir / f"comparison_{plot_subject}.png"
                 try:
                     comp_meta = save_comparison_plot(
@@ -1262,6 +1329,8 @@ def main(args):
             comp["Patch2Self"] = pd.DataFrame(p2s_rows)
         if mppca_rows:
             comp["MP-PCA"] = pd.DataFrame(mppca_rows)
+        if bm4d_rows:
+            comp["BM4D"] = pd.DataFrame(bm4d_rows)
         header = f"{'metric':<16}"
         for name in comp:
             header += f"  {name:>12}"
@@ -1420,6 +1489,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     mppca_group.add_argument("--no-mppca", "--no-mp-pca", "--skip_mppca", "--skip_mp_pca",
                              dest="mppca", action="store_false",
                              help="Disable the MP-PCA baseline")
+    bm4d_group = parser.add_mutually_exclusive_group()
+    bm4d_group.add_argument("--bm4d", "--run_bm4d",
+                            dest="bm4d", action="store_true", default=True,
+                            help="Enable the BM4D baseline (default)")
+    bm4d_group.add_argument("--no-bm4d", "--skip_bm4d",
+                            dest="bm4d", action="store_false",
+                            help="Disable the BM4D baseline")
+    parser.add_argument("--bm4d_sigma", "--bm4d-sigma", type=float, default=cfg.BM4D_SIGMA,
+                        help="BM4D noise sigma per volume (default: None = auto-estimate via MAD)")
+    parser.add_argument("--bm4d_profile", "--bm4d-profile",
+                        choices=["np", "lc", "high"], default=cfg.BM4D_PROFILE,
+                        help="BM4D denoising profile: np (normal), lc (low complexity), high")
     parser.add_argument("--plot_subject", default=None,
                         help="Subject key to visualize (default: all evaluated subjects)")
     parser.add_argument("--plot_repeat", "--plot-repeat", type=int, default=0,

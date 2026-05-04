@@ -10,3 +10,4 @@ zarr
 torch
 tensorboard
 tqdm
+bm4d

@@ -212,3 +212,9 @@ P2S_B0_DENOISING = True
 # ─────────────────────────────────────────────────────────────────────────────
 MPPCA_PATCH_RADIUS = 2       # local patch radius in voxels (2 → 5×5×5)
 MPPCA_PCA_METHOD = "eig"     # 'eig' (faster) | 'svd' (occasionally more accurate)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BM4D baseline
+# ─────────────────────────────────────────────────────────────────────────────
+BM4D_SIGMA = None            # None = auto-estimate per volume via MAD
+BM4D_PROFILE = 'np'         # 'np' (normal) | 'lc' (low complexity) | 'high'
