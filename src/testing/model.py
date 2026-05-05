@@ -7,16 +7,29 @@ class MRDDenoiser(nn.Module):
         super().__init__()
 
         self.net = nn.Sequential(
-            nn.Conv2d(in_channels, 64, kernel_size=3, padding=1),
+
+            # Block 1
+            nn.Conv2d(in_channels, 64, 3, padding=1),
             nn.ReLU(),
 
-            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            # Block 2
+            nn.Conv2d(64, 64, 3, padding=1),
             nn.ReLU(),
 
-            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            # Block 3
+            nn.Conv2d(64, 128, 3, padding=1),
             nn.ReLU(),
 
-            nn.Conv2d(64, in_channels, kernel_size=3, padding=1),
+            # Block 4
+            nn.Conv2d(128, 128, 3, padding=1),
+            nn.ReLU(),
+
+            # Block 5
+            nn.Conv2d(128, 64, 3, padding=1),
+            nn.ReLU(),
+
+            # Output
+            nn.Conv2d(64, in_channels, 3, padding=1),
         )
 
     def forward(self, x):
