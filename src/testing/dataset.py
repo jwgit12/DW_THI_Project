@@ -134,6 +134,25 @@ class DWIDataset2D(Dataset):
             bvals = np.loadtxt(bval_path)
             bvecs = np.loadtxt(bvec_path)
 
+            # ensure correct shape for bvecs (3, N) → (N, 3)
+            if bvecs.shape[0] == 3:
+                bvecs = bvecs.T
+
+            num_volumes = data.shape[-1]
+
+            if len(bvals) != num_volumes:
+                print(f"[WARNING] Mismatch detected: data={num_volumes}, bvals={len(bvals)}")
+
+                min_len = min(len(bvals), num_volumes)
+
+                # trim everything consistently
+                data = data[..., :min_len]
+                bvals = bvals[:min_len]
+                bvecs = bvecs[:min_len]
+
+                print(f"[FIXED] Trimmed to {min_len} volumes")
+
+
             degraded = lowres_noise(data, noise_max=config.NOISE_MAX)
 
             X, Y, Z, N = data.shape
