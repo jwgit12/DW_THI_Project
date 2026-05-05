@@ -12,44 +12,78 @@ import config
 
 
 # -------------------------
-# SIMPLE DTI (unchanged)
+# DTI COMPUTATION (FIXED)
 # -------------------------
 def compute_dti_numpy(data, bvals, bvecs):
-    X, Y, Z, N = data.shape
+    """
+    data: (H, W, N)
+    bvals: (M,)
+    bvecs: (M, 3)
+    """
 
-    data = np.clip(data, 1e-6, None)
+    # -----------------------------
+    # CRITICAL FIX: ALIGN SHAPES
+    # -----------------------------
+    n_channels = data.shape[-1]
 
-    mask = bvals > 50
-    bvals = bvals[mask]
-    bvecs = bvecs[:, mask]
+    if len(bvals) != n_channels:
+        print(f"[WARNING] Mismatch detected: data={n_channels}, bvals={len(bvals)}")
+        min_n = min(len(bvals), n_channels)
+
+        bvals = bvals[:min_n]
+        bvecs = bvecs[:min_n]
+        data = data[..., :min_n]
+
+    # -----------------------------
+    # Remove b0 images (bvals ~ 0)
+    # -----------------------------
+    mask = bvals > 50   # safer than >0
+    if mask.sum() < 6:
+        # not enough directions → return zeros
+        H, W, _ = data.shape
+        return np.zeros((H, W, 6), dtype=np.float32)
+
     data = data[..., mask]
+    # Ensure correct shape
+    if bvecs.shape[0] == 3:
+        bvecs = bvecs.T   # (N,3)
 
-    B = []
-    for i in range(len(bvals)):
-        g = bvecs[:, i]
-        b = bvals[i]
-        B.append([
-            -b * g[0]**2,
-            -b * g[1]**2,
-            -b * g[2]**2,
-            -2*b * g[0]*g[1],
-            -2*b * g[0]*g[2],
-            -2*b * g[1]*g[2],
-        ])
-    B = np.array(B)
-    B_pinv = np.linalg.pinv(B)
+    bvecs = bvecs[mask]
+    bvals = bvals[mask]
 
-    tensor = np.zeros((X, Y, Z, 6))
+    # -----------------------------
+    # Build design matrix
+    # -----------------------------
+    gx, gy, gz = bvecs[:, 0], bvecs[:, 1], bvecs[:, 2]
 
-    for x in range(X):
-        for y in range(Y):
-            for z in range(Z):
-                S = data[x, y, z, :]
-                logS = np.log(S)
-                D = B_pinv @ logS
-                tensor[x, y, z, :] = D
+    X = np.stack([
+        gx * gx,
+        gy * gy,
+        gz * gz,
+        2 * gx * gy,
+        2 * gx * gz,
+        2 * gy * gz
+    ], axis=1)  # (N,6)
 
-    return tensor
+    # -----------------------------
+    # Log signal
+    # -----------------------------
+    eps = 1e-6
+    S = np.log(data + eps)
+
+    H, W, N = S.shape
+    S = S.reshape(-1, N)
+
+    # -----------------------------
+    # Solve least squares
+    # -----------------------------
+    try:
+        D, *_ = np.linalg.lstsq(X, S.T, rcond=None)
+        D = D.T.reshape(H, W, 6)
+    except:
+        D = np.zeros((H, W, 6), dtype=np.float32)
+
+    return D.astype(np.float32)
 
 
 # -------------------------
@@ -81,14 +115,13 @@ class DWIDataset2D(Dataset):
 
         for dwi_path in dwi_files:
 
-            subject_id = dwi_path.split("/")[-4]  # sub-XX
+            subject_id = dwi_path.split("/")[-4]
 
             # -------------------------
-            # SPLIT FILTER
+            # SPLIT
             # -------------------------
             if mode == "train" and subject_id not in config.TRAIN_SUBJECTS:
                 continue
-
             if mode == "test" and subject_id not in config.TEST_SUBJECTS:
                 continue
 
@@ -101,7 +134,6 @@ class DWIDataset2D(Dataset):
             bvals = np.loadtxt(bval_path)
             bvecs = np.loadtxt(bvec_path)
 
-            tensor = compute_dti_numpy(data, bvals, bvecs)
             degraded = lowres_noise(data, noise_max=config.NOISE_MAX)
 
             X, Y, Z, N = data.shape
@@ -110,17 +142,16 @@ class DWIDataset2D(Dataset):
 
                 clean = data[:, :, z, :]
                 noisy = degraded[:, :, z, :]
-                tensor_slice = tensor[:, :, z, :]
 
                 # -------------------------
-                # FIX CHANNELS
+                # FIX CHANNELS FIRST (CRITICAL)
                 # -------------------------
                 def fix_channels(x):
                     if x.shape[-1] > TARGET_N:
-                        x = x[..., :TARGET_N]
+                        return x[..., :TARGET_N]
                     elif x.shape[-1] < TARGET_N:
                         pad = TARGET_N - x.shape[-1]
-                        x = np.concatenate(
+                        return np.concatenate(
                             [x, np.zeros((*x.shape[:2], pad))], axis=-1
                         )
                     return x
@@ -129,14 +160,13 @@ class DWIDataset2D(Dataset):
                 noisy = fix_channels(noisy)
 
                 # -------------------------
-                # TRANSPOSE
+                # TRANSPOSE (C, H, W)
                 # -------------------------
                 clean = np.transpose(clean, (2, 0, 1))
                 noisy = np.transpose(noisy, (2, 0, 1))
-                tensor_slice = np.transpose(tensor_slice, (2, 0, 1))
 
                 # -------------------------
-                # RESIZE
+                # RESIZE FIRST (CRITICAL)
                 # -------------------------
                 def resize(x):
                     x = torch.tensor(x, dtype=torch.float32)
@@ -150,9 +180,26 @@ class DWIDataset2D(Dataset):
 
                 clean = resize(clean)
                 noisy = resize(noisy)
-                tensor_slice = resize(tensor_slice)
 
-                self.samples.append((noisy, clean, tensor_slice, bvals.astype(np.float32), bvecs.astype(np.float32)))
+                # -------------------------
+                # NOW COMPUTE TENSOR (FIXED)
+                # -------------------------
+                # Convert back to (H, W, C)
+                clean_np = clean.permute(1, 2, 0).cpu().numpy()
+
+                tensor_slice = compute_dti_numpy(clean_np, bvals, bvecs)
+
+                # transpose tensor -> (6, H, W)
+                tensor_slice = np.transpose(tensor_slice, (2, 0, 1))
+                tensor_slice = torch.tensor(tensor_slice, dtype=torch.float32)
+
+                self.samples.append((
+                    noisy,
+                    clean,
+                    tensor_slice,
+                    bvals.astype(np.float32),
+                    bvecs.astype(np.float32)
+                ))
 
         print(f"Total slices ({mode}): {len(self.samples)}\n")
 

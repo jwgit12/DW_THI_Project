@@ -12,3 +12,5 @@ TEST_SUBJECTS  = ["sub-09","sub-10","sub-11"]
 DEVICE = "cuda"
 
 EXPERIMENT_NAME = "mrd_baseline_v1"
+
+KEEP_FRACTION = 0.6
