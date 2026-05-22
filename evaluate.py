@@ -23,6 +23,9 @@ EVAL_MODULES = {
     "attention": "evaluate_attention",
     "qspace-attention": "evaluate_attention",
     "qspace_attention": "evaluate_attention",
+    "mrd": "evaluate_mrd",
+    "mrd-cnn": "evaluate_mrd",
+    "mrd_cnn": "evaluate_mrd",
     "f-odf": "fodf.evaluate",
     "f_odf": "fodf.evaluate",
     "fodf": "fodf.evaluate",
@@ -34,6 +37,8 @@ def _normalize_mode(mode: str) -> str:
     if normalized not in EVAL_MODULES:
         choices = ", ".join(sorted(EVAL_MODULES))
         raise SystemExit(f"Unsupported evaluation mode {mode!r}. Choose one of: {choices}")
+    if normalized in {"mrd-cnn", "mrd_cnn"}:
+        return "mrd"
     if normalized in {"qspace-attention", "qspace_attention"}:
         return "attention"
     if normalized in {"fodf", "f_odf"}:
@@ -51,7 +56,7 @@ def main(argv: list[str] | None = None) -> None:
         "--mode",
         choices=sorted(EVAL_MODULES),
         default="standard",
-        help="Evaluation pipeline to run: standard/fa-md or f-odf.",
+        help="Evaluation pipeline to run: standard/fa-md, attention, mrd, or f-odf.",
     )
     dispatch_args, remaining = dispatch_parser.parse_known_args(raw_args)
     mode = _normalize_mode(dispatch_args.training)

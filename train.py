@@ -23,6 +23,9 @@ TRAINING_MODULES = {
     "attention": "train_attention",
     "qspace-attention": "train_attention",
     "qspace_attention": "train_attention",
+    "mrd": "train_mrd",
+    "mrd-cnn": "train_mrd",
+    "mrd_cnn": "train_mrd",
     "f-odf": "fodf.train",
     "f_odf": "fodf.train",
     "fodf": "fodf.train",
@@ -34,6 +37,8 @@ def _normalize_training_mode(mode: str) -> str:
     if normalized not in TRAINING_MODULES:
         choices = ", ".join(sorted(TRAINING_MODULES))
         raise SystemExit(f"Unsupported training mode {mode!r}. Choose one of: {choices}")
+    if normalized in {"mrd-cnn", "mrd_cnn"}:
+        return "mrd"
     if normalized in {"qspace-attention", "qspace_attention"}:
         return "attention"
     if normalized in {"fodf", "f_odf"}:
@@ -61,7 +66,7 @@ def main(argv: list[str] | None = None) -> None:
         "--mode",
         choices=sorted(TRAINING_MODULES),
         default="standard",
-        help="Training pipeline to run: standard/fa-md or f-odf.",
+        help="Training pipeline to run: standard/fa-md, attention, mrd, or f-odf.",
     )
     dispatch_args, remaining = dispatch_parser.parse_known_args(raw_args)
     mode = _normalize_training_mode(dispatch_args.training)

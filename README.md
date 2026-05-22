@@ -1,9 +1,11 @@
 # DW_THI_Project
 
-DWI preprocessing, QSpaceUNet training, and evaluation. Two pipelines share
+DWI preprocessing, QSpaceUNet/QSpaceAttentionNet/MRD-CNN training, and evaluation. Two pipelines share
 the same Zarr dataset format and on-the-fly degradation:
 
 - **Standard FA/MD** — predict the 6D DTI tensor (`src/dw_thi/`)
+- **QSpaceAttentionNet** — same FA/MD task with q-space direction attention
+- **MRD-CNN** — same FA/MD task with explicit residual DWI denoising
 - **fODF** — predict single-shell CSD SH coefficients (`src/fodf/`)
 
 Shared infrastructure (preprocessing, augmentation, runtime helpers, metric
@@ -20,8 +22,8 @@ Raw DWI NIfTI + bval/bvec
   -> build_dataset.py            # standard target_dti_6d
   -> build_fodf_dataset.py       # standard target + target_fodf_sh
   -> dataset/default_clean.zarr
-  -> train.py --training {standard,f-odf}
-  -> evaluate.py --training {standard,f-odf}
+  -> train.py --training {standard,attention,mrd,f-odf}
+  -> evaluate.py --training {standard,attention,mrd,f-odf}
 ```
 
 ## Dataset Contract
@@ -66,6 +68,8 @@ the mask at startup and warn you to rebuild for production.
 python train.py
 python train.py --training standard
 python train.py --training f-odf
+python train.py --training attention
+python train.py --training mrd
 ```
 
 Defaults come from `config.py`, including:
@@ -81,6 +85,8 @@ Useful overrides:
 ```bash
 python train.py --epochs 200 --batch_size 8 --out_dir runs/my_run
 python train.py --training f-odf --epochs 220 --batch_size 8
+python train.py --training attention --compile off --amp --amp_dtype bf16
+python train.py --training mrd --compile off --amp --amp_dtype bf16
 tensorboard --logdir runs/production/tb
 ```
 
@@ -101,7 +107,8 @@ python evaluate.py --training f-odf \
   --zarr_path dataset/default_odf.zarr
 ```
 
-Evaluation writes CSV metrics and plots to `runs/evaluation` (standard) or
+Evaluation writes CSV metrics and plots to `runs/evaluation` (standard),
+`runs/evaluation_attention` (attention), `runs/evaluation_mrd` (MRD-CNN), or
 `runs/evaluation_fodf` (fODF) by default. Both pipelines support comparison
 against Patch2Self and MP-PCA baselines:
 
@@ -157,6 +164,6 @@ Root scripts dispatch to the right package:
 |---|---|
 | `build_dataset.py` | Standard build (clean DWI + DTI targets + brain mask) |
 | `build_fodf_dataset.py` | Same plus single-shell CSD SH targets |
-| `train.py` | Dispatcher: `--training {standard,f-odf}` |
-| `evaluate.py` | Dispatcher: `--training {standard,f-odf}` |
+| `train.py` | Dispatcher: `--training {standard,attention,mrd,f-odf}` |
+| `evaluate.py` | Dispatcher: `--training {standard,attention,mrd,f-odf}` |
 | `visualizer.py` | Unified Qt viewer (handles standard, fODF, or both — pass `--checkpoint` for auto-routing or `--dti_checkpoint`/`--fodf_checkpoint` explicitly) |
