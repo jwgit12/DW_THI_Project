@@ -230,3 +230,6 @@ CLAUDE.md
 # Keep documentation infographics tracked.
 !src/assests/
 !src/assests/*.png
+
+# Windows metadata junk
+*:Zone.Identifier
