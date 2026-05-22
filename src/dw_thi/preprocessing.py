@@ -65,7 +65,11 @@ def parse_dwi_entities(dwi_path: str | os.PathLike[str]) -> dict[str, str]:
 
 def find_dwi_datasets(root_dir: str | os.PathLike[str]) -> list[dict[str, str]]:
     """Find DWI NIfTI files with matching bval/bvec sidecars."""
-    dwi_files = glob.glob(os.path.join(os.fspath(root_dir), "*_dwi.nii.gz"))
+    dwi_files = glob.glob(
+    os.path.join(os.fspath(root_dir), "**", "*_dwi.nii.gz"),
+    recursive=True
+    )
+
     datasets: list[dict[str, str]] = []
 
     for dwi_path in dwi_files:
