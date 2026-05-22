@@ -9,23 +9,15 @@ from dataset import DWIDataset2D
 from model import MRDDenoiser
 
 
-# ----------------------------
-# CUSTOM COLLATE
-# ----------------------------
-def custom_collate(batch):
-    noisy = torch.stack([item[0] for item in batch])
-    clean = torch.stack([item[1] for item in batch])
-    tensor = torch.stack([item[2] for item in batch])
-
-    bvals = [item[3] for item in batch]
-    bvecs = [item[4] for item in batch]
-
-    return noisy, clean, tensor, bvals, bvecs
+def compute_tensor_proxy(x):
+    """
+    Lightweight proxy for tensor supervision
+    """
+    mean = torch.mean(x, dim=1, keepdim=True)
+    var = torch.var(x, dim=1, keepdim=True)
+    return torch.cat([mean, var], dim=1)
 
 
-# ----------------------------
-# TRAIN
-# ----------------------------
 def train():
 
     device = torch.device(config.DEVICE if torch.cuda.is_available() else "cpu")
@@ -45,10 +37,9 @@ def train():
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     criterion = nn.MSELoss()
 
-    # IMPORTANT: keep this small → stabilizes training
-    LAMBDA = 0.01
+    LAMBDA = 0.1
 
-    print("\nStarting MRD + TENSOR training...\n")
+    print("\nStarting MRD + TENSOR (FINAL) training...\n")
 
     for epoch in range(3):
 
@@ -60,30 +51,27 @@ def train():
             x_clean = x_clean.to(device)
             tensor_gt = tensor_gt.to(device)
 
-            # ----------------------------
-            # Forward
-            # ----------------------------
             noise_pred = model(x_noisy)
             x_denoised = x_noisy - noise_pred
 
-            # DWI loss
+            # -------------------------
+            # DWI LOSS
+            # -------------------------
             loss_dwi = criterion(x_denoised, x_clean)
 
-            # ----------------------------
-            # Tensor estimation (approx)
-            # ----------------------------
-            # NOTE: Placeholder → improves later with proper fitting
-            tensor_pred = torch.var(x_denoised, dim=1, keepdim=True)
-            tensor_pred = tensor_pred.repeat(1, 6, 1, 1)
+            # -------------------------
+            # TENSOR PROXY LOSS
+            # -------------------------
+            proxy_pred = compute_tensor_proxy(x_denoised)
+            proxy_gt = compute_tensor_proxy(x_clean)
 
-            loss_tensor = criterion(tensor_pred, tensor_gt)
+            loss_tensor = criterion(proxy_pred, proxy_gt)
 
-            # Combined loss
+            # -------------------------
+            # TOTAL LOSS
+            # -------------------------
             loss = loss_dwi + LAMBDA * loss_tensor
 
-            # ----------------------------
-            # Backprop
-            # ----------------------------
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -103,6 +91,16 @@ def train():
     print("Saved: mrd_tensor_model.pth")
 
 
-# ----------------------------
+def custom_collate(batch):
+    noisy = torch.stack([item[0] for item in batch])
+    clean = torch.stack([item[1] for item in batch])
+    tensor = torch.stack([item[2] for item in batch])
+
+    bvals = [item[3] for item in batch]
+    bvecs = [item[4] for item in batch]
+
+    return noisy, clean, tensor, bvals, bvecs
+
+
 if __name__ == "__main__":
     train()

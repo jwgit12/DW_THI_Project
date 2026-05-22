@@ -1,12 +1,12 @@
 # dataset.py
 
 import os
-import torch
 import numpy as np
+import torch
 from torch.utils.data import Dataset
 
 import config
-from functions import load_all_dwi, lowres_noise, compute_dti, tensor_to_6d
+from functions import load_all_dwi, lowres_noise
 
 
 class DWIDataset2D(Dataset):
@@ -14,37 +14,44 @@ class DWIDataset2D(Dataset):
     def __init__(self, mode="train"):
 
         self.mode = mode
-        self.data_root = config.DATA_DIR
+        self.root = config.DATA_PATH
 
-        print(f"\nLoading dataset ({mode}) from: {self.data_root}")
+        print(f"\nLoading dataset ({mode}) from: {self.root}")
 
-        self.datasets = load_all_dwi(self.data_root)
+        self.data_entries = load_all_dwi(self.root)
 
-        print(f"Found {len(self.datasets)} DWI files\n")
+        print(f"\nFound {len(self.data_entries)} DWI files\n")
 
         self.samples = []
 
-        for ds in self.datasets:
+        for entry in self.data_entries:
 
-            data = ds["data"]  # (X, Y, Z, N)
-            gtab = ds["gtab"]
+            data = entry["data"]  # (X, Y, Z, N)
+            bvals = entry["bvals"]
+            bvecs = entry["bvecs"]
+            path = entry["path"]
 
-            # degrade
+            # load precomputed tensor
+            tensor_path = path.replace(".nii.gz", "_tensor6.npy")
+
+            if not os.path.exists(tensor_path):
+                print(f"[WARN] Missing tensor: {tensor_path}")
+                continue
+
+            tensor6 = np.load(tensor_path)  # (X, Y, Z, 6)
+
+            # degrade DWI
             noisy = lowres_noise(data)
 
-            # compute REAL tensor
-            tensor = compute_dti(data, gtab)           # (X,Y,Z,3,3)
-            tensor6 = tensor_to_6d(tensor)             # (X,Y,Z,6)
-
-            X, Y, Z, N = data.shape
+            _, _, Z, _ = data.shape
 
             for z in range(Z):
 
-                clean_slice = data[:, :, z, :]
+                clean_slice = data[:, :, z, :]       # (X, Y, N)
                 noisy_slice = noisy[:, :, z, :]
-                tensor_slice = tensor6[:, :, z, :]
+                tensor_slice = tensor6[:, :, z, :]   # (X, Y, 6)
 
-                # reshape to (C,H,W)
+                # transpose to channel-first
                 clean_slice = np.transpose(clean_slice, (2, 0, 1))
                 noisy_slice = np.transpose(noisy_slice, (2, 0, 1))
                 tensor_slice = np.transpose(tensor_slice, (2, 0, 1))
@@ -53,17 +60,9 @@ class DWIDataset2D(Dataset):
                     noisy_slice.astype(np.float32),
                     clean_slice.astype(np.float32),
                     tensor_slice.astype(np.float32),
-                    ds["bvals"],
-                    ds["bvecs"]
+                    bvals,
+                    bvecs
                 ))
-
-        # split
-        split = int(0.75 * len(self.samples))
-
-        if mode == "train":
-            self.samples = self.samples[:split]
-        else:
-            self.samples = self.samples[split:]
 
         print(f"\nTotal slices ({mode}): {len(self.samples)}\n")
 
@@ -71,11 +70,11 @@ class DWIDataset2D(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        noisy, clean, tensor, bvals, bvecs = self.samples[idx]
+        x_noisy, x_clean, tensor, bvals, bvecs = self.samples[idx]
 
         return (
-            torch.from_numpy(noisy),
-            torch.from_numpy(clean),
+            torch.from_numpy(x_noisy),
+            torch.from_numpy(x_clean),
             torch.from_numpy(tensor),
             bvals,
             bvecs

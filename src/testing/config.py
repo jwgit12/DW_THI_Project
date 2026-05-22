@@ -19,3 +19,4 @@ KEEP_FRACTION = 0.7
 
 NOISE_STD = 0.05
 
+DATA_PATH = "/home/nerkar/data/ds003047"
