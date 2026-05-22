@@ -20,6 +20,9 @@ TRAINING_MODULES = {
     "fa-md": "dw_thi.train",
     "fa_md": "dw_thi.train",
     "famd": "dw_thi.train",
+    "attention": "train_attention",
+    "qspace-attention": "train_attention",
+    "qspace_attention": "train_attention",
     "f-odf": "fodf.train",
     "f_odf": "fodf.train",
     "fodf": "fodf.train",
@@ -31,6 +34,8 @@ def _normalize_training_mode(mode: str) -> str:
     if normalized not in TRAINING_MODULES:
         choices = ", ".join(sorted(TRAINING_MODULES))
         raise SystemExit(f"Unsupported training mode {mode!r}. Choose one of: {choices}")
+    if normalized in {"qspace-attention", "qspace_attention"}:
+        return "attention"
     if normalized in {"fodf", "f_odf"}:
         return "f-odf"
     if normalized in {"fa_md", "famd"}:

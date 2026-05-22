@@ -20,6 +20,9 @@ EVAL_MODULES = {
     "fa-md": "dw_thi.evaluate",
     "fa_md": "dw_thi.evaluate",
     "famd": "dw_thi.evaluate",
+    "attention": "evaluate_attention",
+    "qspace-attention": "evaluate_attention",
+    "qspace_attention": "evaluate_attention",
     "f-odf": "fodf.evaluate",
     "f_odf": "fodf.evaluate",
     "fodf": "fodf.evaluate",
@@ -31,6 +34,8 @@ def _normalize_mode(mode: str) -> str:
     if normalized not in EVAL_MODULES:
         choices = ", ".join(sorted(EVAL_MODULES))
         raise SystemExit(f"Unsupported evaluation mode {mode!r}. Choose one of: {choices}")
+    if normalized in {"qspace-attention", "qspace_attention"}:
+        return "attention"
     if normalized in {"fodf", "f_odf"}:
         return "f-odf"
     if normalized in {"fa_md", "famd"}:
