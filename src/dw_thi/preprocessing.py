@@ -526,6 +526,8 @@ def build_pretext_dataset(
                 keep_fraction=args.plot_keep_fraction,
                 rel_noise_level=args.plot_noise_level,
                 seed=settings.EVAL_DEGRADE_SEED,
+                noise_distribution=settings.NOISE_DISTRIBUTION,
+                n_coils=settings.NOISE_COILS,
             )
             save_qc_plot(
                 subject_id=subject_id,

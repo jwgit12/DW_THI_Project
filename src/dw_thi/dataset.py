@@ -85,11 +85,17 @@ class DWISliceDataset(Dataset):
             cfg.KEEP_FRACTION_MIN, cfg.KEEP_FRACTION_MAX,
         ),
         noise_range: tuple[float, float] = (cfg.NOISE_MIN, cfg.NOISE_MAX),
+        noise_distribution: str = cfg.NOISE_DISTRIBUTION,
+        n_coils: int = cfg.NOISE_COILS,
         random_axis: bool = cfg.RANDOM_SLICE_AXIS,
         slice_axes: tuple[int, ...] = cfg.SLICE_AXES,
         aug_flip: bool = cfg.AUG_FLIP,
         aug_intensity: float = cfg.AUG_INTENSITY,
         aug_volume_dropout: float = cfg.AUG_VOLUME_DROPOUT,
+        aug_bvec_mask_prob: float = cfg.AUG_BVEC_MASK_PROB,
+        aug_bvec_mask_min_keep: float = cfg.AUG_BVEC_MASK_MIN_KEEP,
+        aug_bvec_mask_max_keep: float = cfg.AUG_BVEC_MASK_MAX_KEEP,
+        eval_bvec_mask_keep: float = cfg.EVAL_BVEC_MASK_KEEP,
         canonical_hw: tuple[int, int] | None = None,
         eval_mode: bool = False,
         eval_keep_fraction: float = cfg.EVAL_KEEP_FRACTION,
@@ -106,11 +112,17 @@ class DWISliceDataset(Dataset):
         self.on_the_fly_degradation = on_the_fly_degradation
         self.keep_fraction_range = tuple(keep_fraction_range)
         self.noise_range = tuple(noise_range)
+        self.noise_distribution = str(noise_distribution).lower()
+        self.n_coils = int(n_coils)
         self.random_axis = random_axis
         self.slice_axes = tuple(slice_axes) if random_axis else (2,)
         self.aug_flip = aug_flip
         self.aug_intensity = float(aug_intensity)
         self.aug_volume_dropout = float(aug_volume_dropout)
+        self.aug_bvec_mask_prob = float(aug_bvec_mask_prob)
+        self.aug_bvec_mask_min_keep = float(aug_bvec_mask_min_keep)
+        self.aug_bvec_mask_max_keep = float(aug_bvec_mask_max_keep)
+        self.eval_bvec_mask_keep = float(eval_bvec_mask_keep)
         self.eval_mode = eval_mode
         self.eval_keep_fraction = float(eval_keep_fraction)
         self.eval_noise_level = float(eval_noise_level)
@@ -250,7 +262,11 @@ class DWISliceDataset(Dataset):
                 kf = self.eval_keep_fraction
                 nl = self.eval_noise_level
                 rng = np.random.default_rng(self.eval_seed + idx)
-                input_nhw = degrade_dwi_slice(clean_nhw, kf, nl, rng)
+                input_nhw = degrade_dwi_slice(
+                    clean_nhw, kf, nl, rng,
+                    noise_distribution=self.noise_distribution,
+                    n_coils=self.n_coils,
+                )
             elif self.gpu_degrade:
                 # Degradation deferred to GPU in run_epoch (cuFFT, ~50x faster).
                 # Return clean signal here; batch dict carries the params needed.
@@ -261,7 +277,11 @@ class DWISliceDataset(Dataset):
                 kf = float(np.random.uniform(*self.keep_fraction_range))
                 nl = float(np.random.uniform(*self.noise_range))
                 rng = np.random.default_rng()
-                input_nhw = degrade_dwi_slice(clean_nhw, kf, nl, rng)
+                input_nhw = degrade_dwi_slice(
+                    clean_nhw, kf, nl, rng,
+                    noise_distribution=self.noise_distribution,
+                    n_coils=self.n_coils,
+                )
         else:
             input_nhw = clean_nhw
 
@@ -332,8 +352,54 @@ class DWISliceDataset(Dataset):
                     dropped_volumes = None
             else:
                 dropped_volumes = None
+            if self.aug_bvec_mask_prob > 0.0 and random.random() < self.aug_bvec_mask_prob:
+                dw_idx = np.where(~b0_idx)[0]
+                if len(dw_idx) > 0:
+                    keep_frac = np.random.uniform(
+                        self.aug_bvec_mask_min_keep, self.aug_bvec_mask_max_keep
+                    )
+                    n_keep = max(1, int(round(len(dw_idx) * keep_frac)))
+                    keep_set = np.random.choice(dw_idx, size=n_keep, replace=False)
+                    bvec_drop = np.zeros(N, dtype=bool)
+                    bvec_drop[dw_idx] = True
+                    bvec_drop[keep_set] = False
+                    if bvec_drop.any():
+                        if input_nhw is clean_nhw:
+                            input_nhw = clean_nhw.copy()
+                        input_nhw[bvec_drop] = 0.0
+                        dropped_volumes = (
+                            bvec_drop if dropped_volumes is None
+                            else dropped_volumes | bvec_drop
+                        )
         else:
             dropped_volumes = None
+
+        # ── Deterministic degradation at eval time (volume dropout + bvec mask) ─
+        if self.eval_mode:
+            if self.aug_volume_dropout > 0.0:
+                rng_drop = np.random.default_rng(self.eval_seed + idx + 200_000)
+                drop = rng_drop.random(N) < self.aug_volume_dropout
+                if drop.any():
+                    if input_nhw is clean_nhw:
+                        input_nhw = clean_nhw.copy()
+                    input_nhw[drop] = 0.0
+                    dropped_volumes = drop
+            dw_idx = np.where(~b0_idx)[0]
+            if len(dw_idx) > 0:
+                rng_mask = np.random.default_rng(self.eval_seed + idx + 100_000)
+                n_keep = max(1, int(round(len(dw_idx) * self.eval_bvec_mask_keep)))
+                keep_set = rng_mask.choice(dw_idx, size=n_keep, replace=False)
+                bvec_drop = np.zeros(N, dtype=bool)
+                bvec_drop[dw_idx] = True
+                bvec_drop[keep_set] = False
+                if bvec_drop.any():
+                    if input_nhw is clean_nhw:
+                        input_nhw = clean_nhw.copy()
+                    input_nhw[bvec_drop] = 0.0
+                    dropped_volumes = (
+                        bvec_drop if dropped_volumes is None
+                        else dropped_volumes | bvec_drop
+                    )
 
         # ── Pad diffusion + spatial dims (single allocation per array) ──────
         n_pad = self.max_n - N

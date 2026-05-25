@@ -9,7 +9,7 @@ the same constants.  CLI argument defaults should reference these too.
 # ─────────────────────────────────────────────────────────────────────────────
 DATASET_ZARR_PATH = "dataset/default_clean.zarr"
 DATASET_QC_DIR = "dataset/default_clean_qc"
-TRAIN_OUT_DIR = "runs/production_6d_tiny"
+TRAIN_OUT_DIR = "runs/production_6d_tiny_rician_dropped"
 EVAL_OUT_DIR = "runs/evaluation"
 SEED = 42
 
@@ -18,10 +18,19 @@ SEED = 42
 # sees different noise and k-space cutouts for the same clean slice. The
 # dataset build stores only the clean DWI; there is no pre-degraded array.
 # ─────────────────────────────────────────────────────────────────────────────
-NOISE_MIN = 0.05              # minimum relative Gaussian noise level
-NOISE_MAX = 0.25              # maximum relative Gaussian noise level
+NOISE_MIN = 0.05              # minimum relative noise level (sigma / max(slice))
+NOISE_MAX = 0.25              # maximum relative noise level (sigma / max(slice))
 KEEP_FRACTION_MIN = 0.5       # min central k-space fraction kept
 KEEP_FRACTION_MAX = 0.7       # max central k-space fraction kept
+
+# Noise distribution applied on top of the lowpass cutout. Magnitude DWI is
+# Rician for single-coil reconstructions (Gudbjartsson & Patz 1995) and
+# non-central chi with 2*N_COILS DoF for N-coil sum-of-squares (Constantinides
+# 1997; Aja-Fernández 2009; Dietrich 2008). Use ``"rician"`` for the standard
+# publication baseline; ``"chi"`` with ``NOISE_COILS=8..32`` to mimic modern
+# accelerated parallel imaging. ``"gaussian"`` is kept for legacy comparisons.
+NOISE_DISTRIBUTION = "rician"  # 'gaussian' | 'rician' | 'chi'
+NOISE_COILS = 1                # effective coils for 'chi' (1 ≡ Rician)
 
 # Deterministic single-value defaults used at eval time (and as a back-compat
 # scalar when callers expect the legacy ``KEEP_FRACTION`` / Zarr attrs).
@@ -45,6 +54,10 @@ SLICE_AXES = (0, 1, 2)        # axes to sample from when RANDOM_SLICE_AXIS is Tr
 AUG_FLIP = True               # random physical-mirror flips: signal + tensor + bvecs transform together
 AUG_INTENSITY = 0.1           # uniform multiplicative jitter on the input (0 disables)
 AUG_VOLUME_DROPOUT = 0.1      # per-volume dropout probability on the input (0 disables)
+AUG_BVEC_MASK_PROB = 0.75      # probability of applying direction masking per sample (0 disables)
+AUG_BVEC_MASK_MIN_KEEP = 0.15 # minimum fraction of DW directions to retain
+AUG_BVEC_MASK_MAX_KEEP = 0.8  # maximum fraction of DW directions to retain
+EVAL_BVEC_MASK_KEEP = 0.5     # fixed fraction of DW directions kept during evaluation
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DWI / DTI shared constants
@@ -128,6 +141,8 @@ FODF_NOISE_MIN = 0.05
 FODF_NOISE_MAX = 0.25
 FODF_KEEP_FRACTION_MIN = 0.5
 FODF_KEEP_FRACTION_MAX = 0.75
+FODF_NOISE_DISTRIBUTION = "rician"   # 'gaussian' | 'rician' | 'chi'
+FODF_NOISE_COILS = 1                  # effective coils for 'chi' (1 ≡ Rician)
 FODF_KEEP_FRACTION = 0.6
 FODF_EVAL_KEEP_FRACTION = 0.6
 FODF_EVAL_NOISE_LEVEL = 0.055
@@ -145,6 +160,10 @@ FODF_SLICE_AXES = (2,)
 FODF_AUG_FLIP = True
 FODF_AUG_INTENSITY = 0.1
 FODF_AUG_VOLUME_DROPOUT = 0.02
+FODF_AUG_BVEC_MASK_PROB = 0.5
+FODF_AUG_BVEC_MASK_MIN_KEEP = 0.15
+FODF_AUG_BVEC_MASK_MAX_KEEP = 0.8
+FODF_EVAL_BVEC_MASK_KEEP = 0.5
 
 FODF_SH_ORDER = 4
 FODF_TRAIN_SH_ORDER = 4

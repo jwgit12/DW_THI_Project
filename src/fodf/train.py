@@ -509,6 +509,11 @@ def run_epoch(
             return value
         return torch.tensor(float(value), device=device)
 
+    # GPU-deferred degradation params live on the dataset; cache once per epoch.
+    ds = getattr(loader, "dataset", None)
+    gpu_noise_distribution = getattr(ds, "noise_distribution", "rician")
+    gpu_noise_coils = int(getattr(ds, "n_coils", 1))
+
     ctx = torch.enable_grad() if is_train else torch.no_grad()
     try:
         with ctx:
@@ -540,7 +545,11 @@ def run_epoch(
                         degrade_kf = batch["degrade_kf"].to(device, non_blocking=non_blocking)
                         degrade_nl = batch["degrade_nl"].to(device, non_blocking=non_blocking)
                         b0_mask = batch["b0_mask"].to(device, non_blocking=non_blocking)
-                        signal = gpu_degrade_dwi_batch(signal, degrade_kf, degrade_nl)
+                        signal = gpu_degrade_dwi_batch(
+                            signal, degrade_kf, degrade_nl,
+                            noise_distribution=gpu_noise_distribution,
+                            n_coils=gpu_noise_coils,
+                        )
                         signal = gpu_b0_normalize_batch(signal, b0_mask)
 
                 with record("train/forward" if is_train else "val/forward"):
@@ -802,6 +811,8 @@ def main(args: argparse.Namespace) -> None:
         use_brain_mask=use_brain_mask,
         keep_fraction_range=(args.keep_fraction_min, args.keep_fraction_max),
         noise_range=(args.noise_min, args.noise_max),
+        noise_distribution=args.noise_distribution,
+        n_coils=args.noise_coils,
         random_axis=args.random_slice_axis,
         slice_axes=tuple(args.slice_axes),
         aug_flip=args.aug_flip,
@@ -823,6 +834,8 @@ def main(args: argparse.Namespace) -> None:
         eval_keep_fraction=args.eval_keep_fraction,
         eval_noise_level=args.eval_noise_level,
         eval_seed=args.eval_seed,
+        noise_distribution=args.noise_distribution,
+        n_coils=args.noise_coils,
         context_slices=args.context_slices,
         target_fodf_sh_order=args.train_fodf_sh_order,
     )
@@ -1238,6 +1251,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--keep_fraction_max", type=float, default=cfg.KEEP_FRACTION_MAX)
     parser.add_argument("--noise_min", type=float, default=cfg.NOISE_MIN)
     parser.add_argument("--noise_max", type=float, default=cfg.NOISE_MAX)
+    parser.add_argument(
+        "--noise_distribution", choices=["gaussian", "rician", "chi"],
+        default=cfg.NOISE_DISTRIBUTION,
+        help="Magnitude noise model. Rician (default) is the standard DWI noise; chi mimics multi-coil SoS.",
+    )
+    parser.add_argument(
+        "--noise_coils", type=int, default=cfg.NOISE_COILS,
+        help="Effective coil count for --noise_distribution chi (1 ≡ Rician).",
+    )
     parser.add_argument("--eval_keep_fraction", type=float, default=cfg.EVAL_KEEP_FRACTION)
     parser.add_argument("--eval_noise_level", type=float, default=cfg.EVAL_NOISE_LEVEL)
     parser.add_argument("--eval_seed", type=int, default=cfg.EVAL_DEGRADE_SEED)

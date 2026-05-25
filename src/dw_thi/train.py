@@ -372,6 +372,43 @@ def move_batch_tensor(
     return tensor.to(device, non_blocking=non_blocking)
 
 
+def _noisy_fa_adc(
+    sample: dict,
+    val_ds: DWISliceDataset,
+    slice_idx: int,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Fit OLS DTI to the degraded/masked input slice and return (FA, ADC).
+
+    Uses only the directions that were not masked out (vol_mask == 1).
+    Returns None if too few valid directions remain for a stable fit.
+    """
+    from dipy.core.gradients import gradient_table
+    from dipy.reconst.dti import TensorModel
+
+    key, _, _ = val_ds.samples[slice_idx]
+    orig_bvals = val_ds._data[key]["bvals"]   # (N,) raw b-values
+    orig_bvecs = val_ds._data[key]["bvecs"]   # (3, N)
+    N = len(orig_bvals)
+
+    valid = sample["vol_mask"].numpy()[:N].astype(bool)
+    if int(valid.sum()) < 7:
+        return None
+
+    noisy = sample["input"].numpy()[:N]        # (N, H, W)
+    sig = noisy[valid].transpose(1, 2, 0)[:, :, np.newaxis, :]  # (H, W, 1, n_valid)
+    bvals_v = orig_bvals[valid]
+    bvecs_v = orig_bvecs[:, valid].T           # (n_valid, 3)
+
+    try:
+        gtab = gradient_table(bvals_v, bvecs_v, b0_threshold=val_ds.b0_threshold)
+        fit = TensorModel(gtab, fit_method="OLS").fit(sig)
+        fa = np.clip(fit.fa[:, :, 0], 0.0, 1.0).astype(np.float32)
+        adc = np.clip(fit.md[:, :, 0], 0.0, None).astype(np.float32)
+        return fa, adc
+    except Exception:
+        return None
+
+
 def make_val_figure(
     model: QSpaceUNet,
     val_ds: DWISliceDataset,
@@ -382,7 +419,12 @@ def make_val_figure(
     amp_dtype: torch.dtype | None = None,
     channels_last: bool = False,
 ) -> plt.Figure:
-    """Generate a prediction-vs-target figure for TensorBoard."""
+    """Generate a prediction-vs-target figure for TensorBoard.
+
+    Layout (2 rows × 5 columns):
+      Row 0 — FA:  Noisy | Target | Predicted | Error map | Scatter
+      Row 1 — ADC: Noisy | Target | Predicted | Error map | Scatter
+    """
     if slice_idx is None:
         slice_idx = len(val_ds) // 2
 
@@ -422,49 +464,69 @@ def make_val_figure(
     fa_diff = (tgt_fa - pred_fa) * bmask
     adc_diff = (tgt_adc - pred_adc) * bmask
 
-    fig, axes = plt.subplots(2, 4, figsize=(20, 10))
-
-    axes[0, 0].imshow(np.rot90(tgt_fa * bmask), cmap="viridis", vmin=0, vmax=1)
-    axes[0, 0].set_title("Target FA")
-    axes[0, 1].imshow(np.rot90(pred_fa * bmask), cmap="viridis", vmin=0, vmax=1)
-    axes[0, 1].set_title("Predicted FA")
-    fa_abs = max(float(np.max(np.abs(fa_diff))), 1e-6)
-    im_fa = axes[0, 2].imshow(np.rot90(fa_diff), cmap="bwr", vmin=-fa_abs, vmax=fa_abs)
-    axes[0, 2].set_title("FA error")
-    fig.colorbar(im_fa, ax=axes[0, 2], fraction=0.046, pad=0.04)
-
-    fa_tgt_brain = tgt_fa[bmask_bool]
-    fa_pred_brain = pred_fa[bmask_bool]
-    axes[0, 3].scatter(fa_tgt_brain, fa_pred_brain, s=1, alpha=0.3)
-    axes[0, 3].plot([0, 1], [0, 1], "r--", lw=1)
-    fa_metrics = scalar_map_metrics(tgt_fa, pred_fa, mask=bmask_bool)
-    axes[0, 3].set_title(f"FA RMSE={fa_metrics['rmse']:.4f} R2={fa_metrics['r2']:.3f}")
-    axes[0, 3].set_xlabel("Target")
-    axes[0, 3].set_ylabel("Predicted")
-    axes[0, 3].set_aspect("equal")
-
     adc_brain = tgt_adc[bmask_bool]
     adc_hi = max(float(np.percentile(adc_brain, 99)), 1e-6) if adc_brain.size else 1e-6
-    axes[1, 0].imshow(np.rot90(tgt_adc * bmask), cmap="magma", vmin=0, vmax=adc_hi)
-    axes[1, 0].set_title("Target ADC")
-    axes[1, 1].imshow(np.rot90(pred_adc * bmask), cmap="magma", vmin=0, vmax=adc_hi)
-    axes[1, 1].set_title("Predicted ADC")
+
+    noisy_maps = _noisy_fa_adc(sample, val_ds, slice_idx)
+
+    fig, axes = plt.subplots(2, 5, figsize=(25, 10))
+
+    # ── Column 0: noisy DTI fit ───────────────────────────────────────────────
+    if noisy_maps is not None:
+        noisy_fa, noisy_adc = noisy_maps
+        axes[0, 0].imshow(np.rot90(noisy_fa * bmask), cmap="viridis", vmin=0, vmax=1)
+        axes[0, 0].set_title("Noisy FA")
+        axes[1, 0].imshow(np.rot90(noisy_adc * bmask), cmap="magma", vmin=0, vmax=adc_hi)
+        axes[1, 0].set_title("Noisy ADC")
+    else:
+        axes[0, 0].set_title("Noisy FA (N/A)")
+        axes[1, 0].set_title("Noisy ADC (N/A)")
+
+    # ── Column 1: target ─────────────────────────────────────────────────────
+    axes[0, 1].imshow(np.rot90(tgt_fa * bmask), cmap="viridis", vmin=0, vmax=1)
+    axes[0, 1].set_title("Target FA")
+    axes[1, 1].imshow(np.rot90(tgt_adc * bmask), cmap="magma", vmin=0, vmax=adc_hi)
+    axes[1, 1].set_title("Target ADC")
+
+    # ── Column 2: model prediction ───────────────────────────────────────────
+    axes[0, 2].imshow(np.rot90(pred_fa * bmask), cmap="viridis", vmin=0, vmax=1)
+    axes[0, 2].set_title("Predicted FA")
+    axes[1, 2].imshow(np.rot90(pred_adc * bmask), cmap="magma", vmin=0, vmax=adc_hi)
+    axes[1, 2].set_title("Predicted ADC")
+
+    # ── Column 3: error maps ──────────────────────────────────────────────────
+    fa_abs = max(float(np.max(np.abs(fa_diff))), 1e-6)
+    im_fa = axes[0, 3].imshow(np.rot90(fa_diff), cmap="bwr", vmin=-fa_abs, vmax=fa_abs)
+    axes[0, 3].set_title("FA error")
+    fig.colorbar(im_fa, ax=axes[0, 3], fraction=0.046, pad=0.04)
+
     adc_abs = max(float(np.max(np.abs(adc_diff))), 1e-6)
-    im_adc = axes[1, 2].imshow(np.rot90(adc_diff), cmap="bwr", vmin=-adc_abs, vmax=adc_abs)
-    axes[1, 2].set_title("ADC error")
-    fig.colorbar(im_adc, ax=axes[1, 2], fraction=0.046, pad=0.04)
+    im_adc = axes[1, 3].imshow(np.rot90(adc_diff), cmap="bwr", vmin=-adc_abs, vmax=adc_abs)
+    axes[1, 3].set_title("ADC error")
+    fig.colorbar(im_adc, ax=axes[1, 3], fraction=0.046, pad=0.04)
+
+    # ── Column 4: scatter plots ───────────────────────────────────────────────
+    fa_tgt_brain = tgt_fa[bmask_bool]
+    fa_pred_brain = pred_fa[bmask_bool]
+    axes[0, 4].scatter(fa_tgt_brain, fa_pred_brain, s=1, alpha=0.3)
+    axes[0, 4].plot([0, 1], [0, 1], "r--", lw=1)
+    fa_metrics = scalar_map_metrics(tgt_fa, pred_fa, mask=bmask_bool)
+    axes[0, 4].set_title(f"FA RMSE={fa_metrics['rmse']:.4f} R2={fa_metrics['r2']:.3f}")
+    axes[0, 4].set_xlabel("Target")
+    axes[0, 4].set_ylabel("Predicted")
+    axes[0, 4].set_aspect("equal")
 
     adc_pred_brain = pred_adc[bmask_bool]
-    axes[1, 3].scatter(adc_brain, adc_pred_brain, s=1, alpha=0.3)
-    axes[1, 3].plot([0, adc_hi], [0, adc_hi], "r--", lw=1)
+    axes[1, 4].scatter(adc_brain, adc_pred_brain, s=1, alpha=0.3)
+    axes[1, 4].plot([0, adc_hi], [0, adc_hi], "r--", lw=1)
     adc_metrics = scalar_map_metrics(tgt_adc, pred_adc, mask=bmask_bool)
-    axes[1, 3].set_title(f"ADC RMSE={adc_metrics['rmse']:.2e} R2={adc_metrics['r2']:.3f}")
-    axes[1, 3].set_xlabel("Target")
-    axes[1, 3].set_ylabel("Predicted")
-    axes[1, 3].set_aspect("equal")
+    axes[1, 4].set_title(f"ADC RMSE={adc_metrics['rmse']:.2e} R2={adc_metrics['r2']:.3f}")
+    axes[1, 4].set_xlabel("Target")
+    axes[1, 4].set_ylabel("Predicted")
+    axes[1, 4].set_aspect("equal")
 
     for ax in axes.ravel():
-        if ax not in [axes[0, 3], axes[1, 3]]:
+        if ax not in [axes[0, 4], axes[1, 4]]:
             ax.axis("off")
 
     fig.tight_layout()
@@ -504,6 +566,11 @@ def run_epoch(
             return value
         return torch.tensor(float(value), device=device)
 
+    # GPU-deferred degradation params live on the dataset; cache once per epoch.
+    ds = getattr(loader, "dataset", None)
+    gpu_noise_distribution = getattr(ds, "noise_distribution", "rician")
+    gpu_noise_coils = int(getattr(ds, "n_coils", 1))
+
     ctx = torch.enable_grad() if is_train else torch.no_grad()
     with ctx:
         for batch in loader:
@@ -534,7 +601,11 @@ def run_epoch(
                     degrade_kf = batch["degrade_kf"].to(device, non_blocking=non_blocking)
                     degrade_nl = batch["degrade_nl"].to(device, non_blocking=non_blocking)
                     b0_mask = batch["b0_mask"].to(device, non_blocking=non_blocking)
-                    signal = gpu_degrade_dwi_batch(signal, degrade_kf, degrade_nl)
+                    signal = gpu_degrade_dwi_batch(
+                        signal, degrade_kf, degrade_nl,
+                        noise_distribution=gpu_noise_distribution,
+                        n_coils=gpu_noise_coils,
+                    )
                     signal = gpu_b0_normalize_batch(signal, b0_mask)
 
             with record("train/forward" if is_train else "val/forward"):
@@ -759,6 +830,8 @@ def main(args: argparse.Namespace) -> None:
         use_brain_mask=use_brain_mask,
         keep_fraction_range=(args.keep_fraction_min, args.keep_fraction_max),
         noise_range=(args.noise_min, args.noise_max),
+        noise_distribution=args.noise_distribution,
+        n_coils=args.noise_coils,
         random_axis=args.random_slice_axis,
         slice_axes=tuple(args.slice_axes),
         aug_flip=args.aug_flip,
@@ -776,6 +849,8 @@ def main(args: argparse.Namespace) -> None:
         eval_keep_fraction=args.eval_keep_fraction,
         eval_noise_level=args.eval_noise_level,
         eval_seed=args.eval_seed,
+        noise_distribution=args.noise_distribution,
+        n_coils=args.noise_coils,
     )
 
     global_max_n = max(train_ds.max_n, val_ds.max_n)
@@ -1129,6 +1204,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--keep_fraction_max", type=float, default=cfg.KEEP_FRACTION_MAX)
     parser.add_argument("--noise_min", type=float, default=cfg.NOISE_MIN)
     parser.add_argument("--noise_max", type=float, default=cfg.NOISE_MAX)
+    parser.add_argument(
+        "--noise_distribution", choices=["gaussian", "rician", "chi"],
+        default=cfg.NOISE_DISTRIBUTION,
+        help="Magnitude noise model. Rician (default) is the standard DWI noise; chi mimics multi-coil SoS.",
+    )
+    parser.add_argument(
+        "--noise_coils", type=int, default=cfg.NOISE_COILS,
+        help="Effective coil count for --noise_distribution chi (1 ≡ Rician).",
+    )
     parser.add_argument("--eval_keep_fraction", type=float, default=cfg.EVAL_KEEP_FRACTION)
     parser.add_argument("--eval_noise_level", type=float, default=cfg.EVAL_NOISE_LEVEL)
     parser.add_argument("--eval_seed", type=int, default=cfg.EVAL_DEGRADE_SEED)

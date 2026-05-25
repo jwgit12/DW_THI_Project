@@ -13,7 +13,7 @@ entry points dispatch to the requested pipeline.
 ## Pipeline
 
 For the fODF-specific reference flow, see
-[`src/fodf/Pipeline.md`](src/fodf/Pipeline.md).
+[`src/fodf/Pipeline.md`](Pipeline.md).
 
 ```text
 Raw DWI NIfTI + bval/bvec

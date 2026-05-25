@@ -54,6 +54,17 @@ def lowres_kspace_cutout(slice_nhw: np.ndarray, keep_fraction: float) -> np.ndar
     return lowres
 
 
+_NOISE_GAUSSIAN = "gaussian"
+_NOISE_RICIAN = "rician"
+_NOISE_CHI = "chi"
+_VALID_NOISE = (_NOISE_GAUSSIAN, _NOISE_RICIAN, _NOISE_CHI)
+
+
+def _per_volume_sigma(slice_nhw: np.ndarray, rel_noise_level: float) -> np.ndarray:
+    slice_max = slice_nhw.reshape(slice_nhw.shape[0], -1).max(axis=1)
+    return (rel_noise_level * slice_max).astype(np.float32).reshape(-1, 1, 1)
+
+
 def add_scaled_gaussian_noise(
     slice_nhw: np.ndarray,
     rel_noise_level: float,
@@ -61,13 +72,88 @@ def add_scaled_gaussian_noise(
 ) -> np.ndarray:
     """Add Gaussian noise with per-slice ``sigma = rel_noise_level * max(slice)``.
 
-    Matches the legacy low-resolution/noise degradation but operates on a
-    (N, H, W) stack and takes a single noise level that can vary per call.
+    Kept for back-compat. Use :func:`add_magnitude_noise` for the publication
+    pipeline (Rician / non-central chi).
     """
-    slice_max = slice_nhw.reshape(slice_nhw.shape[0], -1).max(axis=1)
-    sigma = (rel_noise_level * slice_max).astype(np.float32).reshape(-1, 1, 1)
+    sigma = _per_volume_sigma(slice_nhw, rel_noise_level)
     noise = rng.standard_normal(slice_nhw.shape, dtype=np.float32) * sigma
     return slice_nhw + noise
+
+
+def add_rician_noise(
+    slice_nhw: np.ndarray,
+    rel_noise_level: float,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Add Rician noise to a magnitude DWI stack.
+
+    Standard magnitude-MR noise model (Gudbjartsson & Patz, 1995):
+
+        M = sqrt((S + eta_r)^2 + eta_i^2),  eta_r, eta_i ~ N(0, sigma)
+
+    ``sigma`` is set per volume to ``rel_noise_level * max(slice)`` so the
+    interpretation matches the legacy Gaussian path: high-SNR voxels behave
+    like ``S + eta_r`` (variance ``sigma^2``), while low-SNR voxels exhibit
+    the well-known positive Rician bias.
+    """
+    sigma = _per_volume_sigma(slice_nhw, rel_noise_level)
+    eta_r = rng.standard_normal(slice_nhw.shape, dtype=np.float32) * sigma
+    eta_i = rng.standard_normal(slice_nhw.shape, dtype=np.float32) * sigma
+    real = slice_nhw + eta_r
+    return np.sqrt(real * real + eta_i * eta_i, dtype=np.float32)
+
+
+def add_noncentral_chi_noise(
+    slice_nhw: np.ndarray,
+    rel_noise_level: float,
+    rng: np.random.Generator,
+    n_coils: int,
+) -> np.ndarray:
+    """Add non-central chi noise — multi-coil sum-of-squares MR magnitude.
+
+    For ``n_coils=1`` this collapses to Rician. For ``n_coils > 1`` the result
+    follows a non-central chi distribution with 2*n_coils degrees of freedom
+    (Constantinides 1997; Aja-Fernández 2009), the appropriate model for SoS
+    reconstruction from N receive coils with uniform sensitivity:
+
+        M = sqrt(sum_{i=1..N} (S * delta_{i,1} + eta_r_i)^2 + eta_i_i^2)
+
+    The signal sits in a single virtual channel, which keeps the noise-free
+    expectation equal to ``S`` and the asymptotic high-SNR std equal to sigma.
+    """
+    if n_coils <= 0:
+        raise ValueError(f"n_coils must be >= 1, got {n_coils}.")
+    if n_coils == 1:
+        return add_rician_noise(slice_nhw, rel_noise_level, rng)
+    sigma = _per_volume_sigma(slice_nhw, rel_noise_level)
+    eta_r0 = rng.standard_normal(slice_nhw.shape, dtype=np.float32) * sigma
+    eta_i0 = rng.standard_normal(slice_nhw.shape, dtype=np.float32) * sigma
+    real0 = slice_nhw + eta_r0
+    sumsq = real0 * real0 + eta_i0 * eta_i0
+    extra_shape = (2 * (n_coils - 1) + 1, *slice_nhw.shape)  # 2*(N-1) + 1 == 2N-1
+    extras = rng.standard_normal(extra_shape, dtype=np.float32) * sigma
+    sumsq += np.einsum("k...,k...->...", extras, extras)
+    return np.sqrt(sumsq, dtype=np.float32)
+
+
+def add_magnitude_noise(
+    slice_nhw: np.ndarray,
+    rel_noise_level: float,
+    rng: np.random.Generator,
+    distribution: str = _NOISE_RICIAN,
+    n_coils: int = 1,
+) -> np.ndarray:
+    """Dispatch helper: ``"gaussian" | "rician" | "chi"``."""
+    distribution = (distribution or _NOISE_RICIAN).lower()
+    if distribution not in _VALID_NOISE:
+        raise ValueError(
+            f"Unknown noise distribution {distribution!r}; expected one of {_VALID_NOISE}."
+        )
+    if distribution == _NOISE_GAUSSIAN:
+        return add_scaled_gaussian_noise(slice_nhw, rel_noise_level, rng)
+    if distribution == _NOISE_RICIAN:
+        return add_rician_noise(slice_nhw, rel_noise_level, rng)
+    return add_noncentral_chi_noise(slice_nhw, rel_noise_level, rng, n_coils)
 
 
 def degrade_dwi_slice(
@@ -75,12 +161,23 @@ def degrade_dwi_slice(
     keep_fraction: float,
     rel_noise_level: float,
     rng: np.random.Generator | None = None,
+    *,
+    noise_distribution: str = _NOISE_RICIAN,
+    n_coils: int = 1,
 ) -> np.ndarray:
-    """Apply central-k-space cutout + Gaussian noise to a clean DWI slice stack."""
+    """Apply central-k-space cutout + magnitude noise to a clean DWI slice stack.
+
+    The default noise model is **Rician** — the established magnitude-MR
+    distribution for DWI denoising publications. Pass ``noise_distribution="chi"``
+    with ``n_coils > 1`` to simulate multi-coil sum-of-squares reconstruction.
+    """
     if rng is None:
         rng = np.random.default_rng()
     lowres = lowres_kspace_cutout(slice_nhw, keep_fraction)
-    return add_scaled_gaussian_noise(lowres, rel_noise_level, rng)
+    return add_magnitude_noise(
+        lowres, rel_noise_level, rng,
+        distribution=noise_distribution, n_coils=n_coils,
+    )
 
 
 def degrade_dwi_volume(
@@ -88,6 +185,9 @@ def degrade_dwi_volume(
     keep_fraction: float,
     rel_noise_level: float,
     seed: int | None = None,
+    *,
+    noise_distribution: str = _NOISE_RICIAN,
+    n_coils: int = 1,
 ) -> np.ndarray:
     """Degrade a full 4D DWI volume deterministically. Used by eval/visualizer.
 
@@ -97,6 +197,9 @@ def degrade_dwi_volume(
     keep_fraction, rel_noise_level : scalar, applied uniformly to every slice.
     seed : int or None
         If given, the noise is fully reproducible (for evaluation).
+    noise_distribution : ``"rician"`` (default), ``"chi"``, or ``"gaussian"``.
+    n_coils : int
+        Number of coils for non-central chi (``>=1``; ``1`` ≡ Rician).
 
     Returns
     -------
@@ -107,7 +210,10 @@ def degrade_dwi_volume(
     # Process axial slices: reshape (X, Y, Z, N) -> (Z*N, X, Y) per axial slice.
     perm = np.ascontiguousarray(dwi_xyzn.transpose(2, 3, 0, 1)).reshape(z * n, x, y)
     lowres = lowres_kspace_cutout(perm, keep_fraction)
-    noisy = add_scaled_gaussian_noise(lowres, rel_noise_level, rng)
+    noisy = add_magnitude_noise(
+        lowres, rel_noise_level, rng,
+        distribution=noise_distribution, n_coils=n_coils,
+    )
     return np.ascontiguousarray(
         noisy.reshape(z, n, x, y).transpose(2, 3, 0, 1)
     )
@@ -151,8 +257,11 @@ def gpu_degrade_dwi_batch(
     signal: torch.Tensor,
     keep_fraction: torch.Tensor,
     noise_level: torch.Tensor,
+    *,
+    noise_distribution: str = _NOISE_RICIAN,
+    n_coils: int = 1,
 ) -> torch.Tensor:
-    """K-space cutout + Gaussian noise for a full batch on GPU (cuFFT).
+    """K-space cutout + magnitude noise for a full batch on GPU (cuFFT).
 
     Semantically identical to ``degrade_dwi_slice`` but operates on
     ``(B, N, H, W)`` tensors and uses ``torch.fft.rfft2``, which is
@@ -163,6 +272,9 @@ def gpu_degrade_dwi_batch(
     signal : (B, N, H, W) or (B, N, D, H, W) float32, on device
     keep_fraction : (B,) float32 — fraction of each spatial axis kept around DC
     noise_level : (B,) float32 — rel_noise_level per sample
+    noise_distribution : ``"rician"`` (default), ``"chi"``, or ``"gaussian"``.
+    n_coils : int
+        Coil count for ``"chi"`` (``1`` ≡ Rician).
 
     Returns
     -------
@@ -173,7 +285,10 @@ def gpu_degrade_dwi_batch(
         flat = signal.permute(0, 2, 1, 3, 4).reshape(b * d, n, h, w)
         flat_kf = keep_fraction.repeat_interleave(d)
         flat_nl = noise_level.repeat_interleave(d)
-        flat = gpu_degrade_dwi_batch(flat, flat_kf, flat_nl)
+        flat = gpu_degrade_dwi_batch(
+            flat, flat_kf, flat_nl,
+            noise_distribution=noise_distribution, n_coils=n_coils,
+        )
         return (
             flat.reshape(b, d, n, h, w)
             .permute(0, 2, 1, 3, 4)
@@ -183,6 +298,13 @@ def gpu_degrade_dwi_batch(
         raise ValueError(
             f"gpu_degrade_dwi_batch expected 4D or 5D signal, got {tuple(signal.shape)}."
         )
+    distribution = (noise_distribution or _NOISE_RICIAN).lower()
+    if distribution not in _VALID_NOISE:
+        raise ValueError(
+            f"Unknown noise distribution {distribution!r}; expected one of {_VALID_NOISE}."
+        )
+    if distribution == _NOISE_CHI and n_coils <= 0:
+        raise ValueError(f"n_coils must be >= 1, got {n_coils}.")
     B, N, H, W = signal.shape
 
     k = torch.fft.rfft2(signal, dim=(-2, -1))  # (B, N, H, W//2+1) complex
@@ -202,10 +324,22 @@ def gpu_degrade_dwi_batch(
 
     slice_max = lowres.reshape(B, N, -1).amax(dim=-1)            # (B, N)
     sigma = (noise_level[:, None] * slice_max).view(B, N, 1, 1)
-    noise = torch.randn_like(lowres)
-    noise.mul_(sigma)
-    lowres.add_(noise)
-    return lowres
+
+    if distribution == _NOISE_GAUSSIAN:
+        noise = torch.randn_like(lowres).mul_(sigma)
+        return lowres.add_(noise)
+
+    # Rician / non-central chi share the same magnitude formula; chi adds
+    # 2*(n_coils-1) extra zero-mean Gaussian channels to the sum-of-squares.
+    eta_r = torch.randn_like(lowres).mul_(sigma)
+    eta_i = torch.randn_like(lowres).mul_(sigma)
+    real = lowres.add_(eta_r)
+    sumsq = real.mul_(real).addcmul_(eta_i, eta_i)
+    if distribution == _NOISE_CHI and n_coils > 1:
+        for _ in range(2 * (n_coils - 1)):
+            extra = torch.randn_like(sumsq).mul_(sigma)
+            sumsq.addcmul_(extra, extra)
+    return sumsq.sqrt_()
 
 
 def gpu_b0_normalize_batch(

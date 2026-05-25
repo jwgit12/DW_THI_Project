@@ -1193,6 +1193,8 @@ class PredTractWorker(QRunnable):
                 self.keep_fraction,
                 self.noise_level,
                 seed=self.seed,
+                noise_distribution=cfg.NOISE_DISTRIBUTION,
+                n_coils=cfg.NOISE_COILS,
             )
 
             x, y, z, n = degraded.shape
@@ -1954,7 +1956,11 @@ class DatasetViewer(QMainWindow):
                 self.noise_slider.value(),
             )
         )
-        degraded = degrade_dwi_slice(clean_nhw, self.keep_fraction, self.noise_level, rng)
+        degraded = degrade_dwi_slice(
+            clean_nhw, self.keep_fraction, self.noise_level, rng,
+            noise_distribution=cfg.NOISE_DISTRIBUTION,
+            n_coils=cfg.NOISE_COILS,
+        )
         self.degraded_slice_cache[key] = degraded
         return degraded
 

@@ -69,6 +69,8 @@ def _load_input_dwi(
     keep_fraction: float = cfg.EVAL_KEEP_FRACTION,
     noise_level: float = cfg.EVAL_NOISE_LEVEL,
     seed: int = cfg.EVAL_DEGRADE_SEED,
+    noise_distribution: str = cfg.NOISE_DISTRIBUTION,
+    n_coils: int = cfg.NOISE_COILS,
 ) -> np.ndarray:
     """Return the degraded DWI for eval.
 
@@ -80,7 +82,12 @@ def _load_input_dwi(
         return np.asarray(grp["input_dwi"][:], dtype=np.float32)
     clean = target_dwi if target_dwi is not None else np.asarray(grp["target_dwi"][:], dtype=np.float32)
     return degrade_dwi_volume(
-        clean, keep_fraction=keep_fraction, rel_noise_level=noise_level, seed=seed,
+        clean,
+        keep_fraction=keep_fraction,
+        rel_noise_level=noise_level,
+        seed=seed,
+        noise_distribution=noise_distribution,
+        n_coils=n_coils,
     )
 
 
@@ -336,6 +343,8 @@ def evaluate_subject(
     keep_fraction: float = cfg.EVAL_KEEP_FRACTION,
     noise_level: float = cfg.EVAL_NOISE_LEVEL,
     degrade_seed: int = cfg.EVAL_DEGRADE_SEED,
+    noise_distribution: str = cfg.NOISE_DISTRIBUTION,
+    n_coils: int = cfg.NOISE_COILS,
     run_patch2self: bool = True,
     run_mppca: bool = True,
     p2s_cfg: dict | None = None,
@@ -365,6 +374,8 @@ def evaluate_subject(
         keep_fraction=keep_fraction,
         rel_noise_level=noise_level,
         seed=degrade_seed,
+        noise_distribution=noise_distribution,
+        n_coils=n_coils,
     )
     bvals = np.asarray(grp["bvals"][:], dtype=np.float32)
     bvecs = np.asarray(grp["bvecs"][:], dtype=np.float32)
@@ -905,6 +916,8 @@ def run_patch2self_sweep(
                 keep_fraction=trial["keep_fraction"],
                 rel_noise_level=trial["noise_level"],
                 seed=trial["degrade_seed"],
+                noise_distribution=args.noise_distribution,
+                n_coils=args.noise_coils,
             )
 
             for config_idx, p2s_cfg in enumerate(p2s_configs):
@@ -1156,6 +1169,8 @@ def main(args):
                     keep_fraction=trial["keep_fraction"],
                     noise_level=trial["noise_level"],
                     degrade_seed=trial["degrade_seed"],
+                    noise_distribution=args.noise_distribution,
+                    n_coils=args.noise_coils,
                     run_patch2self=run_patch2self,
                     run_mppca=run_mppca,
                     p2s_cfg=p2s_cfg,
@@ -1369,6 +1384,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval_noise_max", "--eval-noise-max", type=float,
                         default=cfg.EVAL_NOISE_MAX,
                         help="Maximum relative Gaussian noise level sampled during evaluation")
+    parser.add_argument(
+        "--noise_distribution", "--noise-distribution",
+        choices=["gaussian", "rician", "chi"], default=cfg.NOISE_DISTRIBUTION,
+        help="Magnitude noise model used to corrupt the clean DWI at eval time. "
+             "Rician is the standard publication baseline; chi mimics multi-coil SoS.",
+    )
+    parser.add_argument(
+        "--noise_coils", "--noise-coils", type=int, default=cfg.NOISE_COILS,
+        help="Effective coil count for --noise_distribution chi (1 ≡ Rician).",
+    )
     parser.add_argument("--infer_batch_size", "--infer-batch-size", type=int, default=cfg.EVAL_INFER_BATCH_SIZE,
                         help="Number of axial slices evaluated per GPU forward pass")
     amp_group = parser.add_mutually_exclusive_group()
