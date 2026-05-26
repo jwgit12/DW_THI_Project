@@ -115,12 +115,19 @@ def predict_subject(
     dti_scale: float = 1.0,
     max_bval: float = 1000.0,
     input_dwi: np.ndarray | None = None,
+    vol_mask: np.ndarray | None = None,
     batch_size: int = 16,
     amp_enabled: bool = False,
     amp_dtype: torch.dtype | None = None,
     channels_last: bool = False,
 ) -> np.ndarray:
     """Run inference on a full 3D subject, slice by slice.
+
+    ``vol_mask`` is an optional ``(N,)`` array (1 = keep, 0 = dropped) marking
+    which input volumes the model should attend to — pass it when the input has
+    masked/dropped volumes (zeroed signal) so the q-space encoder ignores them,
+    matching the training-time ``vol_mask``. Defaults to all-ones (every volume
+    kept).
 
     Returns predicted DTI tensor (X, Y, Z, 6) as float32 numpy array.
     """
@@ -147,14 +154,18 @@ def predict_subject(
         bvecs = np.pad(bvecs, ((0, 0), (0, pad)))
         input_dwi = np.pad(input_dwi, ((0, 0), (0, 0), (0, 0), (0, pad)))
 
-    vol_mask = np.zeros(max_n, dtype=np.float32)
-    vol_mask[:N] = 1.0
+    vol_mask_full = np.zeros(max_n, dtype=np.float32)
+    if vol_mask is not None:
+        vm = np.asarray(vol_mask, dtype=np.float32).reshape(-1)
+        vol_mask_full[:N] = vm[:N]
+    else:
+        vol_mask_full[:N] = 1.0
 
     # Prepare gradient tensors (shared across slices)
     non_blocking = device.type == "cuda"
     bvals_t = torch.from_numpy(bvals_norm).unsqueeze(0).to(device, non_blocking=non_blocking)
     bvecs_t = torch.from_numpy(bvecs).unsqueeze(0).to(device, non_blocking=non_blocking)
-    vol_mask_t = torch.from_numpy(vol_mask).unsqueeze(0).to(device, non_blocking=non_blocking)
+    vol_mask_t = torch.from_numpy(vol_mask_full).unsqueeze(0).to(device, non_blocking=non_blocking)
 
     # Compute normalisation factor from mean b0
     b0_idx = bvals[:N] < b0_threshold
