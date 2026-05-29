@@ -6,6 +6,7 @@ __all__ = [
     "evaluate",
     "loss",
     "model",
+    "models",
     "preprocessing",
     "runtime",
     "train",

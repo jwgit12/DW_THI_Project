@@ -66,7 +66,7 @@ from dw_thi.utils import (
     tensor6_to_full,
     tensor_to_eig,
 )
-from dw_thi.model import QSpaceUNet
+from dw_thi.models import QSpaceUNet, build_model
 import config as cfg
 
 
@@ -195,16 +195,18 @@ def _resolve_device(name: str) -> torch.device:
 def load_checkpoint_model(
     checkpoint_path: str,
     device: torch.device,
-) -> tuple[QSpaceUNet, dict[str, object]]:
+) -> tuple[torch.nn.Module, dict[str, object]]:
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     max_n = int(ckpt["max_n"])
     feat_dim = int(ckpt.get("feat_dim", 64))
     channels = tuple(ckpt.get("channels", [64, 128, 256, 512]))
+    model_name = str(ckpt.get("model_name", "qspace_unet"))
     cholesky = bool(ckpt.get("cholesky", False))
     dti_scale = float(ckpt.get("dti_scale", 1.0))
     max_bval = float(ckpt.get("max_bval", 1000.0))
 
-    model = QSpaceUNet(
+    model = build_model(
+        model_name,
         max_n=max_n,
         feat_dim=feat_dim,
         channels=channels,
@@ -214,6 +216,7 @@ def load_checkpoint_model(
     model.eval()
     return model, {
         "epoch": int(ckpt.get("epoch", -1)),
+        "model_name": model_name,
         "max_n": max_n,
         "dti_scale": dti_scale,
         "max_bval": max_bval,

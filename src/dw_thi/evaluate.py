@@ -43,7 +43,7 @@ from .utils import (
 )
 from .preprocessing import compute_b0_norm, compute_brain_mask_from_dwi
 from .augment import degrade_dwi_volume
-from .model import QSpaceUNet
+from .models import build_model
 from .runtime import (
     amp_dtype_from_name,
     autocast_context,
@@ -1055,12 +1055,19 @@ def main(args):
     max_n = ckpt["max_n"]
     feat_dim = ckpt.get("feat_dim", 64)
     channels = tuple(ckpt.get("channels", [64, 128, 256, 512]))
+    model_name = ckpt.get("model_name", "qspace_unet")
     cholesky = ckpt.get("cholesky", False)
     dti_scale = ckpt.get("dti_scale", 1.0)
     max_bval = ckpt.get("max_bval", 1000.0)
-    log.info("DTI scale factor: %.4f, max_bval: %.1f, cholesky: %s", dti_scale, max_bval, cholesky)
+    log.info("Model: %s | DTI scale factor: %.4f, max_bval: %.1f, cholesky: %s", model_name, dti_scale, max_bval, cholesky)
 
-    raw_model = QSpaceUNet(max_n=max_n, feat_dim=feat_dim, channels=channels, cholesky=cholesky).to(device)
+    raw_model = build_model(
+        model_name,
+        max_n=max_n,
+        feat_dim=feat_dim,
+        channels=channels,
+        cholesky=cholesky,
+    ).to(device)
     raw_model.load_state_dict(ckpt["model_state_dict"])
     if channels_last:
         raw_model = raw_model.to(memory_format=torch.channels_last)

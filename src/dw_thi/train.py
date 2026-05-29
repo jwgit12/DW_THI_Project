@@ -36,6 +36,7 @@ from .augment import gpu_b0_normalize_batch, gpu_degrade_dwi_batch
 from .dataset import DWISliceDataset, dwi_worker_init
 from .loss import DTILoss
 from .model import QSpaceUNet
+from .models import build_model, model_names
 from .runtime import (
     amp_dtype_from_name,
     autocast_context,
@@ -445,6 +446,7 @@ def build_run_config(
         "feat_dim": args.feat_dim,
         "channels": list(args.channels),
         "cholesky": args.cholesky,
+        "model_name": args.model,
         "batch_size": args.batch_size,
         "epochs": args.epochs,
         "lr": args.lr,
@@ -510,6 +512,7 @@ def save_checkpoint(
             "feat_dim": args.feat_dim,
             "channels": list(args.channels),
             "cholesky": args.cholesky,
+            "model_name": args.model,
             "dti_scale": train_ds.dti_scale,
             "max_bval": train_ds.max_bval,
             "train_subjects": train_subjects,
@@ -650,7 +653,8 @@ def main(args: argparse.Namespace) -> None:
         train_ds.dti_scale,
     )
 
-    raw_model = QSpaceUNet(
+    raw_model = build_model(
+        args.model,
         max_n=global_max_n,
         feat_dim=args.feat_dim,
         channels=tuple(args.channels),
@@ -903,7 +907,7 @@ def main(args: argparse.Namespace) -> None:
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train QSpaceUNet for DWI -> DTI prediction")
+    parser = argparse.ArgumentParser(description="Train a DWI -> DTI prediction model")
 
     parser.add_argument("--zarr_path", default=cfg.DATASET_ZARR_PATH)
     parser.add_argument("--out_dir", default=cfg.TRAIN_OUT_DIR)
@@ -915,6 +919,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--channels", type=int, nargs="+", default=cfg.UNET_CHANNELS)
     parser.add_argument("--dropout", type=float, default=cfg.DROPOUT)
     parser.add_argument("--cholesky", action="store_true", default=True)
+    parser.add_argument(
+        "--model",
+        choices=model_names(),
+        default="qspace_unet",
+        help="Trainable architecture to instantiate.",
+    )
 
     parser.add_argument("--epochs", type=int, default=cfg.EPOCHS)
     parser.add_argument("--batch_size", type=int, default=cfg.BATCH_SIZE)
