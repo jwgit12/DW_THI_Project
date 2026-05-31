@@ -2,12 +2,36 @@
 
 from __future__ import annotations
 
+import os
+import time
+
 import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
 import config as cfg
 from ..model import QSpaceEncoder, cholesky_to_tensor6
+
+
+def _debug_every() -> int:
+    try:
+        return int(os.environ.get("MRD_DEBUG_EVERY", "25"))
+    except ValueError:
+        return 25
+
+
+def _debug_sync_enabled() -> bool:
+    return os.environ.get("MRD_DEBUG_SYNC", "0").lower() in {"1", "true", "yes"}
+
+
+def _maybe_sync(tensor: torch.Tensor) -> None:
+    if _debug_sync_enabled() and tensor.is_cuda:
+        torch.cuda.synchronize(tensor.device)
+
+
+def _should_debug_forward(count: int) -> bool:
+    every = _debug_every()
+    return every > 0 and (count <= 3 or count % every == 0)
 
 
 class FiLMResidualBlock(nn.Module):
@@ -147,6 +171,7 @@ class MRDCNN(nn.Module):
         super().__init__()
         self.max_n = max_n
         self.cholesky = cholesky
+        self._debug_forward_count = 0
         self.denoiser = DirectionConditionedResidualDenoiser(
             channels=denoise_channels,
             depth=denoise_depth,
@@ -173,9 +198,39 @@ class MRDCNN(nn.Module):
         bvecs: torch.Tensor,
         vol_mask: torch.Tensor,
     ) -> torch.Tensor:
+        self._debug_forward_count += 1
+        debug = _should_debug_forward(self._debug_forward_count)
+        t0 = time.perf_counter()
+        if debug:
+            valid = float(vol_mask.sum().detach().cpu())
+            print(
+                f"[MRD] forward {self._debug_forward_count} start "
+                f"mode={'train' if self.training else 'eval'} "
+                f"signal={tuple(signal.shape)} valid_vols={valid:.0f}",
+                flush=True,
+            )
+
         denoised, _residual = self.denoiser(signal, bvals, bvecs, vol_mask)
+        if debug:
+            _maybe_sync(denoised)
+            t1 = time.perf_counter()
+            print(f"[MRD] forward {self._debug_forward_count} denoiser done {t1 - t0:.2f}s", flush=True)
+
         features = self.q_encoder(denoised, bvals, bvecs, vol_mask)
+        if debug:
+            _maybe_sync(features)
+            t2 = time.perf_counter()
+            print(f"[MRD] forward {self._debug_forward_count} q_encoder done {t2 - t1:.2f}s", flush=True)
+
         out = self.tensor_head(features)
         if self.cholesky:
             out = cholesky_to_tensor6(out)
+        if debug:
+            _maybe_sync(out)
+            t3 = time.perf_counter()
+            print(
+                f"[MRD] forward {self._debug_forward_count} tensor_head done "
+                f"{t3 - t2:.2f}s total={t3 - t0:.2f}s",
+                flush=True,
+            )
         return out
