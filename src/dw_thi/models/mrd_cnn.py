@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 import config as cfg
 from ..model import QSpaceEncoder, cholesky_to_tensor6
@@ -43,9 +44,11 @@ class DirectionConditionedResidualDenoiser(nn.Module):
         dropout: float = 0.0,
         grad_hidden: int = 64,
         residual_scale: float = 0.5,
+        checkpoint_blocks: bool = True,
     ):
         super().__init__()
         self.residual_scale = float(residual_scale)
+        self.checkpoint_blocks = bool(checkpoint_blocks)
         self.grad_mlp = nn.Sequential(
             nn.Linear(4, grad_hidden),
             nn.SiLU(inplace=True),
@@ -79,7 +82,10 @@ class DirectionConditionedResidualDenoiser(nn.Module):
         x = signal.reshape(b * n, 1, h, w)
         y = self.stem(x)
         for block in self.blocks:
-            y = block(y, cond)
+            if self.checkpoint_blocks and self.training:
+                y = checkpoint(block, y, cond, use_reentrant=False)
+            else:
+                y = block(y, cond)
         residual = torch.tanh(self.head(y)).reshape(b, n, h, w)
         residual = residual * self.residual_scale * vol_mask[:, :, None, None]
         denoised = (signal - residual) * vol_mask[:, :, None, None]
@@ -96,8 +102,10 @@ class ResidualTensorCNN(nn.Module):
         depth: int = 8,
         dropout: float = 0.0,
         out_ch: int = 6,
+        checkpoint_blocks: bool = True,
     ):
         super().__init__()
+        self.checkpoint_blocks = bool(checkpoint_blocks)
         self.stem = nn.Sequential(
             nn.Conv2d(in_ch, hidden_ch, 3, padding=1, bias=False),
             nn.GroupNorm(8, hidden_ch),
@@ -111,7 +119,10 @@ class ResidualTensorCNN(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.stem(x)
         for block in self.blocks:
-            x = block(x)
+            if self.checkpoint_blocks and self.training:
+                x = checkpoint(block, x, use_reentrant=False)
+            else:
+                x = block(x)
         return self.head(x)
 
 
@@ -131,6 +142,7 @@ class MRDCNN(nn.Module):
         tensor_depth: int = 8,
         residual_scale: float = 0.5,
         grad_hidden: int = 64,
+        checkpoint_blocks: bool = True,
     ):
         super().__init__()
         self.max_n = max_n
@@ -141,6 +153,7 @@ class MRDCNN(nn.Module):
             dropout=dropout,
             grad_hidden=grad_hidden,
             residual_scale=residual_scale,
+            checkpoint_blocks=checkpoint_blocks,
         )
         self.q_encoder = QSpaceEncoder(feat_dim=feat_dim, grad_hidden=max(128, grad_hidden))
         hidden = int(tensor_channels if tensor_channels is not None else (channels[0] if channels else feat_dim))
@@ -150,6 +163,7 @@ class MRDCNN(nn.Module):
             depth=tensor_depth,
             dropout=dropout,
             out_ch=6,
+            checkpoint_blocks=checkpoint_blocks,
         )
 
     def forward(
