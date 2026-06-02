@@ -67,6 +67,13 @@ def _canonical_hw_from_checkpoint(ckpt: dict) -> tuple[int, int]:
     return int(hw[0]), int(hw[1])
 
 
+def configure_export_runtime() -> None:
+    mha_backend = getattr(torch.backends, "mha", None)
+    if mha_backend is not None and hasattr(mha_backend, "set_fastpath_enabled"):
+        mha_backend.set_fastpath_enabled(False)
+        print("Disabled PyTorch Transformer fast path for ONNX export.")
+
+
 def load_checkpoint_model(checkpoint_path: Path) -> tuple[torch.nn.Module, dict]:
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
@@ -124,6 +131,7 @@ def build_dummy_inputs(
 
 
 def export_onnx(args: argparse.Namespace) -> None:
+    configure_export_runtime()
     checkpoint_path = Path(args.checkpoint).expanduser().resolve()
     output_path = Path(args.output).expanduser().resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
