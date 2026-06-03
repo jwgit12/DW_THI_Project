@@ -4,9 +4,12 @@ scikit-image
 pandas
 nibabel
 dipy
+bm4d
 matplotlib
 PyQt6
 zarr
 torch
+onnx
+onnxruntime
 tensorboard
 tqdm
