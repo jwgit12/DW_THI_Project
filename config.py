@@ -203,7 +203,6 @@ FODF_REQUIRE_CUDA = False
 # ─────────────────────────────────────────────────────────────────────────────
 P2S_MODEL = "ridge"            # 'ols' | 'ridge' | 'lasso'
 P2S_ALPHA = 0.001              # regularisation for ridge/lasso
-P2S_PATCH_RADIUS = 0         # patch radius for self-supervised regression (0 = single voxel)
 P2S_SHIFT_INTENSITY = True
 P2S_CLIP_NEGATIVE = True
 P2S_B0_DENOISING = False

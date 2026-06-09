@@ -90,7 +90,6 @@ log = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 P2S_CFG = dict(
     model=cfg.P2S_MODEL, alpha=cfg.P2S_ALPHA, b0_threshold=cfg.P2S_B0_THRESHOLD,
-    patch_radius=cfg.P2S_PATCH_RADIUS,
     shift_intensity=cfg.P2S_SHIFT_INTENSITY, clip_negative=cfg.P2S_CLIP_NEGATIVE,
     b0_denoising=cfg.P2S_B0_DENOISING, dti_fit_method=cfg.DTI_FIT_METHOD,
 )
@@ -214,7 +213,6 @@ def _run_patch2self(
         warnings.simplefilter("ignore")
         return patch2self(
             noisy, bvals,
-            patch_radius=p2s_cfg.get("patch_radius", 0),
             model=p2s_cfg["model"],
             alpha=p2s_cfg["alpha"],
             b0_threshold=p2s_cfg["b0_threshold"],
@@ -449,7 +447,6 @@ def evaluate_subject(
             {
                 "p2s_model": p2s_cfg["model"],
                 "p2s_alpha": p2s_cfg["alpha"],
-                "p2s_patch_radius": p2s_cfg.get("patch_radius", 0),
                 "p2s_b0_denoising": p2s_cfg["b0_denoising"],
                 "p2s_clip_negative": p2s_cfg["clip_negative"],
                 "p2s_shift_intensity": p2s_cfg["shift_intensity"],
@@ -795,7 +792,6 @@ def _p2s_cfg_from_args(args, overrides: dict | None = None) -> dict:
     p2s_cfg.update(
         model=args.p2s_model,
         alpha=float(args.p2s_alpha),
-        patch_radius=int(args.p2s_patch_radius),
         b0_threshold=float(args.b0_threshold),
         shift_intensity=bool(args.p2s_shift_intensity),
         clip_negative=bool(args.p2s_clip_negative),
@@ -1814,9 +1810,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Patch2Self regression model")
     parser.add_argument("--p2s_alpha", "--p2s-alpha", type=float, default=cfg.P2S_ALPHA,
                         help="Patch2Self regularization alpha for ridge/lasso")
-    parser.add_argument("--p2s_patch_radius", "--p2s-patch-radius",
-                        type=int, default=cfg.P2S_PATCH_RADIUS,
-                        help="Patch2Self patch radius (0=single voxel, 1=3x3x3, ...)")
     parser.add_argument("--p2s_dti_fit_method", "--p2s-dti-fit-method",
                         choices=["WLS", "OLS", "NLLS"], default=cfg.DTI_FIT_METHOD,
                         help="DTI fit method used after Patch2Self denoising")
