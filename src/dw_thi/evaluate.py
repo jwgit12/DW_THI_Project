@@ -89,16 +89,20 @@ log = logging.getLogger(__name__)
 # Baseline defaults (match the standalone scripts)
 # ─────────────────────────────────────────────────────────────────────────────
 P2S_CFG = dict(
-    model=cfg.P2S_MODEL, alpha=cfg.P2S_ALPHA, b0_threshold=cfg.B0_THRESHOLD,
+    model=cfg.P2S_MODEL, alpha=cfg.P2S_ALPHA, b0_threshold=cfg.P2S_B0_THRESHOLD,
+    patch_radius=cfg.P2S_PATCH_RADIUS,
     shift_intensity=cfg.P2S_SHIFT_INTENSITY, clip_negative=cfg.P2S_CLIP_NEGATIVE,
     b0_denoising=cfg.P2S_B0_DENOISING, dti_fit_method=cfg.DTI_FIT_METHOD,
 )
 MPPCA_CFG = dict(
     patch_radius=cfg.MPPCA_PATCH_RADIUS, pca_method=cfg.MPPCA_PCA_METHOD,
+    use_mask=cfg.MPPCA_USE_MASK,
     b0_threshold=cfg.B0_THRESHOLD, dti_fit_method=cfg.DTI_FIT_METHOD,
 )
 BM4D_CFG = dict(
     sigma=cfg.BM4D_SIGMA, profile=cfg.BM4D_PROFILE,
+    patch_size=cfg.BM4D_PATCH_SIZE, search_window=cfg.BM4D_SEARCH_WINDOW,
+    n_max=cfg.BM4D_N_MAX,
     b0_threshold=cfg.B0_THRESHOLD, dti_fit_method=cfg.DTI_FIT_METHOD,
 )
 
@@ -209,36 +213,48 @@ def _run_patch2self(
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         return patch2self(
-            noisy, bvals, model=p2s_cfg["model"], alpha=p2s_cfg["alpha"],
+            noisy, bvals,
+            patch_radius=p2s_cfg.get("patch_radius", 0),
+            model=p2s_cfg["model"],
+            alpha=p2s_cfg["alpha"],
             b0_threshold=p2s_cfg["b0_threshold"],
             shift_intensity=p2s_cfg["shift_intensity"],
             clip_negative_vals=p2s_cfg["clip_negative"],
-            b0_denoising=p2s_cfg["b0_denoising"], verbose=False,
+            b0_denoising=p2s_cfg["b0_denoising"],
+            verbose=False,
         ).astype(np.float32)
 
 
-def _run_mppca(noisy: np.ndarray, mask: np.ndarray | None = None) -> np.ndarray:
+def _run_mppca(
+    noisy: np.ndarray,
+    mask: np.ndarray | None = None,
+    mppca_cfg: dict | None = None,
+) -> np.ndarray:
     from dipy.denoise.localpca import mppca
+    cfg_use = MPPCA_CFG if mppca_cfg is None else mppca_cfg
+    effective_mask = mask if cfg_use.get("use_mask", True) else None
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         return mppca(
-            noisy, patch_radius=MPPCA_CFG["patch_radius"],
-            pca_method=MPPCA_CFG["pca_method"],
-            mask=mask,
+            noisy,
+            patch_radius=cfg_use["patch_radius"],
+            pca_method=cfg_use["pca_method"],
+            mask=effective_mask,
             suppress_warning=True,
         ).astype(np.float32)
 
 
-def _run_bm4d(noisy: np.ndarray) -> np.ndarray:
+def _run_bm4d(noisy: np.ndarray, bm4d_cfg: dict | None = None) -> np.ndarray:
     """Apply BM4D independently to each 3D DWI volume.
 
-    Sigma is either taken from BM4D_CFG or estimated per-volume via MAD.
+    Sigma is either taken from the config or estimated per-volume via MAD.
     """
     from bm4d import bm4d
+    cfg_use = BM4D_CFG if bm4d_cfg is None else bm4d_cfg
     N = noisy.shape[3]
     denoised = np.empty_like(noisy, dtype=np.float32)
-    sigma_cfg = BM4D_CFG["sigma"]
-    profile = BM4D_CFG["profile"]
+    sigma_cfg = cfg_use["sigma"]
+    profile = cfg_use["profile"]
     t_start = time.time()
     for n in range(N):
         vol = noisy[:, :, :, n].astype(np.float64)
@@ -340,6 +356,8 @@ def evaluate_subject(
     run_mppca: bool = True,
     run_bm4d: bool = True,
     p2s_cfg: dict | None = None,
+    mppca_cfg: dict | None = None,
+    bm4d_cfg: dict | None = None,
     infer_batch_size: int = 16,
     amp_enabled: bool = False,
     amp_dtype: torch.dtype | None = None,
@@ -431,6 +449,7 @@ def evaluate_subject(
             {
                 "p2s_model": p2s_cfg["model"],
                 "p2s_alpha": p2s_cfg["alpha"],
+                "p2s_patch_radius": p2s_cfg.get("patch_radius", 0),
                 "p2s_b0_denoising": p2s_cfg["b0_denoising"],
                 "p2s_clip_negative": p2s_cfg["clip_negative"],
                 "p2s_shift_intensity": p2s_cfg["shift_intensity"],
@@ -443,26 +462,32 @@ def evaluate_subject(
 
     if run_mppca:
         t2 = time.time()
-        mppca_denoised = _run_mppca(input_dwi, mask=mask_3d)
+        mppca_cfg_use = MPPCA_CFG if mppca_cfg is None else mppca_cfg
+        mppca_denoised = _run_mppca(input_dwi, mask=mask_3d, mppca_cfg=mppca_cfg_use)
         mppca_metrics, mppca_dti6d = _baseline_dti_metrics(
             mppca_denoised, target_dti6d, bvals, bvecs, b0_threshold,
+            dti_fit_method=mppca_cfg_use.get("dti_fit_method", "WLS"),
             mask=mask_3d,
         )
         mppca_metrics.update(row_meta)
+        mppca_metrics["mppca_patch_radius"] = mppca_cfg_use["patch_radius"]
+        mppca_metrics["mppca_pca_method"] = mppca_cfg_use["pca_method"]
+        mppca_metrics["mppca_use_mask"] = mppca_cfg_use.get("use_mask", True)
         mppca_metrics["elapsed_s"] = round(time.time() - t2, 2)
         all_metrics["mppca"] = mppca_metrics
         arrays["mppca_dti6d"] = mppca_dti6d
 
     if run_bm4d:
         t3 = time.time()
-        bm4d_denoised = _run_bm4d(input_dwi)
+        bm4d_cfg_use = BM4D_CFG if bm4d_cfg is None else bm4d_cfg
+        bm4d_denoised = _run_bm4d(input_dwi, bm4d_cfg=bm4d_cfg_use)
         bm4d_metrics, bm4d_dti6d = _baseline_dti_metrics(
             bm4d_denoised, target_dti6d, bvals, bvecs, b0_threshold,
-            dti_fit_method=BM4D_CFG["dti_fit_method"], mask=mask_3d,
+            dti_fit_method=bm4d_cfg_use["dti_fit_method"], mask=mask_3d,
         )
         bm4d_metrics.update(row_meta)
-        bm4d_metrics["bm4d_profile"] = BM4D_CFG["profile"]
-        bm4d_metrics["bm4d_sigma"] = BM4D_CFG["sigma"]
+        bm4d_metrics["bm4d_profile"] = bm4d_cfg_use["profile"]
+        bm4d_metrics["bm4d_sigma"] = bm4d_cfg_use["sigma"]
         bm4d_metrics["elapsed_s"] = round(time.time() - t3, 2)
         all_metrics["bm4d"] = bm4d_metrics
         arrays["bm4d_dti6d"] = bm4d_dti6d
@@ -770,6 +795,7 @@ def _p2s_cfg_from_args(args, overrides: dict | None = None) -> dict:
     p2s_cfg.update(
         model=args.p2s_model,
         alpha=float(args.p2s_alpha),
+        patch_radius=int(args.p2s_patch_radius),
         b0_threshold=float(args.b0_threshold),
         shift_intensity=bool(args.p2s_shift_intensity),
         clip_negative=bool(args.p2s_clip_negative),
@@ -1035,6 +1061,335 @@ def run_patch2self_sweep(
     return summary
 
 
+def _iter_mppca_sweep_configs(args) -> list[dict]:
+    use_mask_values = _bool_choices(args.mppca_sweep_use_mask)
+    configs = []
+    for radius in args.mppca_sweep_radii:
+        for method in args.mppca_sweep_pca_methods:
+            for use_mask in use_mask_values:
+                configs.append(dict(MPPCA_CFG, patch_radius=int(radius), pca_method=method, use_mask=use_mask))
+    unique = []
+    seen = set()
+    for c in configs:
+        key = (c["patch_radius"], c["pca_method"], c["use_mask"])
+        if key not in seen:
+            seen.add(key)
+            unique.append(c)
+    return unique
+
+
+def _iter_bm4d_sweep_configs(args) -> list[dict]:
+    configs = []
+    for profile in args.bm4d_sweep_profiles:
+        for sigma_str in args.bm4d_sweep_sigmas:
+            sigma = None if str(sigma_str).lower() == "auto" else float(sigma_str)
+            configs.append(dict(BM4D_CFG, profile=profile, sigma=sigma))
+    unique = []
+    seen = set()
+    for c in configs:
+        key = (c["profile"], c["sigma"])
+        if key not in seen:
+            seen.add(key)
+            unique.append(c)
+    return unique
+
+
+def run_mppca_sweep(
+    args,
+    subjects: list[str],
+    out_dir: "Path",
+) -> "pd.DataFrame | None":
+    """Evaluate an MP-PCA hyperparameter grid on shared degraded inputs."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    mppca_configs = _iter_mppca_sweep_configs(args)
+    if not mppca_configs:
+        log.error("No MP-PCA sweep configurations were generated.")
+        return None
+
+    metric_cols = [
+        "tensor_rmse",
+        "fa_rmse", "fa_mae", "fa_nrmse", "fa_r2",
+        "adc_rmse", "adc_mae", "adc_nrmse", "adc_r2",
+    ]
+    higher_is_better = {"fa_r2", "adc_r2"}
+    sort_ascending = args.mppca_sweep_metric not in higher_is_better
+
+    log.info(
+        "Running MP-PCA sweep: %d configs x %d subjects x %d repeats",
+        len(mppca_configs), len(subjects), args.eval_repeats,
+    )
+
+    store = zarr.open_group(path_str(args.zarr_path), mode="r")
+    eval_rng = np.random.default_rng(args.eval_seed)
+    rows = []
+
+    for subject_key in subjects:
+        grp = store[subject_key]
+        target_dti6d = np.asarray(grp["target_dti_6d"][:], dtype=np.float32)
+        target_dwi = np.asarray(grp["target_dwi"][:], dtype=np.float32)
+        bvals = np.asarray(grp["bvals"][:], dtype=np.float32)
+        bvecs = np.asarray(grp["bvecs"][:], dtype=np.float32)
+        if "brain_mask" in set(grp.array_keys()):
+            mask_3d = np.asarray(grp["brain_mask"][:], dtype=bool)
+        else:
+            mask_3d = compute_brain_mask_from_dwi(target_dwi, bvals, args.b0_threshold)
+
+        for repeat_idx in range(args.eval_repeats):
+            trial = _next_degradation_trial(
+                eval_rng,
+                repeat_idx=repeat_idx,
+                keep_fraction_range=(
+                    args.eval_keep_fraction_min,
+                    args.eval_keep_fraction_max,
+                ),
+                noise_range=(args.eval_noise_min, args.eval_noise_max),
+            )
+            input_dwi = degrade_dwi_volume(
+                target_dwi,
+                keep_fraction=trial["keep_fraction"],
+                rel_noise_level=trial["noise_level"],
+                seed=trial["degrade_seed"],
+            )
+
+            for config_idx, mppca_cfg in enumerate(mppca_configs):
+                t0 = time.time()
+                try:
+                    mppca_denoised = _run_mppca(input_dwi, mask=mask_3d, mppca_cfg=mppca_cfg)
+                    metrics, _ = _baseline_dti_metrics(
+                        mppca_denoised,
+                        target_dti6d,
+                        bvals,
+                        bvecs,
+                        args.b0_threshold,
+                        dti_fit_method=mppca_cfg.get("dti_fit_method", "WLS"),
+                        mask=mask_3d,
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "MP-PCA sweep failed subject=%s repeat=%d config=%d: %s",
+                        subject_key, repeat_idx, config_idx, exc,
+                    )
+                    continue
+
+                row = {
+                    "subject": subject_key,
+                    "repeat": repeat_idx,
+                    "keep_fraction": round(float(trial["keep_fraction"]), 6),
+                    "noise_level": round(float(trial["noise_level"]), 6),
+                    "degrade_seed": int(trial["degrade_seed"]),
+                    "config_idx": config_idx,
+                    "mppca_patch_radius": mppca_cfg["patch_radius"],
+                    "mppca_pca_method": mppca_cfg["pca_method"],
+                    "mppca_use_mask": mppca_cfg.get("use_mask", True),
+                    "elapsed_s": round(time.time() - t0, 2),
+                }
+                row.update(metrics)
+                rows.append(row)
+
+                log.info(
+                    "%-14s r=%02d cfg=%02d radius=%d method=%s mask=%s  %s=%.6f",
+                    subject_key, repeat_idx, config_idx,
+                    mppca_cfg["patch_radius"], mppca_cfg["pca_method"],
+                    mppca_cfg.get("use_mask", True),
+                    args.mppca_sweep_metric, metrics[args.mppca_sweep_metric],
+                )
+
+    if not rows:
+        log.error("MP-PCA sweep produced no successful rows.")
+        return None
+
+    raw_df = pd.DataFrame(rows)
+    raw_path = out_dir / "mppca_sweep.csv"
+    raw_df.to_csv(raw_path, index=False)
+    log.info("Saved MP-PCA sweep rows -> %s", raw_path)
+
+    group_cols = ["config_idx", "mppca_patch_radius", "mppca_pca_method", "mppca_use_mask"]
+    available_metrics = [c for c in metric_cols if c in raw_df.columns]
+    summary = raw_df.groupby(group_cols, dropna=False)[available_metrics].agg(["mean", "std"])
+    summary.columns = [f"{metric}_{stat}" for metric, stat in summary.columns]
+    summary = summary.reset_index()
+    summary = summary.sort_values(
+        f"{args.mppca_sweep_metric}_mean",
+        ascending=sort_ascending,
+    ).reset_index(drop=True)
+
+    summary_path = out_dir / "mppca_sweep_summary.csv"
+    summary.to_csv(summary_path, index=False)
+    log.info("Saved MP-PCA sweep summary -> %s", summary_path)
+
+    best = summary.iloc[0]
+    print(f"\n{'=' * 72}")
+    print("  MP-PCA Sweep Best Config")
+    print(f"{'=' * 72}")
+    print(
+        "patch_radius={radius}  pca_method={method}  {metric}_mean={score:.6f}".format(
+            radius=int(best["mppca_patch_radius"]),
+            method=best["mppca_pca_method"],
+            metric=args.mppca_sweep_metric,
+            score=best[f"{args.mppca_sweep_metric}_mean"],
+        )
+    )
+    print("\nTop configs:")
+    top_cols = [
+        "mppca_patch_radius", "mppca_pca_method", "mppca_use_mask",
+        f"{args.mppca_sweep_metric}_mean",
+        f"{args.mppca_sweep_metric}_std",
+    ]
+    print(summary[top_cols].head(8).to_string(index=False))
+
+    return summary
+
+
+def run_bm4d_sweep(
+    args,
+    subjects: list[str],
+    out_dir: "Path",
+) -> "pd.DataFrame | None":
+    """Evaluate a BM4D hyperparameter grid on shared degraded inputs.
+
+    Note: BM4D is slow (~minutes per subject). Use minimal repeats for the sweep.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    bm4d_configs = _iter_bm4d_sweep_configs(args)
+    if not bm4d_configs:
+        log.error("No BM4D sweep configurations were generated.")
+        return None
+
+    metric_cols = [
+        "tensor_rmse",
+        "fa_rmse", "fa_mae", "fa_nrmse", "fa_r2",
+        "adc_rmse", "adc_mae", "adc_nrmse", "adc_r2",
+    ]
+    higher_is_better = {"fa_r2", "adc_r2"}
+    sort_ascending = args.bm4d_sweep_metric not in higher_is_better
+
+    log.info(
+        "Running BM4D sweep: %d configs x %d subjects x %d repeats  "
+        "(BM4D is slow — expect significant runtime)",
+        len(bm4d_configs), len(subjects), args.eval_repeats,
+    )
+
+    store = zarr.open_group(path_str(args.zarr_path), mode="r")
+    eval_rng = np.random.default_rng(args.eval_seed)
+    rows = []
+
+    for subject_key in subjects:
+        grp = store[subject_key]
+        target_dti6d = np.asarray(grp["target_dti_6d"][:], dtype=np.float32)
+        target_dwi = np.asarray(grp["target_dwi"][:], dtype=np.float32)
+        bvals = np.asarray(grp["bvals"][:], dtype=np.float32)
+        bvecs = np.asarray(grp["bvecs"][:], dtype=np.float32)
+        if "brain_mask" in set(grp.array_keys()):
+            mask_3d = np.asarray(grp["brain_mask"][:], dtype=bool)
+        else:
+            mask_3d = compute_brain_mask_from_dwi(target_dwi, bvals, args.b0_threshold)
+
+        for repeat_idx in range(args.eval_repeats):
+            trial = _next_degradation_trial(
+                eval_rng,
+                repeat_idx=repeat_idx,
+                keep_fraction_range=(
+                    args.eval_keep_fraction_min,
+                    args.eval_keep_fraction_max,
+                ),
+                noise_range=(args.eval_noise_min, args.eval_noise_max),
+            )
+            input_dwi = degrade_dwi_volume(
+                target_dwi,
+                keep_fraction=trial["keep_fraction"],
+                rel_noise_level=trial["noise_level"],
+                seed=trial["degrade_seed"],
+            )
+
+            for config_idx, bm4d_cfg in enumerate(bm4d_configs):
+                sigma_label = "auto" if bm4d_cfg["sigma"] is None else f"{bm4d_cfg['sigma']:.4g}"
+                t0 = time.time()
+                try:
+                    bm4d_denoised = _run_bm4d(input_dwi, bm4d_cfg=bm4d_cfg)
+                    metrics, _ = _baseline_dti_metrics(
+                        bm4d_denoised,
+                        target_dti6d,
+                        bvals,
+                        bvecs,
+                        args.b0_threshold,
+                        dti_fit_method=bm4d_cfg["dti_fit_method"],
+                        mask=mask_3d,
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "BM4D sweep failed subject=%s repeat=%d config=%d: %s",
+                        subject_key, repeat_idx, config_idx, exc,
+                    )
+                    continue
+
+                row = {
+                    "subject": subject_key,
+                    "repeat": repeat_idx,
+                    "keep_fraction": round(float(trial["keep_fraction"]), 6),
+                    "noise_level": round(float(trial["noise_level"]), 6),
+                    "degrade_seed": int(trial["degrade_seed"]),
+                    "config_idx": config_idx,
+                    "bm4d_profile": bm4d_cfg["profile"],
+                    "bm4d_sigma": bm4d_cfg["sigma"],
+                    "elapsed_s": round(time.time() - t0, 2),
+                }
+                row.update(metrics)
+                rows.append(row)
+
+                log.info(
+                    "%-14s r=%02d cfg=%02d profile=%s sigma=%s  %s=%.6f",
+                    subject_key, repeat_idx, config_idx,
+                    bm4d_cfg["profile"], sigma_label,
+                    args.bm4d_sweep_metric, metrics[args.bm4d_sweep_metric],
+                )
+
+    if not rows:
+        log.error("BM4D sweep produced no successful rows.")
+        return None
+
+    raw_df = pd.DataFrame(rows)
+    raw_path = out_dir / "bm4d_sweep.csv"
+    raw_df.to_csv(raw_path, index=False)
+    log.info("Saved BM4D sweep rows -> %s", raw_path)
+
+    group_cols = ["config_idx", "bm4d_profile", "bm4d_sigma"]
+    available_metrics = [c for c in metric_cols if c in raw_df.columns]
+    summary = raw_df.groupby(group_cols, dropna=False)[available_metrics].agg(["mean", "std"])
+    summary.columns = [f"{metric}_{stat}" for metric, stat in summary.columns]
+    summary = summary.reset_index()
+    summary = summary.sort_values(
+        f"{args.bm4d_sweep_metric}_mean",
+        ascending=sort_ascending,
+    ).reset_index(drop=True)
+
+    summary_path = out_dir / "bm4d_sweep_summary.csv"
+    summary.to_csv(summary_path, index=False)
+    log.info("Saved BM4D sweep summary -> %s", summary_path)
+
+    best = summary.iloc[0]
+    sigma_best = "auto" if (pd.isna(best["bm4d_sigma"]) or best["bm4d_sigma"] is None) else f"{best['bm4d_sigma']:.4g}"
+    print(f"\n{'=' * 72}")
+    print("  BM4D Sweep Best Config")
+    print(f"{'=' * 72}")
+    print(
+        "profile={profile}  sigma={sigma}  {metric}_mean={score:.6f}".format(
+            profile=best["bm4d_profile"],
+            sigma=sigma_best,
+            metric=args.bm4d_sweep_metric,
+            score=best[f"{args.bm4d_sweep_metric}_mean"],
+        )
+    )
+    print("\nTop configs:")
+    top_cols = [
+        "bm4d_profile", "bm4d_sigma",
+        f"{args.bm4d_sweep_metric}_mean",
+        f"{args.bm4d_sweep_metric}_std",
+    ]
+    print(summary[top_cols].head(8).to_string(index=False))
+
+    return summary
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1076,6 +1431,32 @@ def main(args):
         run_patch2self_sweep(args, subjects, out_dir)
         return
 
+    if args.sweep_mppca:
+        subjects = _select_eval_subjects(
+            all_keys,
+            args,
+            default_subjects=cfg.VAL_SUBJECTS,
+        )
+        if not subjects:
+            log.error("No subjects selected for MP-PCA sweep.")
+            return
+        log.info("MP-PCA sweep subjects: %s", subjects)
+        run_mppca_sweep(args, subjects, out_dir)
+        return
+
+    if args.sweep_bm4d:
+        subjects = _select_eval_subjects(
+            all_keys,
+            args,
+            default_subjects=cfg.VAL_SUBJECTS,
+        )
+        if not subjects:
+            log.error("No subjects selected for BM4D sweep.")
+            return
+        log.info("BM4D sweep subjects: %s", subjects)
+        run_bm4d_sweep(args, subjects, out_dir)
+        return
+
     # Load checkpoint
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     max_n = ckpt["max_n"]
@@ -1113,6 +1494,11 @@ def main(args):
     run_patch2self = (not args.skip_baselines) and args.patch2self
     run_mppca = (not args.skip_baselines) and args.mppca
     run_bm4d = (not args.skip_baselines) and args.bm4d
+    MPPCA_CFG.update(
+        patch_radius=args.mppca_patch_radius,
+        pca_method=args.mppca_pca_method,
+        use_mask=bool(args.mppca_use_mask),
+    )
     BM4D_CFG.update(sigma=args.bm4d_sigma, profile=args.bm4d_profile)
     p2s_cfg = _p2s_cfg_from_args(args)
     log.info(
@@ -1428,6 +1814,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Patch2Self regression model")
     parser.add_argument("--p2s_alpha", "--p2s-alpha", type=float, default=cfg.P2S_ALPHA,
                         help="Patch2Self regularization alpha for ridge/lasso")
+    parser.add_argument("--p2s_patch_radius", "--p2s-patch-radius",
+                        type=int, default=cfg.P2S_PATCH_RADIUS,
+                        help="Patch2Self patch radius (0=single voxel, 1=3x3x3, ...)")
     parser.add_argument("--p2s_dti_fit_method", "--p2s-dti-fit-method",
                         choices=["WLS", "OLS", "NLLS"], default=cfg.DTI_FIT_METHOD,
                         help="DTI fit method used after Patch2Self denoising")
@@ -1489,6 +1878,38 @@ def build_arg_parser() -> argparse.ArgumentParser:
     mppca_group.add_argument("--no-mppca", "--no-mp-pca", "--skip_mppca", "--skip_mp_pca",
                              dest="mppca", action="store_false",
                              help="Disable the MP-PCA baseline")
+    parser.add_argument("--mppca_patch_radius", "--mppca-patch-radius",
+                        type=int, default=cfg.MPPCA_PATCH_RADIUS,
+                        help="MP-PCA local patch radius in voxels (radius r → (2r+1)³ patch)")
+    parser.add_argument("--mppca_pca_method", "--mppca-pca-method",
+                        choices=["eig", "svd"], default=cfg.MPPCA_PCA_METHOD,
+                        help="MP-PCA PCA solver: eig (faster) or svd (occasionally more accurate)")
+    mppca_mask_group = parser.add_mutually_exclusive_group()
+    mppca_mask_group.add_argument("--mppca_use_mask", "--mppca-use-mask",
+                                  dest="mppca_use_mask", action="store_true",
+                                  default=cfg.MPPCA_USE_MASK,
+                                  help="Restrict MP-PCA to brain mask voxels (default)")
+    mppca_mask_group.add_argument("--mppca_no_mask", "--mppca-no-mask",
+                                  dest="mppca_use_mask", action="store_false",
+                                  help="Run MP-PCA on all voxels (no brain mask)")
+    parser.add_argument("--sweep_mppca", "--sweep-mppca",
+                        action="store_true",
+                        help="Run a validation MP-PCA hyperparameter sweep and exit")
+    parser.add_argument("--mppca_sweep_metric", "--mppca-sweep-metric",
+                        choices=["tensor_rmse", "fa_rmse", "fa_mae", "fa_nrmse", "fa_r2",
+                                 "adc_rmse", "adc_mae", "adc_nrmse", "adc_r2"],
+                        default="fa_rmse",
+                        help="Metric used to rank MP-PCA sweep configs")
+    parser.add_argument("--mppca_sweep_radii", "--mppca-sweep-radii",
+                        nargs="+", type=int, default=[1, 2, 3, 4],
+                        help="Patch radius values to sweep for MP-PCA")
+    parser.add_argument("--mppca_sweep_pca_methods", "--mppca-sweep-pca-methods",
+                        nargs="+", choices=["eig", "svd"], default=["eig", "svd"],
+                        help="PCA methods to sweep for MP-PCA")
+    parser.add_argument("--mppca_sweep_use_mask", "--mppca-sweep-use-mask",
+                        nargs="+", type=str.lower, choices=["true", "false"],
+                        default=["true", "false"],
+                        help="Mask values to sweep for MP-PCA")
     bm4d_group = parser.add_mutually_exclusive_group()
     bm4d_group.add_argument("--bm4d", "--run_bm4d",
                             dest="bm4d", action="store_true", default=True,
@@ -1499,8 +1920,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bm4d_sigma", "--bm4d-sigma", type=float, default=cfg.BM4D_SIGMA,
                         help="BM4D noise sigma per volume (default: None = auto-estimate via MAD)")
     parser.add_argument("--bm4d_profile", "--bm4d-profile",
-                        choices=["np", "lc", "high"], default=cfg.BM4D_PROFILE,
-                        help="BM4D denoising profile: np (normal), lc (low complexity), high")
+                        choices=["np", "refilter"], default=cfg.BM4D_PROFILE,
+                        help="BM4D profile: np (default) | refilter (two-pass Wiener)")
+    parser.add_argument("--sweep_bm4d", "--sweep-bm4d",
+                        action="store_true",
+                        help="Run a validation BM4D hyperparameter sweep and exit (slow!)")
+    parser.add_argument("--bm4d_sweep_metric", "--bm4d-sweep-metric",
+                        choices=["tensor_rmse", "fa_rmse", "fa_mae", "fa_nrmse", "fa_r2",
+                                 "adc_rmse", "adc_mae", "adc_nrmse", "adc_r2"],
+                        default="fa_rmse",
+                        help="Metric used to rank BM4D sweep configs")
+    parser.add_argument("--bm4d_sweep_profiles", "--bm4d-sweep-profiles",
+                        nargs="+", choices=["np", "refilter"], default=["np", "refilter"],
+                        help="BM4D profiles to sweep: np (default) | refilter (two-pass)")
+    parser.add_argument("--bm4d_sweep_sigmas", "--bm4d-sweep-sigmas",
+                        nargs="+", default=["auto"],
+                        help="Sigma values to sweep for BM4D: 'auto' for MAD or float values")
     parser.add_argument("--plot_subject", default=None,
                         help="Subject key to visualize (default: all evaluated subjects)")
     parser.add_argument("--plot_repeat", "--plot-repeat", type=int, default=0,

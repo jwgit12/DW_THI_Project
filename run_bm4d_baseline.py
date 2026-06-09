@@ -146,8 +146,8 @@ if __name__ == "__main__":
     parser.add_argument("--subjects", nargs="*", default=None)
     parser.add_argument("--eval_all", action="store_true")
     parser.add_argument("--eval_repeats", type=int, default=cfg.EVAL_REPEATS)
-    parser.add_argument("--profile", choices=["np", "lc", "high"], default=cfg.BM4D_PROFILE,
-                        help="BM4D profile: np (normal), lc (low complexity), high")
+    parser.add_argument("--profile", choices=["np", "refilter"], default=cfg.BM4D_PROFILE,
+                        help="BM4D profile: np (default) | refilter (two-pass Wiener)")
     parser.add_argument("--sigma", type=float, default=cfg.BM4D_SIGMA,
                         help="Fixed noise sigma per volume (default: auto via MAD)")
     main(parser.parse_args())

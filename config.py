@@ -201,20 +201,28 @@ FODF_REQUIRE_CUDA = False
 # ─────────────────────────────────────────────────────────────────────────────
 # Patch2Self baseline
 # ─────────────────────────────────────────────────────────────────────────────
-P2S_MODEL = "ols"            # 'ols' | 'ridge' | 'lasso'
-P2S_ALPHA = 1.0              # regularisation for ridge/lasso
+P2S_MODEL = "ridge"            # 'ols' | 'ridge' | 'lasso'
+P2S_ALPHA = 0.001              # regularisation for ridge/lasso
+P2S_PATCH_RADIUS = 0         # patch radius for self-supervised regression (0 = single voxel)
 P2S_SHIFT_INTENSITY = True
-P2S_CLIP_NEGATIVE = False
-P2S_B0_DENOISING = True
+P2S_CLIP_NEGATIVE = True
+P2S_B0_DENOISING = False
+P2S_B0_THRESHOLD = 50  
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MP-PCA baseline
 # ─────────────────────────────────────────────────────────────────────────────
-MPPCA_PATCH_RADIUS = 2       # local patch radius in voxels (2 → 5×5×5)
-MPPCA_PCA_METHOD = "eig"     # 'eig' (faster) | 'svd' (occasionally more accurate)
+MPPCA_PATCH_RADIUS = 1       # local patch radius in voxels (2 → 5×5×5)
+MPPCA_PCA_METHOD = "svd"     # 'eig' (faster) | 'svd' (occasionally more accurate)
+MPPCA_USE_MASK = True        # restrict denoising to brain mask voxels
 
 # ─────────────────────────────────────────────────────────────────────────────
 # BM4D baseline
+# bm4d 4.x only supports 'np' and 'refilter' as string profiles.
+# Custom profiles (patch size, search window, n_max) use BM4DProfile objects.
 # ─────────────────────────────────────────────────────────────────────────────
 BM4D_SIGMA = None            # None = auto-estimate per volume via MAD
-BM4D_PROFILE = 'np'         # 'np' (normal) | 'lc' (low complexity) | 'high'
+BM4D_PROFILE = 'np'         # 'np' (default) | 'refilter' (two-pass Wiener)
+BM4D_PATCH_SIZE = 4       
+BM4D_SEARCH_WINDOW = 9    
+BM4D_N_MAX = 8            
